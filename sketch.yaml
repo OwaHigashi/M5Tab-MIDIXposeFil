@@ -1,0 +1,20 @@
+default_fqbn: esp32:esp32:m5stack_tab5
+default_profile: tab5
+
+profiles:
+  tab5:
+    fqbn: esp32:esp32:m5stack_tab5
+    platforms:
+      - platform: esp32:esp32 (3.3.8)
+    libraries:
+      - M5Unified (0.2.13)
+      - M5GFX (0.2.20)
+      - SdFat (2.2.2)
+      - ESP8266Audio (1.9.9)
+
+# NOTE: esp32 core 3.3.8 has a known bug — esp32-hal-spi.c references
+# BOARD_SDMMC_POWER_CHANNEL but the m5stack_tab5 variant header does not
+# define it (other ESP32-P4 variants use channel 4, same LDO).
+# Build with build.cmd (which injects the missing define) or:
+#   arduino-cli compile --fqbn esp32:esp32:m5stack_tab5 \
+#     --build-property "compiler.cpp.extra_flags=-DBOARD_SDMMC_POWER_CHANNEL=4" .
