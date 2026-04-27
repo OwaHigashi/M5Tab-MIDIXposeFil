@@ -211,6 +211,7 @@ static Rect     instantZero;
 static SeqSlot  seqSteps[SEQ_STEP_COUNT];
 static Rect     seqPatLeft, seqPatRight, seqSave;
 static Rect     smfListArea, smfInfoArea, smfPianoArea;
+static Rect     smfListUpBtn, smfListDownBtn;
 static Rect     mp3ListArea, mp3InfoArea, mp3VisualArea;
 static Rect     mp3ListUpBtn, mp3ListDownBtn;
 
@@ -299,6 +300,21 @@ static void drawRectBtn(const Rect& r, uint16_t bg, uint16_t border,
     M5.Display.setTextColor(txt, bg);
     M5.Display.setTextDatum(middle_center);
     M5.Display.drawString(label, r.x + r.w / 2, r.y + r.h / 2);
+  }
+}
+
+static void drawTriangleBtn(const Rect& r, uint16_t bg, uint16_t border,
+                            bool up, uint16_t triColor)
+{
+  M5.Display.fillRoundRect(r.x, r.y, r.w, r.h, 10, bg);
+  M5.Display.drawRoundRect(r.x, r.y, r.w, r.h, 10, border);
+  int cx = r.x + r.w / 2;
+  int cy = r.y + r.h / 2;
+  int s = (r.w < r.h ? r.w : r.h) / 3;
+  if (up) {
+    M5.Display.fillTriangle(cx, cy - s, cx - s, cy + s, cx + s, cy + s, triColor);
+  } else {
+    M5.Display.fillTriangle(cx - s, cy - s, cx + s, cy - s, cx, cy + s, triColor);
   }
 }
 
@@ -401,8 +417,12 @@ static void computeLayout() {
   int listW = contentArea.w - margin * 2 - splitGap - rightW;
   int rightX = contentArea.x + margin + listW + splitGap;
 
+  // Lists span the full area down to navArea bottom (matches the SMF select UX).
+  int listBottom = navArea.y + navArea.h - margin;
   smfListArea  = { contentArea.x + margin, contentArea.y + margin,
-                   listW, contentArea.h - margin * 2 };
+                   contentArea.w - margin * 2, listBottom - (contentArea.y + margin) };
+  smfListUpBtn   = { smfListArea.x + smfListArea.w - 102, smfListArea.y + 8, 44, 44 };
+  smfListDownBtn = { smfListArea.x + smfListArea.w - 52,  smfListArea.y + 8, 44, 44 };
   smfInfoArea  = { rightX, contentArea.y + margin, rightW, 140 };
   int smfKeyboardTop = smfInfoArea.y + smfInfoArea.h + 16;
   int smfKeyboardBottom = navArea.y + navArea.h - margin;
@@ -410,12 +430,12 @@ static void computeLayout() {
                    rightW, smfKeyboardBottom - smfKeyboardTop };
 
   mp3ListArea   = { contentArea.x + margin, contentArea.y + margin,
-                    listW, contentArea.h - margin * 2 };
+                    listW, listBottom - (contentArea.y + margin) };
   mp3ListUpBtn   = { mp3ListArea.x + mp3ListArea.w - 102, mp3ListArea.y + 8, 44, 44 };
   mp3ListDownBtn = { mp3ListArea.x + mp3ListArea.w - 52,  mp3ListArea.y + 8, 44, 44 };
   mp3InfoArea   = { rightX, contentArea.y + margin, rightW, 118 };
   mp3VisualArea = { rightX, mp3InfoArea.y + mp3InfoArea.h + 12,
-                    rightW, contentArea.y + contentArea.h - (mp3InfoArea.y + mp3InfoArea.h + 12) - margin };
+                    rightW, listBottom - (mp3InfoArea.y + mp3InfoArea.h + 12) };
 
   initPianoKeys(smfPianoArea);
 }
@@ -1144,6 +1164,7 @@ static void drawSmfChannelKeyboard(const Rect& area) {
 
 static void drawMp3Static() {
   M5.Display.fillRect(contentArea.x, contentArea.y, contentArea.w, contentArea.h, COL_BG);
+  M5.Display.fillRect(navArea.x, navArea.y, navArea.w, navArea.h, COL_BG);
 
   M5.Display.fillRoundRect(mp3ListArea.x, mp3ListArea.y, mp3ListArea.w, mp3ListArea.h, 12, COL_PANEL);
   M5.Display.drawRoundRect(mp3ListArea.x, mp3ListArea.y, mp3ListArea.w, mp3ListArea.h, 12, COL_BTN_BDR);
@@ -1151,8 +1172,8 @@ static void drawMp3Static() {
   M5.Display.setTextColor(COL_TITLE, COL_PANEL);
   M5.Display.setTextDatum(top_left);
   M5.Display.drawString("MP3 Playlist", mp3ListArea.x + 12, mp3ListArea.y + 10);
-  drawRectBtn(mp3ListUpBtn, TFT_BLUE, COL_BTN_BDR, "^", COL_BTN_TXT, FONT_MED);
-  drawRectBtn(mp3ListDownBtn, TFT_BLUE, COL_BTN_BDR, "v", COL_BTN_TXT, FONT_MED);
+  drawTriangleBtn(mp3ListUpBtn,   TFT_BLUE, COL_BTN_BDR, true,  COL_BTN_TXT);
+  drawTriangleBtn(mp3ListDownBtn, TFT_BLUE, COL_BTN_BDR, false, COL_BTN_TXT);
 
   int lineH = 34;
   int top = mp3ListArea.y + 58;
@@ -1195,8 +1216,11 @@ static void drawMp3Static() {
 }
 
 static void drawMp3Visual() {
-  Rect body = { mp3VisualArea.x + 8, mp3VisualArea.y + 18,
-                mp3VisualArea.w - 16, mp3VisualArea.h - 26 };
+  // Body fills the panel beneath the "Cassette" title and stretches to the
+  // panel edges so the cassette image uses the full width and height.
+  int titleH = 28;
+  Rect body = { mp3VisualArea.x + 8, mp3VisualArea.y + titleH,
+                mp3VisualArea.w - 16, mp3VisualArea.h - titleH - 10 };
   if (!mp3StaticDirty) {
     M5.Display.fillRect(body.x, body.y, body.w, body.h, COL_PANEL);
   } else {
@@ -1204,23 +1228,27 @@ static void drawMp3Visual() {
     M5.Display.drawRoundRect(mp3VisualArea.x, mp3VisualArea.y, mp3VisualArea.w, mp3VisualArea.h, 12, COL_BTN_BDR);
   }
 
-  int cx = body.x + body.w / 2;
-  int cy = body.y + body.h / 2 + 8;
-  int reelGap = body.w / 3;
-  int reelR = min(body.w / 8, body.h / 3);
-  int leftX = cx - reelGap / 2;
-  int rightX = cx + reelGap / 2;
-  int spokeCount = 3;
-
   M5.Display.setFont(FONT_SMALL);
   M5.Display.setTextColor(COL_ACCENT, COL_PANEL);
   M5.Display.setTextDatum(top_center);
   M5.Display.drawString("Cassette", mp3VisualArea.x + mp3VisualArea.w / 2, mp3VisualArea.y + 8);
 
-  M5.Display.drawRoundRect(cx - reelGap, cy - reelR - 18, reelGap * 2, reelR * 2 + 36, 16, COL_BTN_BDR);
+  int caseX = body.x;
+  int caseY = body.y;
+  int caseW = body.w;
+  int caseH = body.h;
+  M5.Display.drawRoundRect(caseX,     caseY,     caseW,     caseH,     18, COL_BTN_BDR);
+  M5.Display.drawRoundRect(caseX + 1, caseY + 1, caseW - 2, caseH - 2, 17, COL_BTN_BDR);
+
+  int leftX  = caseX + caseW / 4;
+  int rightX = caseX + caseW * 3 / 4;
+  int cy     = caseY + caseH / 2;
+  int reelR  = min(caseW * 22 / 100, caseH * 38 / 100);
+  int spokeCount = 3;
+
   for (int i = 0; i < 2; ++i) {
     int ox = (i == 0) ? leftX : rightX;
-    M5.Display.drawCircle(ox, cy, reelR, TFT_WHITE);
+    M5.Display.drawCircle(ox, cy, reelR,      TFT_WHITE);
     M5.Display.drawCircle(ox, cy, reelR - 10, TFT_LIGHTGREY);
     for (int s = 0; s < spokeCount; ++s) {
       float angle = mp3CassetteAngle + (2.0f * PI * s / spokeCount);
@@ -1229,7 +1257,8 @@ static void drawMp3Visual() {
       M5.Display.drawLine(ox, cy, px, py, TFT_WHITE);
     }
   }
-  M5.Display.drawLine(leftX + reelR, cy - reelR, rightX - reelR, cy - reelR, TFT_LIGHTGREY);
+  M5.Display.drawLine(leftX, cy - reelR, rightX, cy - reelR, TFT_LIGHTGREY);
+
   mp3VisualDirty = false;
   mp3StaticDirty = false;
 }
@@ -1249,30 +1278,27 @@ static void drawSmf() {
     return;
   }
 
-  Rect selectArea = {
-    contentArea.x + 20,
-    contentArea.y + 20,
-    contentArea.w - 40,
-    (navArea.y + navArea.h) - (contentArea.y + 20) - 20
-  };
-
-  M5.Display.fillRoundRect(selectArea.x, selectArea.y, selectArea.w, selectArea.h, 12, COL_PANEL);
-  M5.Display.drawRoundRect(selectArea.x, selectArea.y, selectArea.w, selectArea.h, 12, COL_BTN_BDR);
+  M5.Display.fillRoundRect(smfListArea.x, smfListArea.y, smfListArea.w, smfListArea.h, 12, COL_PANEL);
+  M5.Display.drawRoundRect(smfListArea.x, smfListArea.y, smfListArea.w, smfListArea.h, 12, COL_BTN_BDR);
   M5.Display.setFont(FONT_SMALL);
   M5.Display.setTextColor(COL_TITLE, COL_PANEL);
   M5.Display.setTextDatum(top_left);
-  M5.Display.drawString("SMF Playlist", selectArea.x + 12, selectArea.y + 10);
+  M5.Display.drawString("SMF Playlist", smfListArea.x + 12, smfListArea.y + 10);
+  drawTriangleBtn(smfListUpBtn,   TFT_BLUE, COL_BTN_BDR, true,  COL_BTN_TXT);
+  drawTriangleBtn(smfListDownBtn, TFT_BLUE, COL_BTN_BDR, false, COL_BTN_TXT);
 
   int lineH = 30;
-  int top = selectArea.y + 44;
-  int visible = (selectArea.h - 56) / lineH;
+  int top = smfListArea.y + 58;
+  int visible = (smfListArea.h - 60) / lineH;
   if (smfCurrentTrack < smfListScroll) smfListScroll = smfCurrentTrack;
   if (smfCurrentTrack >= smfListScroll + visible) smfListScroll = smfCurrentTrack - visible + 1;
   if (smfListScroll < 0) smfListScroll = 0;
+  int maxScroll = max(0, (int)smfPlaylist.size() - visible);
+  if (smfListScroll > maxScroll) smfListScroll = maxScroll;
   for (int row = 0; row < visible; ++row) {
     int idx = smfListScroll + row;
     if (idx >= (int)smfPlaylist.size()) break;
-    Rect rr = { selectArea.x + 10, top + row * lineH, selectArea.w - 20, lineH - 2 };
+    Rect rr = { smfListArea.x + 10, top + row * lineH, smfListArea.w - 20, lineH - 2 };
     bool on = (idx == smfCurrentTrack);
     M5.Display.fillRoundRect(rr.x, rr.y, rr.w, rr.h, 6, on ? COL_BTN_HI2 : COL_PANEL);
     const char* slash = strrchr(smfPlaylist[idx].c_str(), '/');
@@ -1897,14 +1923,25 @@ static void processMp3() {
 
 static void handleSmfTouch(int x, int y) {
   if (smfPlaying) return;
-  Rect selectArea = {
-    contentArea.x + 20,
-    contentArea.y + 20,
-    contentArea.w - 40,
-    (navArea.y + navArea.h) - (contentArea.y + 20) - 20
-  };
-  if (hit(selectArea, x, y)) {
-    int top = selectArea.y + 44;
+  if (hit(smfListUpBtn, x, y)) {
+    if (smfListScroll > 0) {
+      smfListScroll--;
+      needFullRedraw = true;
+    }
+    return;
+  }
+  if (hit(smfListDownBtn, x, y)) {
+    int lineH = 30;
+    int visible = (smfListArea.h - 60) / lineH;
+    int maxScroll = max(0, (int)smfPlaylist.size() - visible);
+    if (smfListScroll < maxScroll) {
+      smfListScroll++;
+      needFullRedraw = true;
+    }
+    return;
+  }
+  if (hit(smfListArea, x, y)) {
+    int top = smfListArea.y + 58;
     int lineH = 30;
     int idx = smfListScroll + ((y - top) / lineH);
     if (y >= top && idx >= 0 && idx < (int)smfPlaylist.size()) {
