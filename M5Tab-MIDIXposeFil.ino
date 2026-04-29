@@ -8,9 +8,11 @@
 //   - MP3 player imported from ../../M5Core2-MP3Player
 //   - Common app menu and large-format Tab5 UI
 //
-// MIDI I/O is unified on Tab5 PortA by repurposing the two signal pins as UART:
-//   RX = G54, TX = G53
-// This matches a 4-pin Unit connection physically plugged into PortA.
+// MIDI input can come from either:
+//   - Tab5 PortA repurposed as UART for M5 Unit MIDI (SAM2695)
+//     RX = G54, TX = G53
+//   - Tab5 USB-A host port for class-compliant USB-MIDI instruments
+// The on-screen selector in the upper-right corner switches the input source.
 //
 // Differences vs the M5Core2 original:
 //   - Full 1280x720 layout, FreeSans proportional fonts, larger tap targets.
@@ -33,6 +35,10 @@
 #include <AudioFileSourceFS.h>
 #include <AudioFileSourceID3.h>
 #include <AudioGeneratorMP3.h>
+#include <usb/usb_host.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/portmacro.h>
 
 #define SD_FAT_TYPE 3
 #include "src/MD_MIDIFile.h"
@@ -88,6 +94,7 @@ enum DisplayMode { DIRECT_MODE, KEY_MODE, INSTANT_MODE, SEQUENCE_MODE };
 // PLAY 内のサブモード (2 種)
 enum PlayMode { PLAY_SMF, PLAY_MP3 };
 enum TransposeRange { RANGE_0_TO_12, RANGE_MINUS12_TO_0, RANGE_MINUS5_TO_6 };
+enum MidiInputSource { MIDI_INPUT_UNIT, MIDI_INPUT_USB, MIDI_INPUT_MIX };
 
 // ==== MIDI Manager (FILTER + MAPPER) ====
 enum MidiManagePage     { MIDI_PAGE_FILTER, MIDI_PAGE_MAPPER };
@@ -164,6 +171,7 @@ static bool   minorUpperTranspose = false;
 static bool allNotesOffEnabled = false;
 static unsigned long midiInCount = 0;
 static unsigned long midiOutCount = 0;
+static MidiInputSource midiInputSource = MIDI_INPUT_MIX;
 
 // MIDI Manager state
 static MidiManagePage     midiManagePage      = MIDI_PAGE_FILTER;
@@ -278,6 +286,7 @@ static const char* modeName[4] = { "DIR.", "KEY", "INST.", "SEQ." };
 static Rect midiAppTabFilter;
 static Rect midiAppTabMapper;
 static Rect midiAppBypassBtn;
+static Rect midiInputSourceBtn;
 // PLAY app sub-mode tabs (SMF / MP3)
 static Rect playTab[2];
 static const char* playName[2] = { "SMF", "MP3" };
@@ -307,6 +316,28 @@ static bool needFullRedraw    = true;
 static bool needPartialUpdate = false;
 static bool midiManageDirty   = false;
 static uint32_t g_lastMidiInputAt = 0;
+// ESP-IDF USB-host based MIDI input. Uses the same libusb.a that ships with
+// arduino-esp32 3.3.x for ESP32-P4. The PHY is brought up automatically by
+// usb_host_install(). See USB MIDI handling below.
+static volatile bool   g_usbHostReady     = false;  // host stack installed
+static volatile bool   g_usbMidiMounted   = false;  // MIDI interface claimed and IN xfer running
+static volatile uint8_t g_usbMidiActiveIndex = 0xFF; // legacy field, kept for status text
+static volatile uint8_t g_usbMidiCableCount  = 0;    // virtual cables on IN endpoint
+static volatile uint8_t g_usbMidiInEpAddr    = 0;    // address of the IN endpoint we polled
+static volatile uint8_t g_usbMidiClaimedItf  = 0xFF; // interface number we claimed
+static usb_host_client_handle_t g_usbClient = nullptr;
+static usb_device_handle_t      g_usbDevice = nullptr;
+static usb_transfer_t*          g_usbInXfer = nullptr;
+static TaskHandle_t             g_usbTask   = nullptr;
+
+// Lock-free-ish ring buffer the USB task uses to hand raw MIDI bytes to the
+// main loop. processMIDIByte() touches Serial2 and global UI state, so it
+// must run on the loop task only.
+static constexpr size_t USB_MIDI_RING_SIZE = 1024;
+static uint8_t  g_usbMidiRing[USB_MIDI_RING_SIZE];
+static volatile uint16_t g_usbMidiRingHead = 0;  // written by USB task
+static volatile uint16_t g_usbMidiRingTail = 0;  // read by loop
+static portMUX_TYPE g_usbMidiRingMux = portMUX_INITIALIZER_UNLOCKED;
 
 enum CyclerKind : uint8_t;
 
@@ -335,8 +366,11 @@ static void drawHeaderStatusApp();
 static void drawToolbarApp();
 static void drawNavApp();
 static void updateStatusArea();
+static void drawMidiInputSourceBtn();
+static const char* getHeaderTitle();
 static void handleTouch();
 static void setCurrentApp(AppMode app);
+static bool setMidiInputSource(MidiInputSource source);
 static bool ensureStorage();
 static void scanSmfFiles();
 static bool loadSmfTrack(int index);
@@ -348,6 +382,12 @@ static void resetSmfKeyboard();
 static void smfMidiEventHandler(midi_event* pev);
 static void smfSysexEventHandler(sysex_event* pev);
 static void smfMetaEventHandler(const meta_event* mev);
+static void resetMidiInputParser();
+static bool startUsbHost();
+static void serviceUsbHost(uint32_t now);
+static void processMidiInput();
+static void processUsbMidiInput();
+static size_t getMidiInputAvailable();
 static void scanMp3Files();
 static bool startMp3Track(int index);
 static void stopMp3();
@@ -364,7 +404,7 @@ static void drawSmfMonitorBase(const Rect& area);
 static void drawSmfMonitorKey(uint8_t channel, uint8_t note);
 static void handleSmfTouch(int x, int y);
 static void handleMp3Touch(int x, int y);
-static void processMIDI();
+static void processMidiInput();
 static void sendAllNotesOff();
 static void sendGSReset();
 static int8_t clampTranspose(int8_t v);
@@ -465,8 +505,8 @@ static void computeLayout() {
   // the title text. This frees the toolbar entirely for sub-mode tabs and
   // transport buttons.
   int appGap = 8;
-  int appW = 140;
-  int appTabHX0 = 460;                                       // start x in header
+  int appW = 120;
+  int appTabHX0 = 336;                                       // shifted left to make room
   int appTabHY  = headerArea.y + (headerArea.h - tabH) / 2;  // centred vertically
   for (int i = 0; i < 3; ++i) {
     appTab[i] = { appTabHX0 + i * (appW + appGap), appTabHY, appW, tabH };
@@ -525,6 +565,10 @@ static void computeLayout() {
   mp3BtnNext    = { mp3BtnPlay.x + mp3BtnPlay.w + playerGap, tabY, mp3NextW, tabH };
   mp3BtnVolDown = { mp3BtnNext.x + mp3BtnNext.w + playerGap, tabY, mp3VolW, tabH };
   mp3BtnVolUp   = { mp3BtnVolDown.x + mp3BtnVolDown.w + playerGap, tabY, mp3VolW, tabH };
+
+  // Header-side MIDI input selector. Keep it pinned to the upper-right so it
+  // stays discoverable without stealing toolbar width.
+  midiInputSourceBtn = { appTab[2].x + appTab[2].w + 12, appTabHY, appW, tabH };
 
   // Bottom nav: large PREV / NEXT.
   int navPad = 20;
@@ -810,19 +854,10 @@ static void drawSplash() {
 static void drawHeader() {
   M5.Display.fillRect(headerArea.x, headerArea.y, headerArea.w, headerArea.h, COL_PANEL);
 
-  const char* title = "MIDI Transposer";
-  if (currentApp == APP_MIDI) {
-    title = (midiManagePage == MIDI_PAGE_FILTER) ? "MIDI Filter" : "MIDI Mapper";
-  } else if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF)) {
-    title = "SMF Player";
-  } else if ((currentApp == APP_PLAY && currentPlay == PLAY_MP3)) {
-    title = "MP3 Player";
-  }
-
   M5.Display.setFont(FONT_TITLE);
   M5.Display.setTextColor(COL_TITLE, COL_PANEL);
   M5.Display.setTextDatum(middle_left);
-  M5.Display.drawString(title, 30, headerArea.y + headerArea.h / 2);
+  M5.Display.drawString(getHeaderTitle(), 30, headerArea.y + headerArea.h / 2);
 
   drawAppTabs();
   drawHeaderStatusApp();
@@ -831,7 +866,8 @@ static void drawHeader() {
 static void updateStatusArea() {
   // Right-aligned status block. The clear width starts just past the app
   // tabs in the header so we don't wipe them out on partial refreshes.
-  int sx = SCREEN_W - 30;
+  int valueX = SCREEN_W - 30;
+  int countX = valueX;
   int y  = headerArea.y + 10;
   int h  = headerArea.h - 20;
   int statusX = appTab[2].x + appTab[2].w + 12;
@@ -846,7 +882,7 @@ static void updateStatusArea() {
   M5.Display.setFont(FONT_HUGE);
   M5.Display.setTextColor(COL_VALUE, COL_PANEL);
   M5.Display.setTextDatum(middle_right);
-  M5.Display.drawString(buf, sx, y + h / 2);
+  M5.Display.drawString(buf, valueX, y + h / 2);
 
   // Small MIDI I/O counters above the value line.
   char line[48];
@@ -854,7 +890,9 @@ static void updateStatusArea() {
   M5.Display.setFont(FONT_TINY);
   M5.Display.setTextColor(COL_MUTED, COL_PANEL);
   M5.Display.setTextDatum(top_right);
-  M5.Display.drawString(line, sx, headerArea.y + 8);
+  M5.Display.drawString(line, countX, headerArea.y + 8);
+
+  drawMidiInputSourceBtn();
 
   // BT status indicator above the title on the left side.
   BT_STATUS bt = ble_hid_status();
@@ -881,6 +919,40 @@ static uint16_t btStatusColor(BT_STATUS s) {
     case BT_SCANNING:   return TFT_CYAN;
     default:            return COL_MUTED;
   }
+}
+
+static const char* getHeaderTitle() {
+  if (currentApp == APP_MIDI) {
+    return (midiManagePage == MIDI_PAGE_FILTER) ? "Filter" : "Mapper";
+  } else if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF)) {
+    return "SMF Player";
+  } else if ((currentApp == APP_PLAY && currentPlay == PLAY_MP3)) {
+    return "MP3 Player";
+  }
+  return "Transposer";
+}
+
+static const char* getMidiInputSourceLabel() {
+  switch (midiInputSource) {
+    case MIDI_INPUT_USB: return "USBIN";
+    case MIDI_INPUT_MIX: return "MIX";
+    default:             return "MIDIIN";
+  }
+}
+
+static void drawMidiInputSourceBtn() {
+  const bool usbSelected = (midiInputSource == MIDI_INPUT_USB);
+  const bool mixSelected = (midiInputSource == MIDI_INPUT_MIX);
+  uint16_t bg = COL_BTN;
+  uint16_t txt = COL_BTN_TXT;
+  if (mixSelected) {
+    bg = COL_ACCENT;
+    txt = COL_BTN_TXT_HI;
+  } else if (usbSelected) {
+    bg = g_usbMidiMounted ? COL_BTN_HI : COL_BTN_HI2;
+    txt = g_usbMidiMounted ? COL_BTN_TXT_HI : COL_BTN_TXT;
+  }
+  drawRectBtn(midiInputSourceBtn, bg, COL_BTN_BDR, getMidiInputSourceLabel(), txt, FONT_MED);
 }
 
 static void drawToolbar() {
@@ -934,7 +1006,8 @@ static void drawHeaderStatusApp() {
     return;
   }
 
-  int sx = SCREEN_W - 30;
+  int valueX = SCREEN_W - 30;
+  int countX = valueX;
   int y  = headerArea.y + 10;
   int h  = headerArea.h - 20;
   int statusX = appTab[2].x + appTab[2].w + 12;
@@ -949,7 +1022,7 @@ static void drawHeaderStatusApp() {
     char line[48];
     snprintf(line, sizeof(line), "%d file(s)   %s",
              (int)smfPlaylist.size(), smfLoop ? "Loop ON" : "Loop OFF");
-    M5.Display.drawString(line, sx, headerArea.y + 8);
+    M5.Display.drawString(line, countX, headerArea.y + 8);
 
     uint32_t elapsed = smfPlaying
                      ? smfPausedElapsedMs + (millis() - smfPlaybackStartMs)
@@ -962,12 +1035,12 @@ static void drawHeaderStatusApp() {
     M5.Display.setFont(FONT_HUGE);
     M5.Display.setTextColor(smfPlaying ? COL_BTN_HI : COL_MUTED, COL_PANEL);
     M5.Display.setTextDatum(middle_right);
-    M5.Display.drawString(buf, sx, y + h / 2);
+    M5.Display.drawString(buf, valueX, y + h / 2);
   } else {
     char line[48];
     snprintf(line, sizeof(line), "%d file(s)   Vol %d%%",
              (int)mp3Playlist.size(), (mp3Volume * 100) / 255);
-    M5.Display.drawString(line, sx, headerArea.y + 8);
+    M5.Display.drawString(line, countX, headerArea.y + 8);
 
     uint32_t elapsed = (mp3Playing && mp3PlaybackStartMs)
                      ? (millis() - mp3PlaybackStartMs) : 0;
@@ -979,8 +1052,10 @@ static void drawHeaderStatusApp() {
     M5.Display.setFont(FONT_HUGE);
     M5.Display.setTextColor(mp3Playing ? COL_ACCENT : COL_MUTED, COL_PANEL);
     M5.Display.setTextDatum(middle_right);
-    M5.Display.drawString(buf, sx, y + h / 2);
+    M5.Display.drawString(buf, valueX, y + h / 2);
   }
+
+  drawMidiInputSourceBtn();
 
   BT_STATUS bt = ble_hid_status();
   M5.Display.fillRect(30, headerArea.y + 4, 260, 24, COL_PANEL);
@@ -2330,7 +2405,302 @@ static void setCurrentTransposeButton() {
   }
 }
 
+static void resetMidiInputParser() {
+  // The MIDI parser currently lives inside processMIDIByte() and does not need
+  // explicit reset state for the source toggle path.
+}
+
+// =================================================================
+//  USB MIDI host (ESP-IDF usb_host driver)
+// =================================================================
+static void usbMidiRingPush(const uint8_t* bytes, size_t n) {
+  portENTER_CRITICAL(&g_usbMidiRingMux);
+  for (size_t i = 0; i < n; i++) {
+    uint16_t next = (uint16_t)((g_usbMidiRingHead + 1) % USB_MIDI_RING_SIZE);
+    if (next == g_usbMidiRingTail) break;  // full → drop the rest
+    g_usbMidiRing[g_usbMidiRingHead] = bytes[i];
+    g_usbMidiRingHead = next;
+  }
+  portEXIT_CRITICAL(&g_usbMidiRingMux);
+}
+
+static int usbMidiRingPop() {
+  int v = -1;
+  portENTER_CRITICAL(&g_usbMidiRingMux);
+  if (g_usbMidiRingHead != g_usbMidiRingTail) {
+    v = g_usbMidiRing[g_usbMidiRingTail];
+    g_usbMidiRingTail = (uint16_t)((g_usbMidiRingTail + 1) % USB_MIDI_RING_SIZE);
+  }
+  portEXIT_CRITICAL(&g_usbMidiRingMux);
+  return v;
+}
+
+static size_t usbMidiRingAvailable() {
+  size_t a;
+  portENTER_CRITICAL(&g_usbMidiRingMux);
+  uint16_t h = g_usbMidiRingHead, t = g_usbMidiRingTail;
+  a = (h >= t) ? (size_t)(h - t) : (size_t)(USB_MIDI_RING_SIZE - t + h);
+  portEXIT_CRITICAL(&g_usbMidiRingMux);
+  return a;
+}
+
+// USB-MIDI 1.0 Code Index Number (CIN) → number of MIDI bytes following the
+// header byte in a 4-byte event packet. Index by low nibble of the header.
+static const uint8_t USB_MIDI_CIN_LEN[16] = {
+  0, 0, 2, 3, 3, 1, 2, 3, 3, 3, 3, 3, 2, 2, 3, 1
+};
+
+// Submitted IN-endpoint transfer completed. Runs in USB task context. Parse
+// USB-MIDI packets into a raw MIDI byte stream so the existing MIDI parser
+// in the loop can process it.
+static void usbMidiInDoneCb(usb_transfer_t* t) {
+  if (t->status == USB_TRANSFER_STATUS_COMPLETED && t->actual_num_bytes >= 4) {
+    for (int off = 0; off + 4 <= t->actual_num_bytes; off += 4) {
+      const uint8_t* p = t->data_buffer + off;
+      // Empty packet (no event) — common when an IN poll returns nothing.
+      if (p[0] == 0x00 && p[1] == 0x00 && p[2] == 0x00 && p[3] == 0x00) continue;
+      uint8_t cin = p[0] & 0x0F;
+      uint8_t n   = USB_MIDI_CIN_LEN[cin];
+      if (n == 0) continue;
+      usbMidiRingPush(p + 1, n);
+    }
+  }
+  // Always re-arm the transfer while the device is mounted so the next batch
+  // arrives. If the device was unplugged the resubmit will fail and we let
+  // the device-gone event tear things down.
+  if (g_usbMidiMounted) {
+    if (usb_host_transfer_submit(t) != ESP_OK) {
+      // submit failed → leave it to the next mount cycle
+    }
+  }
+}
+
+// Walk the active configuration descriptor and claim the first MIDI Streaming
+// interface (Audio class 0x01, subclass 0x03), allocating an IN-endpoint
+// transfer to receive USB-MIDI events.
+static bool usbMidiClaimAndStart(const usb_config_desc_t* cfg) {
+  const uint8_t* p = cfg->val;
+  uint16_t total = cfg->wTotalLength;
+  uint16_t i = 0;
+
+  uint8_t  midiItfNum    = 0xFF;
+  uint8_t  midiItfAlt    = 0;
+  uint8_t  inEp          = 0;
+  uint16_t inEpMaxPacket = 0;
+  uint8_t  inEpInterval  = 1;
+
+  // First pass: locate Audio/MIDI Streaming interface and IN endpoint.
+  while (i + 2 <= total) {
+    uint8_t len = p[i];
+    if (len < 2 || i + len > total) break;
+    uint8_t type = p[i + 1];
+    if (type == 0x04 /*INTERFACE*/ && len >= 9) {
+      uint8_t itfNum   = p[i + 2];
+      uint8_t itfAlt   = p[i + 3];
+      uint8_t numEp    = p[i + 4];
+      uint8_t cls      = p[i + 5];
+      uint8_t subcls   = p[i + 6];
+      if (cls == 0x01 /*AUDIO*/ && subcls == 0x03 /*MIDI_STREAMING*/) {
+        midiItfNum = itfNum;
+        midiItfAlt = itfAlt;
+        // Scan endpoints belonging to this interface
+        uint16_t j = i + len;
+        uint8_t  epSeen = 0;
+        while (j + 2 <= total && epSeen < numEp) {
+          uint8_t lj = p[j];
+          if (lj < 2 || j + lj > total) break;
+          uint8_t tj = p[j + 1];
+          if (tj == 0x04 /*INTERFACE*/) break;  // hit next interface
+          if (tj == 0x05 /*ENDPOINT*/ && lj >= 7) {
+            uint8_t  addr   = p[j + 2];
+            uint16_t maxPkt = (uint16_t)(p[j + 4] | (p[j + 5] << 8));
+            uint8_t  bIntr  = p[j + 6];
+            if ((addr & 0x80) && inEp == 0) {
+              inEp          = addr;
+              inEpMaxPacket = maxPkt > 64 ? 64 : (maxPkt == 0 ? 64 : maxPkt);
+              inEpInterval  = bIntr ? bIntr : 1;
+            }
+            epSeen++;
+          }
+          j += lj;
+        }
+        if (inEp) break;  // got what we need
+      }
+    }
+    i += len;
+  }
+
+  if (midiItfNum == 0xFF || inEp == 0) {
+    Serial.println("[USB] no MIDI Streaming interface found");
+    return false;
+  }
+
+  esp_err_t err = usb_host_interface_claim(g_usbClient, g_usbDevice, midiItfNum, midiItfAlt);
+  if (err != ESP_OK) {
+    Serial.printf("[USB] interface_claim itf=%u alt=%u err=0x%x\n",
+                  (unsigned)midiItfNum, (unsigned)midiItfAlt, (unsigned)err);
+    return false;
+  }
+
+  err = usb_host_transfer_alloc(inEpMaxPacket, 0, &g_usbInXfer);
+  if (err != ESP_OK || g_usbInXfer == nullptr) {
+    Serial.printf("[USB] transfer_alloc err=0x%x\n", (unsigned)err);
+    usb_host_interface_release(g_usbClient, g_usbDevice, midiItfNum);
+    return false;
+  }
+  g_usbInXfer->device_handle    = g_usbDevice;
+  g_usbInXfer->bEndpointAddress = inEp;
+  g_usbInXfer->callback         = usbMidiInDoneCb;
+  g_usbInXfer->context          = nullptr;
+  g_usbInXfer->num_bytes        = inEpMaxPacket;
+  g_usbInXfer->timeout_ms       = 0;
+
+  g_usbMidiClaimedItf = midiItfNum;
+  g_usbMidiInEpAddr   = inEp;
+  g_usbMidiCableCount = 1;  // we don't parse Element/Jack descriptors; assume 1
+  g_usbMidiActiveIndex = 0;
+  g_usbMidiMounted    = true;
+
+  if (usb_host_transfer_submit(g_usbInXfer) != ESP_OK) {
+    Serial.println("[USB] initial IN submit failed");
+  }
+  Serial.printf("[USB] MIDI mounted itf=%u in_ep=0x%02x mps=%u poll=%u\n",
+                (unsigned)midiItfNum, (unsigned)inEp,
+                (unsigned)inEpMaxPacket, (unsigned)inEpInterval);
+  needPartialUpdate = true;
+  return true;
+}
+
+static void usbMidiTeardown() {
+  g_usbMidiMounted = false;
+  if (g_usbInXfer) {
+    usb_host_transfer_free(g_usbInXfer);
+    g_usbInXfer = nullptr;
+  }
+  if (g_usbDevice && g_usbClient && g_usbMidiClaimedItf != 0xFF) {
+    usb_host_interface_release(g_usbClient, g_usbDevice, g_usbMidiClaimedItf);
+  }
+  g_usbMidiClaimedItf = 0xFF;
+  g_usbMidiInEpAddr   = 0;
+  g_usbMidiCableCount = 0;
+  g_usbMidiActiveIndex = 0xFF;
+  if (g_usbDevice) {
+    usb_host_device_close(g_usbClient, g_usbDevice);
+    g_usbDevice = nullptr;
+  }
+  needPartialUpdate = true;
+}
+
+// Called by the USB host stack when a device is attached or removed.
+static void usbClientEventCb(const usb_host_client_event_msg_t* msg, void* /*arg*/) {
+  switch (msg->event) {
+    case USB_HOST_CLIENT_EVENT_NEW_DEV: {
+      if (g_usbDevice) break;  // already have one (we don't manage hubs of MIDI devices)
+      esp_err_t err = usb_host_device_open(g_usbClient, msg->new_dev.address, &g_usbDevice);
+      if (err != ESP_OK) {
+        Serial.printf("[USB] device_open err=0x%x\n", (unsigned)err);
+        g_usbDevice = nullptr;
+        break;
+      }
+      const usb_config_desc_t* cfg = nullptr;
+      err = usb_host_get_active_config_descriptor(g_usbDevice, &cfg);
+      if (err != ESP_OK || !cfg) {
+        Serial.printf("[USB] get_active_config_descriptor err=0x%x\n", (unsigned)err);
+        usb_host_device_close(g_usbClient, g_usbDevice);
+        g_usbDevice = nullptr;
+        break;
+      }
+      if (!usbMidiClaimAndStart(cfg)) {
+        // Not a MIDI device (or no claim) — release the device handle.
+        usb_host_device_close(g_usbClient, g_usbDevice);
+        g_usbDevice = nullptr;
+      }
+      break;
+    }
+    case USB_HOST_CLIENT_EVENT_DEV_GONE: {
+      Serial.println("[USB] device gone");
+      usbMidiTeardown();
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+// Background task: drives the host stack and the registered client.
+static void usbHostTask(void* /*arg*/) {
+  for (;;) {
+    uint32_t evtFlags = 0;
+    usb_host_lib_handle_events(pdMS_TO_TICKS(20), &evtFlags);
+    if (g_usbClient) {
+      usb_host_client_handle_events(g_usbClient, pdMS_TO_TICKS(5));
+    }
+    // No periodic resubmit needed — usbMidiInDoneCb resubmits.
+  }
+}
+
+static bool startUsbHost() {
+  if (g_usbHostReady) return true;
+
+  usb_host_config_t hostCfg = {};
+  hostCfg.skip_phy_setup = false;             // let IDF bring up the PHY
+  hostCfg.intr_flags     = ESP_INTR_FLAG_LEVEL1;
+  esp_err_t err = usb_host_install(&hostCfg);
+  if (err != ESP_OK) {
+    Serial.printf("[USB] host_install err=0x%x\n", (unsigned)err);
+    return false;
+  }
+
+  usb_host_client_config_t clientCfg = {};
+  clientCfg.is_synchronous   = false;
+  clientCfg.max_num_event_msg = 5;
+  clientCfg.async.client_event_callback = usbClientEventCb;
+  clientCfg.async.callback_arg          = nullptr;
+  err = usb_host_client_register(&clientCfg, &g_usbClient);
+  if (err != ESP_OK) {
+    Serial.printf("[USB] client_register err=0x%x\n", (unsigned)err);
+    usb_host_uninstall();
+    return false;
+  }
+
+  BaseType_t ok = xTaskCreatePinnedToCore(
+    usbHostTask, "usbh", 4096, nullptr, 5, &g_usbTask, 0);
+  if (ok != pdPASS) {
+    Serial.println("[USB] usb host task spawn failed");
+    usb_host_client_deregister(g_usbClient);
+    g_usbClient = nullptr;
+    usb_host_uninstall();
+    return false;
+  }
+
+  g_usbHostReady = true;
+  Serial.println("[USB] host ready (idf usb_host); waiting for MIDI device");
+  return true;
+}
+
+static bool setMidiInputSource(MidiInputSource source) {
+  if (midiInputSource == source) return true;
+  sendAllNotesOff();
+  resetMidiInputParser();
+  midiInputSource = source;
+  needFullRedraw = true;
+  needPartialUpdate = true;
+  return true;
+}
+
+static MidiInputSource nextMidiInputSource() {
+  switch (midiInputSource) {
+    case MIDI_INPUT_MIX:  return MIDI_INPUT_USB;
+    case MIDI_INPUT_USB:  return MIDI_INPUT_UNIT;
+    default:              return MIDI_INPUT_MIX;
+  }
+}
+
 static void handleToolbarTouch(int x, int y) {
+  if (hit(midiInputSourceBtn, x, y)) {
+    setMidiInputSource(nextMidiInputSource());
+    return;
+  }
   // Top app tabs are always visible.
   for (int i = 0; i < 3; ++i) {
     if (hit(appTab[i], x, y)) {
@@ -3143,7 +3513,7 @@ static void clearTrackedNoteStates() {
 }
 
 static bool isMidiInputIdle(uint32_t now) {
-  return Serial2.available() == 0 && (now - g_lastMidiInputAt) >= 250;
+  return getCurrentMidiInputAvailable() == 0 && (now - g_lastMidiInputAt) >= 250;
 }
 
 static void processDeferredStorageTasks(uint32_t now) {
@@ -3600,14 +3970,59 @@ static void processMIDIByte(uint8_t data) {
   }
 }
 
-static void processMIDI() {
+static size_t getCurrentMidiInputAvailable() {
+  if (midiInputSource == MIDI_INPUT_UNIT) {
+    return (size_t)Serial2.available();
+  }
+  size_t usbAvailable = g_usbMidiMounted ? usbMidiRingAvailable() : 0;
+  if (midiInputSource == MIDI_INPUT_USB) return usbAvailable;
+  return (size_t)Serial2.available() + usbAvailable;
+}
+
+static void serviceUsbHost(uint32_t now) {
+  (void)now;
+  // ESP-IDF host events are pumped by the dedicated task on core 0.
+}
+
+static void processUsbMidiInput() {
+  if (midiInputSource != MIDI_INPUT_USB && midiInputSource != MIDI_INPUT_MIX) return;
+  if (!g_usbHostReady || !g_usbMidiMounted) return;
+
   bool sawInput = false;
-  while (Serial2.available()) {
-    uint8_t b = Serial2.read();
+  while (true) {
+    int b = usbMidiRingPop();
+    if (b < 0) break;
     sawInput = true;
     midiInCount++;
-    processMIDIByte(b);
+    processMIDIByte((uint8_t)b);
   }
+  if (sawInput) g_lastMidiInputAt = millis();
+}
+
+static void processMidiInput() {
+  bool sawInput = false;
+
+  if (midiInputSource == MIDI_INPUT_UNIT || midiInputSource == MIDI_INPUT_MIX) {
+    while (Serial2.available()) {
+      uint8_t b = Serial2.read();
+      sawInput = true;
+      midiInCount++;
+      processMIDIByte(b);
+    }
+  }
+
+  if (midiInputSource == MIDI_INPUT_USB || midiInputSource == MIDI_INPUT_MIX) {
+    if (g_usbMidiMounted) {
+      while (true) {
+        int b = usbMidiRingPop();
+        if (b < 0) break;
+        sawInput = true;
+        midiInCount++;
+        processMIDIByte((uint8_t)b);
+      }
+    }
+  }
+
   if (sawInput) g_lastMidiInputAt = millis();
 }
 
@@ -3833,11 +4248,14 @@ static void injectTouchPoint(int16_t x, int16_t y) {
 static void printUsbSerialStatus() {
   const char* pageLabel       = (midiManagePage == MIDI_PAGE_FILTER) ? "FILTER" : "MAPPER";
   const char* mapperPageLabel = (midiMapperEditPage == MAPPER_PAGE_SOURCE) ? "PG1" : "PG2";
+  const char* inputLabel      = getMidiInputSourceLabel();
+  const char* usbLabel        = g_usbMidiMounted ? "connected" : "disconnected";
   Serial.printf(
-    "OK STATUS app=%s mode=%s transpose=%d range=%d filter_bypass=%d mapper_bypass=%d "
-    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu bt=%s\n",
+    "OK STATUS app=%s mode=%s input=%s transpose=%d range=%d filter_bypass=%d mapper_bypass=%d "
+    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu bt=%s usb_in=%s cables=%u\n",
     getAppLabel(currentApp),
     getDisplayModeLabel(currentMode),
+    inputLabel,
     (int)transposeValue,
     (int)transposeRange,
     midiFilterBypass ? 1 : 0,
@@ -3846,7 +4264,9 @@ static void printUsbSerialStatus() {
     midiSelectedMapperRule + 1, midiMapperRuleCount,
     pageLabel, mapperPageLabel,
     midiInCount, midiOutCount,
-    getBtStatusLabelTab(g_lastBtStatus)
+    getBtStatusLabelTab(g_lastBtStatus),
+    usbLabel,
+    (unsigned)g_usbMidiCableCount
   );
 }
 
@@ -3860,6 +4280,7 @@ static void printUsbSerialHelp() {
   Serial.println("MODE DIRECT|KEY|INSTANT|SEQUENCE|FILTER|MAPPER|MIDI|SMF|MP3");
   Serial.println("GROUP TRANSPOSE|MIDI");
   Serial.println("SET TRANSPOSE <-12..12>");
+  Serial.println("SET INPUT USBIN|MIDIIN|MIX");
   Serial.println("SET FILTER BYPASS|ACTIVE");
   Serial.println("SET MAPPER BYPASS|ACTIVE");
   Serial.println("INFO SCREEN");
@@ -3944,6 +4365,26 @@ static void handleUsbSerialCommand(char* line) {
       Serial.printf("OK SET TRANSPOSE %d\n", (int)transposeValue);
       return;
     }
+    if (target && tokenEqualsIgnoreCase(target, "INPUT")) {
+      char* val = strtok_r(nullptr, " \t", &save);
+      if (val && (tokenEqualsIgnoreCase(val, "USB") || tokenEqualsIgnoreCase(val, "USB-MIDI") || tokenEqualsIgnoreCase(val, "USBIN"))) {
+        if (!setMidiInputSource(MIDI_INPUT_USB)) { Serial.println("ERR SET INPUT USBIN failed"); return; }
+        Serial.println("OK SET INPUT USBIN");
+        return;
+      }
+      if (val && (tokenEqualsIgnoreCase(val, "MIDIIF") || tokenEqualsIgnoreCase(val, "UNIT") || tokenEqualsIgnoreCase(val, "MIDI-IF") || tokenEqualsIgnoreCase(val, "MIDIIN"))) {
+        if (!setMidiInputSource(MIDI_INPUT_UNIT)) { Serial.println("ERR SET INPUT MIDIIN failed"); return; }
+        Serial.println("OK SET INPUT MIDIIN");
+        return;
+      }
+      if (val && tokenEqualsIgnoreCase(val, "MIX")) {
+        if (!setMidiInputSource(MIDI_INPUT_MIX)) { Serial.println("ERR SET INPUT MIX failed"); return; }
+        Serial.println("OK SET INPUT MIX");
+        return;
+      }
+      Serial.println("ERR SET INPUT requires USBIN, MIDIIN, or MIX");
+      return;
+    }
     if (target && tokenEqualsIgnoreCase(target, "FILTER")) {
       char* val = strtok_r(nullptr, " \t", &save);
       if (val && tokenEqualsIgnoreCase(val, "BYPASS")) { midiFilterBypass = true;  needFullRedraw = true; Serial.println("OK SET FILTER BYPASS"); return; }
@@ -4002,6 +4443,15 @@ void setup() {
   Serial2.begin(MIDI_BAUD, SERIAL_8N1, RXD2, TXD2);
   Serial2.setRxBufferSize(1024);
   Serial2.setTxBufferSize(512);
+
+  // Start USB host once at boot. Input-source changes only toggle whether
+  // received data is consumed, never the USB host itself.
+  if (startUsbHost()) {
+    Serial.println("[USB] host ready");
+  } else {
+    Serial.println("[USB] host init failed; UART-only fallback active");
+  }
+
   sendGSReset();
   delay(30);
   sendAllNotesOff();
@@ -4038,11 +4488,15 @@ void setup() {
 }
 
 void loop() {
-  if (currentApp == APP_TRANSPOSE || currentApp == APP_MIDI) {
-    processMIDI();
-    processPedal();
-  } else if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF)) {
+  uint32_t now = millis();
+  serviceUsbHost(now);
+
+  if (currentApp == APP_PLAY && currentPlay == PLAY_SMF) {
+    processMidiInput();
     processSmf();
+  } else if (currentApp == APP_TRANSPOSE || currentApp == APP_MIDI) {
+    processMidiInput();
+    processPedal();
   } else {
     processMp3();
   }
@@ -4052,7 +4506,6 @@ void loop() {
   static uint32_t lastUI = 0;
   static uint32_t lastSmfHeaderRefresh = 0;
   static uint32_t lastMp3HeaderRefresh = 0;
-  uint32_t now = millis();
   processDeferredStorageTasks(now);
   if (now - lastUI >= 20) {
     lastUI = now;
