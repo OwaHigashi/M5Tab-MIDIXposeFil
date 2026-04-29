@@ -249,6 +249,7 @@ static std::vector<String> mp3Playlist;
 static int mp3CurrentTrack = 0;
 static int mp3ListScroll = 0;
 static bool mp3Playing = false;
+static uint32_t mp3PlaybackStartMs = 0;
 static int mp3Volume = 220;  // M5.Speaker range is 0..255
 static float mp3CassetteAngle = 0.0f;
 static uint32_t mp3LastAnimMs = 0;
@@ -269,7 +270,7 @@ static Rect contentArea;      // main area
 static Rect navArea;          // bottom PREV / NEXT
 
 static Rect appTab[3];
-static const char* appName[3] = { "XPOSE", "MIDI", "PLAY" };
+static const char* appName[3] = { "XPOSE", "MSG", "PLAY" };
 // XPOSE app sub-mode tabs (4)
 static Rect modeTab[4];
 static const char* modeName[4] = { "DIR.", "KEY", "INST.", "SEQ." };
@@ -317,7 +318,9 @@ static void initInstant();
 static void initSequence();
 static void initPianoKeys(const Rect& area);
 static void drawInterface();
+static void drawSplash();
 static void drawHeader();
+static void drawAppTabs();
 static void drawToolbar();
 static void drawNav();
 static void drawDirect();
@@ -458,13 +461,19 @@ static void computeLayout() {
   int tabY = toolbarArea.y + 6;
   int tabH = 62;
 
-  int appGap = 6;
-  int appW = 124;
+  // App tabs (XPOSE / MIDI / PLAY) live in the header now, to the right of
+  // the title text. This frees the toolbar entirely for sub-mode tabs and
+  // transport buttons.
+  int appGap = 8;
+  int appW = 140;
+  int appTabHX0 = 460;                                       // start x in header
+  int appTabHY  = headerArea.y + (headerArea.h - tabH) / 2;  // centred vertically
   for (int i = 0; i < 3; ++i) {
-    appTab[i] = { tabX + i * (appW + appGap), tabY, appW, tabH };
+    appTab[i] = { appTabHX0 + i * (appW + appGap), appTabHY, appW, tabH };
   }
 
-  int toolStartX = appTab[2].x + appTab[2].w + 18;
+  // The toolbar can now start from the left edge.
+  int toolStartX = tabX;
   int auxW = 138;
   int auxGap = 8;
   int toolRightX = SCREEN_W - 20 - (auxW * 2 + auxGap);
@@ -491,26 +500,26 @@ static void computeLayout() {
   btnRange  = { SCREEN_W - (auxW * 2 + auxGap + 20), tabY, auxW, tabH };
   btnAllOff = { SCREEN_W - (auxW + 20),              tabY, auxW, tabH };
 
-  int playerGap = 10;
+  int playerGap = 12;
   // Transport buttons share the right portion next to the SMF/MP3 mode tabs and
-  // before the AOFF/range buttons. Compute available width from transStartX.
+  // before the AOFF button. Compute available width from transStartX.
   int transRightX = btnAllOff.x - 12;  // leave some space before AOFF
   int playerAvail = transRightX - transStartX;
-  int smfPrevW = 130;
-  int smfPlayW = 180;
-  int smfNextW = 130;
+  int smfPrevW = 170;
+  int smfPlayW = 230;
+  int smfNextW = 170;
   int smfLoopW = playerAvail - (smfPrevW + smfPlayW + smfNextW + playerGap * 3);
-  if (smfLoopW < 100) smfLoopW = 100;
+  if (smfLoopW < 120) smfLoopW = 120;
   smfBtnPrev = { transStartX, tabY, smfPrevW, tabH };
   smfBtnPlay = { smfBtnPrev.x + smfBtnPrev.w + playerGap, tabY, smfPlayW, tabH };
   smfBtnNext = { smfBtnPlay.x + smfBtnPlay.w + playerGap, tabY, smfNextW, tabH };
   smfBtnLoop = { smfBtnNext.x + smfBtnNext.w + playerGap, tabY, smfLoopW, tabH };
 
-  int mp3PrevW = 140;
-  int mp3PlayW = 170;
-  int mp3NextW = 120;
+  int mp3PrevW = 160;
+  int mp3PlayW = 220;
+  int mp3NextW = 160;
   int mp3VolW = (playerAvail - (mp3PrevW + mp3PlayW + mp3NextW + playerGap * 4)) / 2;
-  if (mp3VolW < 80) mp3VolW = 80;
+  if (mp3VolW < 100) mp3VolW = 100;
   mp3BtnPrev    = { transStartX, tabY, mp3PrevW, tabH };
   mp3BtnPlay    = { mp3BtnPrev.x + mp3BtnPrev.w + playerGap, tabY, mp3PlayW, tabH };
   mp3BtnNext    = { mp3BtnPlay.x + mp3BtnPlay.w + playerGap, tabY, mp3NextW, tabH };
@@ -724,27 +733,110 @@ static void initPianoKeys(const Rect& area) {
 // =================================================================
 //  Draw
 // =================================================================
+static void drawSplash() {
+  SCREEN_W = M5.Display.width();
+  SCREEN_H = M5.Display.height();
+
+  M5.Display.fillScreen(TFT_BLACK);
+
+  const int cx = SCREEN_W / 2;
+  const int cy = SCREEN_H / 2;
+
+  // Double frame for product feel.
+  M5.Display.drawRect(50, 50, SCREEN_W - 100, SCREEN_H - 100, 0x2104);
+  M5.Display.drawRect(54, 54, SCREEN_W - 108, SCREEN_H - 108, 0x18C3);
+
+  // Decorative lines flanking the title with accent dots at the corners.
+  M5.Display.drawFastHLine(cx - 320, cy - 90, 640, 0x39E7);
+  M5.Display.drawFastHLine(cx - 320, cy + 90, 640, 0x39E7);
+  M5.Display.fillCircle(cx - 320, cy - 90, 3, COL_ACCENT);
+  M5.Display.fillCircle(cx + 320, cy - 90, 3, COL_ACCENT);
+  M5.Display.fillCircle(cx - 320, cy + 90, 3, COL_ACCENT);
+  M5.Display.fillCircle(cx + 320, cy + 90, 3, COL_ACCENT);
+
+  // Subtitle under the brand line.
+  M5.Display.setFont(FONT_MED);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(0x8C71, TFT_BLACK);
+  M5.Display.drawString("MIDI Transposer  -  Player  -  BLE Pedal", cx, cy + 40);
+
+  // Footer.
+  M5.Display.setFont(FONT_TINY);
+  M5.Display.setTextColor(0x6B4D, TFT_BLACK);
+  M5.Display.drawString("for M5Stack Tab5", cx, cy + 170);
+
+  // Progress bar frame.
+  const int pbW = 520;
+  const int pbH = 4;
+  const int pbX = cx - pbW / 2;
+  const int pbY = cy + 140;
+  M5.Display.drawRoundRect(pbX, pbY, pbW, pbH, 2, 0x4208);
+
+  const uint32_t totalMs = 3000;
+  const uint32_t startMs = millis();
+
+  M5.Display.setFont(FONT_TITLE);
+  M5.Display.setTextDatum(middle_center);
+
+  int lastFill = -1;
+  uint16_t lastTitleCol = 0xFFFE;  // unlikely value, forces first draw
+
+  while (true) {
+    uint32_t e = millis() - startMs;
+    if (e >= totalMs) break;
+
+    // Title fades in over the first 700ms, holds, then fades out the last 300ms.
+    uint8_t lum;
+    if (e < 700)                lum = (uint8_t)((uint32_t)255 * e / 700);
+    else if (e > totalMs - 300) lum = (uint8_t)((uint32_t)255 * (totalMs - e) / 300);
+    else                        lum = 255;
+
+    uint16_t tcol = M5.Display.color565(lum, lum, lum);
+    if (tcol != lastTitleCol) {
+      M5.Display.setTextColor(tcol, TFT_BLACK);
+      M5.Display.drawString("OWAMIDICON-Tab", cx, cy - 30);
+      lastTitleCol = tcol;
+    }
+
+    int fill = (int)((uint64_t)(pbW - 4) * e / totalMs);
+    if (fill != lastFill) {
+      M5.Display.fillRoundRect(pbX + 2, pbY + 2, fill, pbH - 4, 1, COL_ACCENT);
+      lastFill = fill;
+    }
+    delay(16);
+  }
+}
+
 static void drawHeader() {
   M5.Display.fillRect(headerArea.x, headerArea.y, headerArea.w, headerArea.h, COL_PANEL);
 
   const char* title = "MIDI Transposer";
-  if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF)) title = "MIDI Player";
-  else if ((currentApp == APP_PLAY && currentPlay == PLAY_MP3)) title = "MP3 Player";
+  if (currentApp == APP_MIDI) {
+    title = (midiManagePage == MIDI_PAGE_FILTER) ? "MIDI Filter" : "MIDI Mapper";
+  } else if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF)) {
+    title = "SMF Player";
+  } else if ((currentApp == APP_PLAY && currentPlay == PLAY_MP3)) {
+    title = "MP3 Player";
+  }
 
   M5.Display.setFont(FONT_TITLE);
   M5.Display.setTextColor(COL_TITLE, COL_PANEL);
   M5.Display.setTextDatum(middle_left);
   M5.Display.drawString(title, 30, headerArea.y + headerArea.h / 2);
 
+  drawAppTabs();
   drawHeaderStatusApp();
 }
 
 static void updateStatusArea() {
-  // Right-aligned status block.
+  // Right-aligned status block. The clear width starts just past the app
+  // tabs in the header so we don't wipe them out on partial refreshes.
   int sx = SCREEN_W - 30;
   int y  = headerArea.y + 10;
   int h  = headerArea.h - 20;
-  M5.Display.fillRect(sx - 640, headerArea.y, 640, headerArea.h, COL_PANEL);
+  int statusX = appTab[2].x + appTab[2].w + 12;
+  int statusW = SCREEN_W - statusX;
+  M5.Display.fillRect(statusX, headerArea.y, statusW, headerArea.h, COL_PANEL);
 
   // Transpose value — large.
   char buf[32];
@@ -845,7 +937,9 @@ static void drawHeaderStatusApp() {
   int sx = SCREEN_W - 30;
   int y  = headerArea.y + 10;
   int h  = headerArea.h - 20;
-  M5.Display.fillRect(sx - 640, headerArea.y, 640, headerArea.h, COL_PANEL);
+  int statusX = appTab[2].x + appTab[2].w + 12;
+  int statusW = SCREEN_W - statusX;
+  M5.Display.fillRect(statusX, headerArea.y, statusW, headerArea.h, COL_PANEL);
 
   M5.Display.setFont(FONT_TINY);
   M5.Display.setTextColor(COL_MUTED, COL_PANEL);
@@ -875,10 +969,13 @@ static void drawHeaderStatusApp() {
              (int)mp3Playlist.size(), (mp3Volume * 100) / 255);
     M5.Display.drawString(line, sx, headerArea.y + 8);
 
-    char buf[96];
-    snprintf(buf, sizeof(buf), "%s   %s",
+    uint32_t elapsed = (mp3Playing && mp3PlaybackStartMs)
+                     ? (millis() - mp3PlaybackStartMs) : 0;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s   %02lu:%02lu",
              mp3Playing ? "PLAY" : "STOP",
-             mp3Artist[0] ? mp3Artist : "Local SD");
+             (unsigned long)(elapsed / 60000UL),
+             (unsigned long)((elapsed / 1000UL) % 60UL));
     M5.Display.setFont(FONT_HUGE);
     M5.Display.setTextColor(mp3Playing ? COL_ACCENT : COL_MUTED, COL_PANEL);
     M5.Display.setTextDatum(middle_right);
@@ -913,11 +1010,9 @@ static void drawToolbarApp() {
 
   if (currentApp == APP_TRANSPOSE) {
     drawToolbar();   // XPOSE: 4 mode tabs + RANGE + AOFF (existing)
-    drawAppTabs();
     return;
   }
 
-  drawAppTabs();
   drawAllOffBtn();
 
   if (currentApp == APP_MIDI) {
@@ -2808,6 +2903,7 @@ static bool startMp3Track(int index) {
   mp3Id3->RegisterMetadataCB(mp3MetadataCallback, nullptr);
   M5.Speaker.setVolume(mp3Volume);
   mp3Playing = mp3Decoder.begin(mp3Id3, &mp3Out);
+  mp3PlaybackStartMs = mp3Playing ? millis() : 0;
   mp3CassetteAngle = 0.0f;
   mp3LastAnimMs = millis();
   mp3StaticDirty = true;
@@ -2831,6 +2927,7 @@ static void stopMp3() {
     mp3File = nullptr;
   }
   mp3Playing = false;
+  mp3PlaybackStartMs = 0;
   mp3StaticDirty = true;
   mp3VisualDirty = true;
 }
@@ -2971,8 +3068,9 @@ static void handleTouch() {
   if (!t.wasPressed() && !t.wasHold()) return;  // one-shot tap / hold-begin only
 
   int x = t.x, y = t.y;
-  // Toolbar / nav are always available.
-  if (y < toolbarArea.y + toolbarArea.h && y >= toolbarArea.y) {
+  // Header now hosts the XPOSE/MIDI/PLAY app tabs — route header taps to the
+  // same handler as the toolbar (it already gates by rect hit).
+  if (y < toolbarArea.y + toolbarArea.h) {
     handleToolbarTouch(x, y);
     return;
   }
@@ -3899,6 +3997,8 @@ void setup() {
   M5.Display.setBrightness(220);
   M5.Speaker.setVolume(mp3Volume);
 
+  drawSplash();
+
   Serial2.begin(MIDI_BAUD, SERIAL_8N1, RXD2, TXD2);
   Serial2.setRxBufferSize(1024);
   Serial2.setTxBufferSize(512);
@@ -3951,6 +4051,7 @@ void loop() {
 
   static uint32_t lastUI = 0;
   static uint32_t lastSmfHeaderRefresh = 0;
+  static uint32_t lastMp3HeaderRefresh = 0;
   uint32_t now = millis();
   processDeferredStorageTasks(now);
   if (now - lastUI >= 20) {
@@ -3971,27 +4072,37 @@ void loop() {
       needPartialUpdate = true;
     }
 
+    if ((currentApp == APP_PLAY && currentPlay == PLAY_MP3) && mp3Playing && now - lastMp3HeaderRefresh >= 500) {
+      lastMp3HeaderRefresh = now;
+      needPartialUpdate = true;
+    }
+
     if (needFullRedraw) {
       drawInterface();
       needFullRedraw = false;
       midiManageDirty = false;
       needPartialUpdate = false;
-    } else if (currentApp == APP_MIDI && midiManageDirty) {
-      drawMidiManage();
-      midiManageDirty = false;
-    } else if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF) && smfPlaying) {
-      Rect fullArea = {
-        contentArea.x,
-        contentArea.y,
-        contentArea.w,
-        contentArea.h + navArea.h
-      };
-      flushSmfMonitorDirty(fullArea);
-    } else if ((currentApp == APP_PLAY && currentPlay == PLAY_MP3) && (mp3StaticDirty || mp3VisualDirty)) {
-      drawMp3();
-    } else if (needPartialUpdate) {
-      drawHeaderStatusApp();
-      needPartialUpdate = false;
+    } else {
+      if (currentApp == APP_MIDI && midiManageDirty) {
+        drawMidiManage();
+        midiManageDirty = false;
+      }
+      if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF) && smfPlaying) {
+        Rect fullArea = {
+          contentArea.x,
+          contentArea.y,
+          contentArea.w,
+          contentArea.h + navArea.h
+        };
+        flushSmfMonitorDirty(fullArea);
+      }
+      if ((currentApp == APP_PLAY && currentPlay == PLAY_MP3) && (mp3StaticDirty || mp3VisualDirty)) {
+        drawMp3();
+      }
+      if (needPartialUpdate) {
+        drawHeaderStatusApp();
+        needPartialUpdate = false;
+      }
     }
   }
 }
