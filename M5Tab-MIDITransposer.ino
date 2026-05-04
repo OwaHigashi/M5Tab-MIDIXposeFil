@@ -26,8 +26,8 @@
 #include <FS.h>
 #include <SD.h>
 #include <SPI.h>
-#include <vector>
 #include <math.h>
+#include <new>
 #include <SdFat.h>
 #include <M5Unified.h>
 #include <AudioFileSourceFS.h>
@@ -150,8 +150,14 @@ static int seqCurrentStep    = 0;
 
 // ==== SMF Player ====
 static constexpr const char* SMF_FOLDER = "/smf";
+// Fixed-size playlist storage. See note in M5Tab-MIDIXposeFil: using
+// String/vector<String> on this hot path causes heap fragmentation that
+// kills the device after a few hours of use.
+static const int   SMF_MAX_FILES     = 256;
+static const int   PLAYLIST_PATH_MAX = 128;
 static MD_MIDIFile smf;
-static std::vector<String> smfPlaylist;
+static char        smfPlaylist[SMF_MAX_FILES][PLAYLIST_PATH_MAX];
+static int         smfPlaylistCount = 0;
 static int smfCurrentTrack = 0;
 static int smfListScroll = 0;
 static bool smfLoaded = false;
@@ -169,7 +175,9 @@ static char smfCurrentName[128] = {};
 
 // ==== MP3 Player ====
 static constexpr const char* MP3_FOLDER = "/mp3";
-static std::vector<String> mp3Playlist;
+static const int MP3_MAX_FILES = 256;
+static char      mp3Playlist[MP3_MAX_FILES][PLAYLIST_PATH_MAX];
+static int       mp3PlaylistCount = 0;
 static int mp3CurrentTrack = 0;
 static int mp3ListScroll = 0;
 static bool mp3Playing = false;
@@ -741,7 +749,7 @@ static void drawHeaderStatusApp() {
   if (currentApp == APP_SMF) {
     char line[48];
     snprintf(line, sizeof(line), "%d file(s)   %s",
-             (int)smfPlaylist.size(), smfLoop ? "Loop ON" : "Loop OFF");
+             smfPlaylistCount, smfLoop ? "Loop ON" : "Loop OFF");
     M5.Display.drawString(line, sx, headerArea.y + 8);
 
     uint32_t elapsed = smfPlaying
@@ -759,7 +767,7 @@ static void drawHeaderStatusApp() {
   } else {
     char line[48];
     snprintf(line, sizeof(line), "%d file(s)   Vol %d%%",
-             (int)mp3Playlist.size(), (mp3Volume * 100) / 255);
+             mp3PlaylistCount, (mp3Volume * 100) / 255);
     M5.Display.drawString(line, sx, headerArea.y + 8);
 
     char buf[96];
@@ -1184,13 +1192,13 @@ static void drawMp3Static() {
   if (mp3ListScroll < 0) mp3ListScroll = 0;
   for (int row = 0; row < visible; ++row) {
     int idx = mp3ListScroll + row;
-    if (idx >= (int)mp3Playlist.size()) break;
+    if (idx >= mp3PlaylistCount) break;
     Rect rr = { mp3ListArea.x + 10, top + row * lineH, mp3ListArea.w - 20, lineH - 2 };
     rr.w = listRight - rr.x;
     bool on = (idx == mp3CurrentTrack);
     M5.Display.fillRoundRect(rr.x, rr.y, rr.w, rr.h, 6, on ? COL_BTN_HI2 : COL_PANEL);
-    const char* slash = strrchr(mp3Playlist[idx].c_str(), '/');
-    const char* name = slash ? slash + 1 : mp3Playlist[idx].c_str();
+    const char* slash = strrchr(mp3Playlist[idx], '/');
+    const char* name  = slash ? slash + 1 : mp3Playlist[idx];
     drawTextFit(rr, name, FONT_TINY, on ? COL_BTN_TXT_HI : COL_BTN_TXT,
                 on ? COL_BTN_HI2 : COL_PANEL);
   }
@@ -1293,16 +1301,16 @@ static void drawSmf() {
   if (smfCurrentTrack < smfListScroll) smfListScroll = smfCurrentTrack;
   if (smfCurrentTrack >= smfListScroll + visible) smfListScroll = smfCurrentTrack - visible + 1;
   if (smfListScroll < 0) smfListScroll = 0;
-  int maxScroll = max(0, (int)smfPlaylist.size() - visible);
+  int maxScroll = max(0, smfPlaylistCount - visible);
   if (smfListScroll > maxScroll) smfListScroll = maxScroll;
   for (int row = 0; row < visible; ++row) {
     int idx = smfListScroll + row;
-    if (idx >= (int)smfPlaylist.size()) break;
+    if (idx >= smfPlaylistCount) break;
     Rect rr = { smfListArea.x + 10, top + row * lineH, smfListArea.w - 20, lineH - 2 };
     bool on = (idx == smfCurrentTrack);
     M5.Display.fillRoundRect(rr.x, rr.y, rr.w, rr.h, 6, on ? COL_BTN_HI2 : COL_PANEL);
-    const char* slash = strrchr(smfPlaylist[idx].c_str(), '/');
-    const char* name = slash ? slash + 1 : smfPlaylist[idx].c_str();
+    const char* slash = strrchr(smfPlaylist[idx], '/');
+    const char* name  = slash ? slash + 1 : smfPlaylist[idx];
     M5.Display.setFont(FONT_TINY);
     M5.Display.setTextColor(on ? COL_BTN_TXT_HI : COL_BTN_TXT, on ? COL_BTN_HI2 : COL_PANEL);
     M5.Display.setTextDatum(middle_left);
@@ -1356,15 +1364,15 @@ static void handleToolbarTouch(int x, int y) {
   }
 
   if (currentApp == APP_SMF) {
-    if (hit(smfBtnPrev, x, y) && !smfPlaylist.empty()) {
-      loadSmfTrack((smfCurrentTrack > 0) ? smfCurrentTrack - 1 : (int)smfPlaylist.size() - 1);
+    if (hit(smfBtnPrev, x, y) && smfPlaylistCount > 0) {
+      loadSmfTrack((smfCurrentTrack > 0) ? smfCurrentTrack - 1 : smfPlaylistCount - 1);
       needFullRedraw = true;
     } else if (hit(smfBtnPlay, x, y)) {
       if (smfPlaying) stopSmf();
       else playSmf();
       needFullRedraw = true;
-    } else if (hit(smfBtnNext, x, y) && !smfPlaylist.empty()) {
-      loadSmfTrack((smfCurrentTrack + 1) % (int)smfPlaylist.size());
+    } else if (hit(smfBtnNext, x, y) && smfPlaylistCount > 0) {
+      loadSmfTrack((smfCurrentTrack + 1) % smfPlaylistCount);
       needFullRedraw = true;
     } else if (hit(smfBtnLoop, x, y)) {
       smfLoop = !smfLoop;
@@ -1375,15 +1383,15 @@ static void handleToolbarTouch(int x, int y) {
   }
 
   if (currentApp == APP_MP3) {
-    if (hit(mp3BtnPrev, x, y) && !mp3Playlist.empty()) {
-      startMp3Track((mp3CurrentTrack > 0) ? mp3CurrentTrack - 1 : (int)mp3Playlist.size() - 1);
+    if (hit(mp3BtnPrev, x, y) && mp3PlaylistCount > 0) {
+      startMp3Track((mp3CurrentTrack > 0) ? mp3CurrentTrack - 1 : mp3PlaylistCount - 1);
       needFullRedraw = true;
     } else if (hit(mp3BtnPlay, x, y)) {
       if (mp3Playing) stopMp3();
       else startMp3Track(mp3CurrentTrack);
       needFullRedraw = true;
-    } else if (hit(mp3BtnNext, x, y) && !mp3Playlist.empty()) {
-      startMp3Track((mp3CurrentTrack + 1) % (int)mp3Playlist.size());
+    } else if (hit(mp3BtnNext, x, y) && mp3PlaylistCount > 0) {
+      startMp3Track((mp3CurrentTrack + 1) % mp3PlaylistCount);
       needFullRedraw = true;
     } else if (hit(mp3BtnVolDown, x, y)) {
       mp3Volume = max(0, mp3Volume - 16);
@@ -1611,11 +1619,11 @@ static void setCurrentApp(AppMode app) {
   currentApp = app;
   if (currentApp == APP_SMF) {
     ensureStorage();
-    if (smfPlaylist.empty()) scanSmfFiles();
+    if ((smfPlaylistCount == 0)) scanSmfFiles();
     invalidateSmfMonitorAll();
   } else if (currentApp == APP_MP3) {
     ensureStorage();
-    if (mp3Playlist.empty()) scanMp3Files();
+    if ((mp3PlaylistCount == 0)) scanMp3Files();
   }
   needFullRedraw = true;
   needPartialUpdate = true;
@@ -1634,30 +1642,54 @@ static bool ensureStorage() {
   return storageReady;
 }
 
+// Case-insensitive suffix match without using String. Avoids any heap
+// allocation on the file-scan path.
+static bool nameHasExt(const char* name, const char* ext) {
+  if (!name || !ext) return false;
+  size_t nl = strlen(name);
+  size_t el = strlen(ext);
+  if (nl < el) return false;
+  const char* p = name + (nl - el);
+  for (size_t i = 0; i < el; i++) {
+    char a = p[i];
+    char b = ext[i];
+    if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
+    if (b >= 'A' && b <= 'Z') b = (char)(b + ('a' - 'A'));
+    if (a != b) return false;
+  }
+  return true;
+}
+
 static void scanSmfFiles() {
-  smfPlaylist.clear();
+  smfPlaylistCount = 0;
   smfListScroll = 0;
   if (!ensureStorage()) return;
 
   File root = SD.open(SMF_FOLDER);
-  if (!root || !root.isDirectory()) return;
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    return;
+  }
 
-  while (true) {
+  while (smfPlaylistCount < SMF_MAX_FILES) {
     File entry = root.openNextFile();
     if (!entry) break;
     if (!entry.isDirectory()) {
-      String name = entry.name();
-      if (name.endsWith(".mid") || name.endsWith(".MID") ||
-          name.endsWith(".smf") || name.endsWith(".SMF")) {
-        smfPlaylist.push_back(String(SMF_FOLDER) + "/" + name);
+      const char* name = entry.name();
+      if (name && (nameHasExt(name, ".mid") || nameHasExt(name, ".smf"))) {
+        snprintf(smfPlaylist[smfPlaylistCount], PLAYLIST_PATH_MAX,
+                 "%s/%s", SMF_FOLDER, name);
+        smfPlaylistCount++;
       }
     }
     entry.close();
   }
   root.close();
 
-  if (!smfPlaylist.empty()) {
-    loadSmfTrack(min(smfCurrentTrack, (int)smfPlaylist.size() - 1));
+  if (smfPlaylistCount > 0) {
+    int target = smfCurrentTrack;
+    if (target >= smfPlaylistCount) target = smfPlaylistCount - 1;
+    loadSmfTrack(target);
   }
 }
 
@@ -1697,8 +1729,8 @@ static void closeSmf() {
 }
 
 static bool loadSmfTrack(int index) {
-  if (!ensureStorage() || !midiFsReady || smfPlaylist.empty()) return false;
-  if (index < 0 || index >= (int)smfPlaylist.size()) return false;
+  if (!ensureStorage() || !midiFsReady || (smfPlaylistCount == 0)) return false;
+  if (index < 0 || index >= smfPlaylistCount) return false;
 
   closeSmf();
   smf.begin(&midiSd);
@@ -1708,16 +1740,18 @@ static bool loadSmfTrack(int index) {
   smf.looping(smfLoop);
 
   smfCurrentTrack = index;
-  String path = smfPlaylist[index];
-  const char* slash = strrchr(path.c_str(), '/');
-  const char* name = slash ? slash + 1 : path.c_str();
+  const char* path = smfPlaylist[index];
+  const char* slash = strrchr(path, '/');
+  const char* name  = slash ? slash + 1 : path;
   strncpy(smfCurrentName, name, sizeof(smfCurrentName) - 1);
   smfCurrentName[sizeof(smfCurrentName) - 1] = '\0';
 
-  int err = smf.load(path.c_str());
+  int err = smf.load(path);
   smfLoaded = (err == MD_MIDIFile::E_OK);
   if (!smfLoaded) {
-    Serial.printf("[SMF] load failed %s err=%d\n", path.c_str(), err);
+    Serial.printf("[SMF] load failed %s err=%d\n", path, err);
+    // Force a clean close so a half-loaded file does not leak _fd.
+    smf.close();
     smfCurrentName[0] = '\0';
     return false;
   }
@@ -1759,11 +1793,13 @@ static void stopSmf() {
 
 static void smfMidiEventHandler(midi_event* pev) {
   if (pev == nullptr) return;
+  uint8_t messageSize = pev->size;
+  if (messageSize == 0) return;
+  if (messageSize > 4) messageSize = 4;
 
   uint8_t status = (pev->data[0] & 0xF0) | (pev->channel & 0x0F);
   uint8_t channel = pev->channel & 0x0F;
   uint8_t message[4];
-  uint8_t messageSize = min((uint8_t)4, pev->size);
   message[0] = status;
   for (uint8_t i = 1; i < messageSize; ++i) {
     message[i] = pev->data[i];
@@ -1793,7 +1829,10 @@ static void smfMidiEventHandler(midi_event* pev) {
 
 static void smfSysexEventHandler(sysex_event* pev) {
   if (pev == nullptr) return;
-  for (uint16_t i = 0; i < pev->size; ++i) {
+  uint16_t cap = (uint16_t)sizeof(pev->data);
+  uint16_t n = pev->size;
+  if (n > cap) n = cap;
+  for (uint16_t i = 0; i < n; ++i) {
     Serial2.write(pev->data[i]);
     ++midiOutCount;
   }
@@ -1805,7 +1844,15 @@ static void smfMetaEventHandler(const meta_event* mev) {
 
 static void processSmf() {
   if (!smfPlaying || !smfLoaded) return;
-  bool advanced = smf.getNextEvent();
+  // Cap per-loop work so dense events do not starve the watchdog.
+  uint32_t startUs = micros();
+  bool advanced = false;
+  while ((micros() - startUs) < 4000UL) {
+    bool a = smf.getNextEvent();
+    if (a) advanced = true;
+    if (!a) break;
+    if (smf.isEOF()) break;
+  }
   if (advanced && smf.isEOF()) {
     if (smfLoop) {
       playSmf(false);
@@ -1817,30 +1864,37 @@ static void processSmf() {
 }
 
 static void scanMp3Files() {
-  mp3Playlist.clear();
+  mp3PlaylistCount = 0;
   mp3ListScroll = 0;
   if (!ensureStorage()) return;
 
   File root = SD.open(MP3_FOLDER);
-  if (!root || !root.isDirectory()) return;
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    return;
+  }
 
-  while (true) {
+  while (mp3PlaylistCount < MP3_MAX_FILES) {
     File entry = root.openNextFile();
     if (!entry) break;
     if (!entry.isDirectory()) {
-      String name = entry.name();
-      if (name.endsWith(".mp3") || name.endsWith(".MP3")) {
-        mp3Playlist.push_back(String(MP3_FOLDER) + "/" + name);
+      const char* name = entry.name();
+      if (name && nameHasExt(name, ".mp3")) {
+        snprintf(mp3Playlist[mp3PlaylistCount], PLAYLIST_PATH_MAX,
+                 "%s/%s", MP3_FOLDER, name);
+        mp3PlaylistCount++;
       }
     }
     entry.close();
   }
   root.close();
 
-  if (!mp3Playlist.empty()) {
-    String path = mp3Playlist[min(mp3CurrentTrack, (int)mp3Playlist.size() - 1)];
-    const char* slash = strrchr(path.c_str(), '/');
-    const char* name = slash ? slash + 1 : path.c_str();
+  if (mp3PlaylistCount > 0) {
+    int idx = mp3CurrentTrack;
+    if (idx >= mp3PlaylistCount) idx = mp3PlaylistCount - 1;
+    const char* path = mp3Playlist[idx];
+    const char* slash = strrchr(path, '/');
+    const char* name  = slash ? slash + 1 : path;
     strncpy(mp3CurrentName, name, sizeof(mp3CurrentName) - 1);
     mp3CurrentName[sizeof(mp3CurrentName) - 1] = '\0';
   }
@@ -1861,24 +1915,47 @@ static void mp3MetadataCallback(void* cbData, const char* type, bool isUnicode, 
 }
 
 static bool startMp3Track(int index) {
-  if (!ensureStorage() || mp3Playlist.empty()) return false;
-  if (index < 0 || index >= (int)mp3Playlist.size()) return false;
+  if (!ensureStorage() || (mp3PlaylistCount == 0)) return false;
+  if (index < 0 || index >= mp3PlaylistCount) return false;
 
   stopMp3();
   mp3CurrentTrack = index;
-  String path = mp3Playlist[index];
-  const char* slash = strrchr(path.c_str(), '/');
-  const char* name = slash ? slash + 1 : path.c_str();
+  const char* path = mp3Playlist[index];
+  const char* slash = strrchr(path, '/');
+  const char* name  = slash ? slash + 1 : path;
   strncpy(mp3CurrentName, name, sizeof(mp3CurrentName) - 1);
   mp3CurrentName[sizeof(mp3CurrentName) - 1] = '\0';
   mp3Title[0] = '\0';
   mp3Artist[0] = '\0';
 
-  mp3File = new AudioFileSourceFS(SD, path.c_str());
-  mp3Id3 = new AudioFileSourceID3(mp3File);
+  mp3File = new (std::nothrow) AudioFileSourceFS(SD, path);
+  if (mp3File == nullptr) {
+    Serial.println("[MP3] AudioFileSourceFS alloc failed");
+    return false;
+  }
+  mp3Id3 = new (std::nothrow) AudioFileSourceID3(mp3File);
+  if (mp3Id3 == nullptr) {
+    Serial.println("[MP3] AudioFileSourceID3 alloc failed");
+    mp3File->close();
+    delete mp3File;
+    mp3File = nullptr;
+    return false;
+  }
   mp3Id3->RegisterMetadataCB(mp3MetadataCallback, nullptr);
   M5.Speaker.setVolume(mp3Volume);
   mp3Playing = mp3Decoder.begin(mp3Id3, &mp3Out);
+  if (!mp3Playing) {
+    Serial.printf("[MP3] decoder.begin failed for %s\n", path);
+    mp3Id3->close();
+    delete mp3Id3;
+    mp3Id3 = nullptr;
+    mp3File->close();
+    delete mp3File;
+    mp3File = nullptr;
+    mp3StaticDirty = true;
+    mp3VisualDirty = true;
+    return false;
+  }
   mp3CassetteAngle = 0.0f;
   mp3LastAnimMs = millis();
   mp3StaticDirty = true;
@@ -1933,7 +2010,7 @@ static void handleSmfTouch(int x, int y) {
   if (hit(smfListDownBtn, x, y)) {
     int lineH = 30;
     int visible = (smfListArea.h - 60) / lineH;
-    int maxScroll = max(0, (int)smfPlaylist.size() - visible);
+    int maxScroll = max(0, smfPlaylistCount - visible);
     if (smfListScroll < maxScroll) {
       smfListScroll++;
       needFullRedraw = true;
@@ -1944,7 +2021,7 @@ static void handleSmfTouch(int x, int y) {
     int top = smfListArea.y + 58;
     int lineH = 30;
     int idx = smfListScroll + ((y - top) / lineH);
-    if (y >= top && idx >= 0 && idx < (int)smfPlaylist.size()) {
+    if (y >= top && idx >= 0 && idx < smfPlaylistCount) {
       loadSmfTrack(idx);
       needFullRedraw = true;
     }
@@ -1963,7 +2040,7 @@ static void handleMp3Touch(int x, int y) {
   if (hit(mp3ListDownBtn, x, y)) {
     int lineH = 34;
     int visible = (mp3ListArea.h - 56) / lineH;
-    int maxScroll = max(0, (int)mp3Playlist.size() - visible);
+    int maxScroll = max(0, mp3PlaylistCount - visible);
     if (mp3ListScroll < maxScroll) {
       mp3ListScroll++;
       mp3StaticDirty = true;
@@ -1975,7 +2052,7 @@ static void handleMp3Touch(int x, int y) {
     int top = mp3ListArea.y + 58;
     int lineH = 34;
     int idx = mp3ListScroll + ((y - top) / lineH);
-    if (y >= top && idx >= 0 && idx < (int)mp3Playlist.size()) {
+    if (y >= top && idx >= 0 && idx < mp3PlaylistCount) {
       startMp3Track(idx);
       needFullRedraw = true;
     }
@@ -2170,10 +2247,21 @@ static void processMIDIByte(uint8_t data) {
     return;
   }
   if (inSysEx) {
-    Serial2.write(data);
-    midiOutCount++;
-    if (data == 0xF7) inSysEx = false;
-    return;
+    // Defensive: a non-realtime status byte during SysEx is illegal but
+    // some devices emit it. If we just kept echoing into Serial2 here we
+    // would never escape SysEx mode and every subsequent message would be
+    // forwarded raw without transpose, which manifests as "stuck notes".
+    if (data >= 0x80 && data != 0xF7) {
+      Serial2.write((uint8_t)0xF7);  // close SysEx synthetically
+      midiOutCount++;
+      inSysEx = false;
+      // fall through to normal status handling below
+    } else {
+      Serial2.write(data);
+      midiOutCount++;
+      if (data == 0xF7) inSysEx = false;
+      return;
+    }
   }
   if (data == 0xF0) {
     inSysEx = true;
