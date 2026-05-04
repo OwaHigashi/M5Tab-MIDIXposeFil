@@ -10,6 +10,8 @@
 #include <BLESecurity.h>
 #include <BLEUUID.h>
 #include "nvs_flash.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // Standard HID-over-GATT UUIDs.
 static const BLEUUID kHidService((uint16_t)0x1812);
@@ -24,6 +26,22 @@ static BLEAdvertisedDevice* g_target = nullptr;
 static volatile bool g_doConnect = false;
 static volatile bool g_doScan = false;
 static uint32_t g_lastScanRestart = 0;
+
+// g_target is touched by both the BLE scan task (allocates a new one on
+// match) and the loop task (consumes it inside connectAndSubscribe). Without
+// a lock the two can race while one is mid-delete and the other is reading,
+// which corrupts the heap. The mutex is created lazily so it is safe to
+// reference even before ble_hid_begin() runs.
+static SemaphoreHandle_t g_targetMutex = nullptr;
+static void ensureTargetMutex() {
+  if (g_targetMutex == nullptr) {
+    g_targetMutex = xSemaphoreCreateMutex();
+  }
+}
+struct TargetLock {
+  TargetLock()  { ensureTargetMutex(); if (g_targetMutex) xSemaphoreTake(g_targetMutex, portMAX_DELAY); }
+  ~TargetLock() { if (g_targetMutex) xSemaphoreGive(g_targetMutex); }
+};
 
 // ---- Notification handler ----
 static void onNotify(BLERemoteCharacteristic* chr,
@@ -85,12 +103,17 @@ class HidScanCb : public BLEAdvertisedDeviceCallbacks {
     }
     if (emit) {
       lastLog[slot] = now;
-      String name = dev.getName().c_str();
+      // Avoid building extra String temporaries here. dev.getName() and
+      // BLEAddress::toString() each return std::string from the BLE library;
+      // we reach into them with c_str() only and never copy into a new
+      // String to keep this scan-callback path heap-allocation-free as far
+      // as possible. (The inner BLE library still does its own allocs, but
+      // we don't add to them.)
       int uuids = dev.haveServiceUUID() ? dev.getServiceUUIDCount() : 0;
       uint16_t ap = dev.haveAppearance() ? dev.getAppearance() : 0;
       Serial.printf("[BLE_SCAN] %s  rssi=%d  name='%s'  uuids=%d  appearance=0x%04x\n",
-                    addr.toString().c_str(), dev.getRSSI(), name.c_str(),
-                    uuids, ap);
+                    addr.toString().c_str(), dev.getRSSI(),
+                    dev.getName().c_str(), uuids, ap);
       for (int i = 0; i < uuids; i++) {
         Serial.printf("            svc[%d] = %s\n",
                       i, dev.getServiceUUID(i).toString().c_str());
@@ -126,9 +149,12 @@ class HidScanCb : public BLEAdvertisedDeviceCallbacks {
                   reason, addr.toString().c_str(), dev.getName().c_str());
 
     BLEDevice::getScan()->stop();
-    if (g_target) { delete g_target; g_target = nullptr; }
-    g_target = new BLEAdvertisedDevice(dev);
-    g_doConnect = true;
+    {
+      TargetLock lk;
+      if (g_target) { delete g_target; g_target = nullptr; }
+      g_target = new BLEAdvertisedDevice(dev);
+      g_doConnect = true;
+    }
     g_status = BT_CONNECTING;
   }
 };
@@ -141,15 +167,23 @@ static HidScanCb   s_scanCb;
 // that supports it.  For a keyboard pedal that's the Boot Keyboard Input
 // Report (0x2A22) and/or one of the 0x2A4D Report characteristics.
 static bool connectAndSubscribe() {
-  if (!g_target) return false;
+  // Take a private copy of the candidate device under the mutex so the scan
+  // task cannot delete g_target while we are using it. The connect call
+  // itself can take seconds and is unsafe to hold a spinlock-style lock for.
+  BLEAdvertisedDevice targetCopy;
+  {
+    TargetLock lk;
+    if (!g_target) return false;
+    targetCopy = *g_target;          // BLEAdvertisedDevice is copyable
+  }
   Serial.printf("[BLE_HID] connecting to %s\n",
-                g_target->getAddress().toString().c_str());
+                targetCopy.getAddress().toString().c_str());
 
   if (!g_client) {
     g_client = BLEDevice::createClient();
     g_client->setClientCallbacks(&s_clientCb);
   }
-  if (!g_client->connect(g_target)) {
+  if (!g_client->connect(&targetCopy)) {
     Serial.println("[BLE_HID] connect() failed");
     return false;
   }
@@ -237,7 +271,15 @@ BT_STATUS ble_hid_status() { return g_status; }
 void ble_hid_service() {
   if (g_doConnect) {
     g_doConnect = false;
-    if (!connectAndSubscribe()) {
+    bool ok = connectAndSubscribe();
+    // Whether connect succeeded or not, the scan-supplied advertiser data is
+    // no longer needed. Holding it indefinitely would slowly bloat the heap
+    // across reconnect cycles and create stale pointers.
+    {
+      TargetLock lk;
+      if (g_target) { delete g_target; g_target = nullptr; }
+    }
+    if (!ok) {
       g_status = BT_DISCONNECTED;
       g_doScan = true;
     }
