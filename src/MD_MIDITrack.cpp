@@ -218,8 +218,8 @@ void MD_MFTrack::parseEvent(MD_MIDIFile *mf)
   break;
 
 // ---------------------------- SYSEX
-  case 0xf0:  // sysex_event = 0xF0 + <len:1> + <data_bytes> + 0xF7 
-  case 0xf7:  // sysex_event = 0xF7 + <len:1> + <data_bytes> + 0xF7 
+  case 0xf0:  // sysex_event = 0xF0 + <len:1> + <data_bytes> + 0xF7
+  case 0xf7:  // sysex_event = 0xF7 + <len:1> + <data_bytes> + 0xF7
   {
     sysex_event sev;
     uint16_t index = 0;
@@ -227,11 +227,16 @@ void MD_MFTrack::parseEvent(MD_MIDIFile *mf)
     // collect all the bytes until the 0xf7 - boundaries are included in the message
     sev.track = _trackId;
     mLen = readVarLen(&mf->_fd);
-    sev.size = mLen;
+    // Clamp to an explicitly safe range so a corrupt SMF cannot cause us to
+    // skip a wildly negative or huge offset below.
+    if (mLen > 65535UL) mLen = 65535UL;
+    sev.size = (uint16_t)mLen;
     if (eType==0xF0)       // add space for 0xF0
     {
       sev.data[index++] = eType;
-      sev.size++;
+      // size already accounts for the trailing 0xF7; adding the leading 0xF0
+      // can theoretically overflow but mLen is clamped above.
+      if (sev.size < 0xFFFF) sev.size++;
     }
     uint16_t minLen = min((unsigned int)sev.size, ARRAY_SIZE(sev.data));
     // The length parameter includes the 0xF7 but not the start boundary.
@@ -239,7 +244,7 @@ void MD_MFTrack::parseEvent(MD_MIDIFile *mf)
     for (uint16_t i=index; i<minLen; ++i)
       sev.data[i] = mf->_fd.read();
     if (sev.size>minLen)
-      mf->_fd.seekCur(sev.size-minLen);
+      mf->_fd.seekCur((int32_t)sev.size - (int32_t)minLen);
 
 #if DUMP_DATA
     DUMPS("[SYSX] Data:");
@@ -429,14 +434,15 @@ void MD_MFTrack::parseEvent(MD_MIDIFile *mf)
 
       default:
       {
+        if (mLen > 65535UL) mLen = 65535UL;     // bound so seekCur arg cannot overflow
         uint8_t minLen = static_cast<uint8_t>(std::min<uint32_t>(ARRAY_SIZE(mev.data), mLen));
-        
+
         for (uint8_t i = 0; i < minLen; ++i)
           mev.data[i] = mf->_fd.read(); // read next
 
         mev.chars[minLen] = '\0'; // in case it is a string
         if (mLen > ARRAY_SIZE(mev.data))
-          mf->_fd.seekCur(mLen-ARRAY_SIZE(mev.data));
+          mf->_fd.seekCur((int32_t)mLen - (int32_t)ARRAY_SIZE(mev.data));
   //    DUMPS("IGNORED");
       }
       break;

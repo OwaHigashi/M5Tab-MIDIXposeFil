@@ -32,12 +32,14 @@ uint32_t readMultiByte(SDFILE *f, uint8_t nLen)
 // read fixed length parameter from input
 {
   uint32_t  value = 0L;
-  
+
   for (uint8_t i=0; i<nLen; i++)
   {
-    value = (value << 8) + f->read();
+    int b = f->read();
+    if (b < 0) return value;          // EOF / read error: stop accumulating
+    value = (value << 8) + (uint8_t)b;
   }
-  
+
   return(value);
 }
 
@@ -45,14 +47,18 @@ uint32_t readVarLen(SDFILE *f)
 // read variable length parameter from input
 {
   uint32_t  value = 0;
-  char      c;
-  
-  do
+  // SMF variable-length quantities are 1..4 bytes. Cap iterations so a
+  // corrupt file (or EOF returning -1 with the high bit set) cannot trap us
+  // in an infinite loop and starve the watchdog.
+  for (uint8_t i = 0; i < 4; i++)
   {
-    c = f->read();
+    int b = f->read();
+    if (b < 0) return value;          // EOF / read error
+    uint8_t c = (uint8_t)b;
     value = (value << 7) + (c & 0x7f);
-  }  while (c & 0x80);
-  
+    if ((c & 0x80) == 0) break;
+  }
+
   return(value);
 }
 
