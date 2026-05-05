@@ -1848,6 +1848,13 @@ static void processSmf() {
   uint32_t startUs = micros();
   bool advanced = false;
   while ((micros() - startUs) < 4000UL) {
+    // MIDI OUT runs at 31.25 kbaud (~4 bytes/ms drained). If the TX ring
+    // is nearly full, the next Serial2.write() inside the event handler
+    // will block past our 4 ms cap and starve the IDLE task long enough
+    // to trip the watchdog. Hold off when there is not enough headroom
+    // for a worst-case event (a 50-byte SysEx). The next loop iteration
+    // resumes once the UART has drained.
+    if (Serial2.availableForWrite() < 64) break;
     bool a = smf.getNextEvent();
     if (a) advanced = true;
     if (!a) break;
@@ -2291,7 +2298,15 @@ static void processMIDIByte(uint8_t data) {
 }
 
 static void processMIDI() {
+  // Cap the work done per loop iteration. Sustained MIDI bursts can outpace
+  // the 31.25 kbaud TX, and Serial2.write() blocks once the TX ring is full.
+  // Without a budget the loop never returns to M5.update() / IDLE / WDT feed,
+  // and the device resets. Unconsumed bytes stay in the Serial2 RX ring and
+  // are picked up on the next loop iteration.
+  const uint32_t startUs = micros();
+  const uint32_t kBudgetUs = 3000UL;
   while (Serial2.available()) {
+    if ((micros() - startUs) >= kBudgetUs) break;
     uint8_t b = Serial2.read();
     midiInCount++;
     processMIDIByte(b);
@@ -2389,9 +2404,15 @@ void setup() {
   M5.Display.setBrightness(220);
   M5.Speaker.setVolume(mp3Volume);
 
+  // setRxBufferSize / setTxBufferSize must run BEFORE begin() — the
+  // arduino-esp32 implementation early-returns once the UART driver is
+  // installed (HardwareSerial.cpp::setTxBufferSize: `if (_uart) return 0;`).
+  // Calling them after begin() silently no-ops, leaving Serial2 with no TX
+  // ring (just the ~128-byte hardware FIFO). Sustained MIDI input then
+  // overflows the FIFO and Serial2.write() blocks, starving the loop.
+  Serial2.setRxBufferSize(2048);
+  Serial2.setTxBufferSize(4096);
   Serial2.begin(MIDI_BAUD, SERIAL_8N1, RXD2, TXD2);
-  Serial2.setRxBufferSize(256);
-  Serial2.setTxBufferSize(256);
   sendGSReset();
   delay(30);
   sendAllNotesOff();

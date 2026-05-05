@@ -179,10 +179,24 @@ static bool connectAndSubscribe() {
   Serial.printf("[BLE_HID] connecting to %s\n",
                 targetCopy.getAddress().toString().c_str());
 
-  if (!g_client) {
-    g_client = BLEDevice::createClient();
-    g_client->setClientCallbacks(&s_clientCb);
+  // Always start each connect attempt with a fresh BLEClient. Reusing the
+  // same client across reconnects accumulates BLERemoteService and
+  // BLERemoteCharacteristic objects in its internal m_servicesMap — the
+  // upstream library never clears it on disconnect, and the public API
+  // exposes no clearServices() (it is private). Long-running sessions with
+  // intermittent BLE peers therefore leak per cycle. Destroying and
+  // recreating here returns those allocations via ~BLEClient and keeps
+  // memory bounded.
+  if (g_client) {
+    delete g_client;
+    g_client = nullptr;
   }
+  g_client = BLEDevice::createClient();
+  if (!g_client) {
+    Serial.println("[BLE_HID] createClient() failed");
+    return false;
+  }
+  g_client->setClientCallbacks(&s_clientCb);
   if (!g_client->connect(&targetCopy)) {
     Serial.println("[BLE_HID] connect() failed");
     return false;
