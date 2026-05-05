@@ -40,6 +40,14 @@
 #include <freertos/task.h>
 #include <freertos/portmacro.h>
 
+// Define M5TAB_DIAG (e.g. via -DM5TAB_DIAG in build.cmd or the IDE) to
+// enable the lightweight `[mem]` heap / stack monitor printed every 5 s.
+// Off by default so production builds carry zero diagnostic overhead.
+#ifdef M5TAB_DIAG
+#include <esp_system.h>
+#include <esp_heap_caps.h>
+#endif
+
 #define SD_FAT_TYPE 3
 #include "src/MD_MIDIFile.h"
 #include "src/AudioOutputM5Speaker.h"
@@ -2608,6 +2616,13 @@ static void usbMidiTeardown() {
     usb_host_endpoint_halt(g_usbDevice, g_usbMidiInEpAddr);
     usb_host_endpoint_flush(g_usbDevice, g_usbMidiInEpAddr);
     usb_host_endpoint_clear(g_usbDevice, g_usbMidiInEpAddr);
+    // Halt/flush/clear cancels in-flight transfers, but the IN-completion
+    // callback for them may already have been queued onto the host task
+    // before we got here. If we free the transfer struct now the callback
+    // will dereference freed memory when it finally runs. Yielding for
+    // ~20 ms gives usbHostTask a chance to drain those pending callbacks
+    // (each one early-exits via the !g_usbMidiMounted check we set above).
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 
   // Now it is safe to release the interface (must precede transfer_free per
@@ -3303,6 +3318,14 @@ static void processSmf() {
   // responsive and we never starve the IDLE task long enough to trip the
   // 5-second task watchdog.
   while ((micros() - startUs) < 4000UL) {
+    // Serial2 (MIDI OUT) runs at 31.25 kbaud — only ~4 bytes drain per ms.
+    // The TX buffer is 512 bytes. If it is nearly full, the next
+    // Serial2.write() inside the event handler will block past our 4 ms
+    // cap and starve the IDLE task long enough to trip the watchdog.
+    // Hold off when there is not enough headroom for a worst-case event
+    // (a 50-byte SysEx). The next loop iteration will retry once the UART
+    // has drained.
+    if (Serial2.availableForWrite() < 64) break;
     bool a = smf.getNextEvent();
     if (a) advanced = true;
     if (!a) break;
@@ -4168,10 +4191,25 @@ static void processUsbMidiInput() {
 }
 
 static void processMidiInput() {
+  // Cap the work done per loop iteration. A keyboard player driving heavy
+  // running-status + clock + chord traffic can sustain bursts that outpace
+  // the 31.25 kbaud MIDI OUT, and Serial2.write() blocks once the TX ring
+  // is full. Without a budget, draining-to-empty inside a single loop()
+  // iteration prevents M5.update() / handleTouch() / ble_hid_service() /
+  // the IDLE task from running and the task watchdog resets the device.
+  // Unconsumed bytes stay in the source buffer (Serial2 RX ring or the
+  // USB ring) and are picked up on the next loop iteration. 3 ms keeps
+  // the worst-case response latency under one MIDI clock tick at 240 BPM.
+  const uint32_t startUs = micros();
+  const uint32_t kBudgetUs = 3000UL;
   bool sawInput = false;
 
   if (midiInputSource == MIDI_INPUT_UNIT || midiInputSource == MIDI_INPUT_MIX) {
     while (Serial2.available()) {
+      if ((micros() - startUs) >= kBudgetUs) {
+        if (sawInput) g_lastMidiInputAt = millis();
+        return;
+      }
       uint8_t b = Serial2.read();
       sawInput = true;
       midiInCount++;
@@ -4182,6 +4220,10 @@ static void processMidiInput() {
   if (midiInputSource == MIDI_INPUT_USB || midiInputSource == MIDI_INPUT_MIX) {
     if (g_usbMidiMounted) {
       while (true) {
+        if ((micros() - startUs) >= kBudgetUs) {
+          if (sawInput) g_lastMidiInputAt = millis();
+          return;
+        }
         int b = usbMidiRingPop();
         if (b < 0) break;
         sawInput = true;
@@ -4608,9 +4650,19 @@ void setup() {
 
   drawSplash();
 
+  // setRxBufferSize / setTxBufferSize must be called BEFORE begin() — the
+  // arduino-esp32 implementation early-returns once the UART driver is
+  // installed (see HardwareSerial.cpp::setTxBufferSize: `if (_uart) return 0;`).
+  // The previous order silently no-op'd both calls, leaving Serial2 with the
+  // default 256-byte RX ring and no TX ring at all (just the ~128-byte
+  // hardware FIFO). At 31.25 kbaud that overflowed almost immediately when
+  // a keyboard player drove sustained MIDI input, so every Serial2.write()
+  // blocked waiting for the hardware FIFO to drain — starving the loop and
+  // tripping the task watchdog. Generous TX/RX rings absorb realistic
+  // bursts (a 4 KB TX ring buys ~125 ms of headroom).
+  Serial2.setRxBufferSize(2048);
+  Serial2.setTxBufferSize(4096);
   Serial2.begin(MIDI_BAUD, SERIAL_8N1, RXD2, TXD2);
-  Serial2.setRxBufferSize(1024);
-  Serial2.setTxBufferSize(512);
 
   // Start USB host once at boot. Input-source changes only toggle whether
   // received data is consumed, never the USB host itself.
@@ -4651,12 +4703,55 @@ void setup() {
   // while the C6 radio comes up and NimBLE does its setup.
   ble_hid_begin_async("M5Tab5-MIDITransposer", pedalReportCb);
 
+#ifdef M5TAB_DIAG
+  Serial.printf("[boot] Tab5 MIDI Transposer ready  panel=%dx%d  reset_reason=%d\n",
+                M5.Display.width(), M5.Display.height(), (int)esp_reset_reason());
+  Serial.printf("[boot] heap=%u psram=%u\n",
+                (unsigned)esp_get_free_heap_size(),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+#else
   Serial.printf("[boot] Tab5 MIDI Transposer ready  panel=%dx%d\n",
                 M5.Display.width(), M5.Display.height());
+#endif
 }
 
+#ifdef M5TAB_DIAG
+// Lightweight memory-leak monitor. Sampled once per loop() iteration so a
+// transient drop between reports is still captured; cost is one heap-counter
+// read per iteration (~hundreds of ns each — far below 1% at our 18 µs/loop).
+// Prints every 5 s. The signal that matters most is `all_min`: it must stay
+// flat across the run, otherwise something is leaking.
+static uint32_t g_diagLastReportMs = 0;
+static uint32_t g_diagWinMinHeap   = UINT32_MAX;
+
+static inline void diagSample() {
+  uint32_t heap = (uint32_t)esp_get_free_heap_size();
+  if (heap < g_diagWinMinHeap) g_diagWinMinHeap = heap;
+}
+
+static inline void diagMaybeReport(uint32_t nowMs) {
+  if (nowMs - g_diagLastReportMs < 5000) return;
+  uint32_t heapNow  = (uint32_t)esp_get_free_heap_size();
+  uint32_t allMin   = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
+  uint32_t psramNow = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  uint32_t psramMin = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+  uint32_t stackHW  = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+  Serial.printf("[mem] heap=%u win_min=%u all_min=%u psram=%u psram_min=%u stack_hw=%u uptime_ms=%u\n",
+                (unsigned)heapNow, (unsigned)g_diagWinMinHeap,
+                (unsigned)allMin, (unsigned)psramNow,
+                (unsigned)psramMin, (unsigned)stackHW, (unsigned)nowMs);
+  g_diagLastReportMs = nowMs;
+  g_diagWinMinHeap   = heapNow;
+}
+#else
+static inline void diagSample() {}
+static inline void diagMaybeReport(uint32_t /*nowMs*/) {}
+#endif
+
 void loop() {
+  diagSample();
   uint32_t now = millis();
+  diagMaybeReport(now);
   serviceUsbHost(now);
 
   if (currentApp == APP_PLAY && currentPlay == PLAY_SMF) {

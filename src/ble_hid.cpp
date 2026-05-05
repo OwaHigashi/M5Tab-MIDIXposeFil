@@ -75,6 +75,11 @@ static bool macEquals(const uint8_t* a, const uint8_t* b) {
   return true;
 }
 
+static void printMac(const uint8_t* mac) {
+  Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
 class HidScanCb : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) override {
     // --- Verbose log of every advertisement we see, deduped per MAC.  This
@@ -103,21 +108,12 @@ class HidScanCb : public BLEAdvertisedDeviceCallbacks {
     }
     if (emit) {
       lastLog[slot] = now;
-      // Avoid building extra String temporaries here. dev.getName() and
-      // BLEAddress::toString() each return std::string from the BLE library;
-      // we reach into them with c_str() only and never copy into a new
-      // String to keep this scan-callback path heap-allocation-free as far
-      // as possible. (The inner BLE library still does its own allocs, but
-      // we don't add to them.)
-      int uuids = dev.haveServiceUUID() ? dev.getServiceUUIDCount() : 0;
-      uint16_t ap = dev.haveAppearance() ? dev.getAppearance() : 0;
-      Serial.printf("[BLE_SCAN] %s  rssi=%d  name='%s'  uuids=%d  appearance=0x%04x\n",
-                    addr.toString().c_str(), dev.getRSSI(),
-                    dev.getName().c_str(), uuids, ap);
-      for (int i = 0; i < uuids; i++) {
-        Serial.printf("            svc[%d] = %s\n",
-                      i, dev.getServiceUUID(i).toString().c_str());
-      }
+      // Keep the scan callback allocation-light. The BLE library still owns
+      // the advertised device object, but we avoid extra temporary strings
+      // here so repeated scan cycles do not churn the heap.
+      Serial.printf("[BLE_SCAN] ");
+      printMac(raw);
+      Serial.printf("  rssi=%d\n", dev.getRSSI());
     }
 
     // --- Match logic ---
@@ -145,8 +141,9 @@ class HidScanCb : public BLEAdvertisedDeviceCallbacks {
     }
     if (!match) return;
 
-    Serial.printf("[BLE_HID] pedal candidate (%s): %s name='%s'\n",
-                  reason, addr.toString().c_str(), dev.getName().c_str());
+    Serial.printf("[BLE_HID] pedal candidate (%s): ", reason);
+    printMac(raw);
+    Serial.println();
 
     BLEDevice::getScan()->stop();
     {
@@ -179,10 +176,27 @@ static bool connectAndSubscribe() {
   Serial.printf("[BLE_HID] connecting to %s\n",
                 targetCopy.getAddress().toString().c_str());
 
-  if (!g_client) {
-    g_client = BLEDevice::createClient();
-    g_client->setClientCallbacks(&s_clientCb);
+  // Always start each connect attempt with a fresh BLEClient. Reusing the
+  // same client across reconnects accumulates BLERemoteService and
+  // BLERemoteCharacteristic objects in its internal m_servicesMap — the
+  // upstream library never clears it on disconnect, and the public API
+  // exposes no clearServices() (it is private). Long-running sessions with
+  // intermittent BLE peers therefore leak per cycle. Destroying and
+  // recreating here returns those allocations via ~BLEClient and keeps
+  // memory bounded. The previous session's onDisconnect callback has
+  // already run by the time we get here (we only enter this path after
+  // g_doScan completed and a new candidate was matched), so no in-flight
+  // callback can dereference the about-to-be-deleted client.
+  if (g_client) {
+    delete g_client;
+    g_client = nullptr;
   }
+  g_client = BLEDevice::createClient();
+  if (!g_client) {
+    Serial.println("[BLE_HID] createClient() failed");
+    return false;
+  }
+  g_client->setClientCallbacks(&s_clientCb);
   if (!g_client->connect(&targetCopy)) {
     Serial.println("[BLE_HID] connect() failed");
     return false;
@@ -257,6 +271,7 @@ void ble_hid_start_scan() {
   if (g_status == BT_CONNECTED || g_status == BT_CONNECTING) return;
   Serial.println("[BLE_HID] start scan");
   g_status = BT_SCANNING;
+  BLEDevice::getScan()->clearResults();
   // IMPORTANT: the 2-arg start(duration, is_continue) BLOCKS the caller
   // (on NimBLE the 2-arg overload waits on an internal semaphore — with
   // duration=0 that is forever).  Pass an explicit nullptr completion
@@ -279,6 +294,7 @@ void ble_hid_service() {
       TargetLock lk;
       if (g_target) { delete g_target; g_target = nullptr; }
     }
+    BLEDevice::getScan()->clearResults();
     if (!ok) {
       g_status = BT_DISCONNECTED;
       g_doScan = true;
@@ -286,11 +302,13 @@ void ble_hid_service() {
   }
   if (g_doScan && g_status == BT_DISCONNECTED) {
     g_doScan = false;
+    BLEDevice::getScan()->clearResults();
     ble_hid_start_scan();
   }
   // If a scan went idle without finding anything, nudge it after 30 s.
   if (g_status == BT_SCANNING && (millis() - g_lastScanRestart) > 30000) {
     BLEDevice::getScan()->stop();
+    BLEDevice::getScan()->clearResults();
     g_status = BT_DISCONNECTED;
     ble_hid_start_scan();
   }

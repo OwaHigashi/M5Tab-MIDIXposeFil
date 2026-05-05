@@ -120,6 +120,10 @@ void MD_MIDIFile::setTicksPerQuarterNote(uint16_t ticks)
 void MD_MIDIFile::setMicrosecondPerQuarterNote(uint32_t m)
 // This is the value given in the META message setting tempo
 {
+  // A corrupt SMF (or a tempo meta truncated to 0 bytes) can pass m == 0
+  // here; the divide below would raise an integer divide-by-zero exception
+  // and reset the device.
+  if (m == 0) return;
   // work out the tempo from the delta by reversing the calcs in
   // calctickTime - m is already per quarter note
   _tempo = (60 * 1000000L) / m;
