@@ -306,9 +306,11 @@ void MD_MFTrack::parseEvent(MD_MIDIFile *mf)
       {
         uint8_t n = mf->_fd.read();
         uint8_t d = mf->_fd.read();
-        
+
         mf->setTimeSignature(n, 1 << d);  // denominator is 2^n
-        mf->_fd.seekCur(mLen - 2);
+        // Spec time-sig is 4 bytes. A corrupt SMF with mLen<2 would underflow
+        // the unsigned subtraction into a multi-GB seek offset.
+        if (mLen > 2) mf->_fd.seekCur((int32_t)mLen - 2);
 
         mev.data[0] = n;
         mev.data[1] = d;
@@ -440,10 +442,22 @@ void MD_MFTrack::parseEvent(MD_MIDIFile *mf)
         for (uint8_t i = 0; i < minLen; ++i)
           mev.data[i] = mf->_fd.read(); // read next
 
-        mev.chars[minLen] = '\0'; // in case it is a string
+        // The NUL terminator must live INSIDE the 50-byte union; mLen >= 50
+        // would put it at chars[50] (one past the end) and corrupt whatever
+        // follows on the stack. Track names / lyrics / copyright meta events
+        // commonly exceed 49 bytes, so this path was a frequent crash source.
+        uint8_t termIdx = (minLen < ARRAY_SIZE(mev.chars))
+                          ? minLen
+                          : (uint8_t)(ARRAY_SIZE(mev.chars) - 1);
+        mev.chars[termIdx] = '\0';
+
+        // Make mev.size reflect how many bytes are actually valid in mev.data.
+        // The on-file mLen (already clamped to 65535) can exceed the buffer,
+        // and uint16 truncation of e.g. 65536 would silently wrap to 0.
+        mev.size = (uint16_t)minLen;
+
         if (mLen > ARRAY_SIZE(mev.data))
           mf->_fd.seekCur((int32_t)mLen - (int32_t)ARRAY_SIZE(mev.data));
-  //    DUMPS("IGNORED");
       }
       break;
     }
