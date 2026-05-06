@@ -122,6 +122,30 @@ arduino-cli upload -p COM7 --fqbn esp32:esp32:m5stack_tab5 .
 
 ---
 
+## ブート設定 `/config.json`
+
+SD ルートに `/config.json` (ArduinoJson 形式) があると起動時に読まれて、デフォルトのアプリ / 転調値 / 入力ソース等が決まる。SD 未挿入・ファイル無し・パース失敗のいずれも組込のデフォルト動作にフォールバック。スキーマは M5Core2-MIDIXposeFilBTUM と完全に共通:
+
+| キー | 値の例 / 意味 |
+|---|---|
+| `DefaultApp` | `Transpose` / `Play` / `SMF` / `MP3` / `Filter` / `Change` |
+| `DefaultTransposeMode` | `DIRECT` / `KEY` / `INSTANT` / `SEQUENCE` |
+| `InitialTranspose` | `TransposeBase` からのオフセット (整数) |
+| `TransposeBase` | 転調基準 (整数, -12..+12) |
+| `InitialAllNotesOff` / `InitialFilterBypass` / `InitialMapperBypass` | bool |
+| `TransposeRange` | `0..11` / `-11..0` / `-5..6` |
+| `MidiInputSource` | `USB` / `MIDIIN` / `MIX` (Tab5 で実際に切替) |
+| `MajorUpperTranspose` / `BTAutoReconnect` / `ShowSplash` | bool |
+
+設定は本体の **CONFIG エディタ** から編集 → SAVE / APPLY できる。
+
+### 画面トリガ (Tab5 はハードボタンが無いので長押しジェスチャ)
+
+- ヘッダ左 **BT ステータス**ラベルを長押し → `CONFIG_EDIT_MODE` (フィールドをタップで巡回 / 4 件 × 3 ページ + SAVE / CANCEL / APPLY)
+- ツールバーの **AOFF** ボタンを長押し → `BASE_SET_MODE` (3 ページの転調基準ピッカー: -12..-1 / -5..+6 / +1..+12, +6→R, -5→L, +1→M, -1→M, EXIT で戻る)
+
+シリアルからは `MODE CONFIG` (`MODE CONFIG_EDIT`) / `MODE BASE` (`MODE BASE_SET`) でも入れる。
+
 ## USB シリアルコマンド
 
 PC から本体を遠隔操作できる (115200 bps、改行 LF / CRLF)。
@@ -134,7 +158,7 @@ PC から本体を遠隔操作できる (115200 bps、改行 LF / CRLF)。
 | `INFO SCREEN` | 画面サイズを返す |
 | `BUTTON A\|B\|C [LONG]` | 物理ボタン疑似操作 (Tab5 はハードボタンが無いので疑似) |
 | `TOUCH x y` | 画面の (x,y) をタップ (現状は座標エコーのみ) |
-| `MODE DIRECT\|KEY\|INSTANT\|SEQUENCE\|FILTER\|MAPPER\|MIDI\|SMF\|MP3` | 指定モードへジャンプ |
+| `MODE DIRECT\|KEY\|INSTANT\|SEQUENCE\|FILTER\|MAPPER\|MIDI\|SMF\|MP3\|CONFIG\|BASE` | 指定モードへジャンプ (`CONFIG`/`BASE` でオーバーレイ起動) |
 | `GROUP TRANSPOSE\|MIDI` | アプリ切替 |
 | `SET TRANSPOSE n` | 転調値を直接設定 (-12..12) |
 | `SET FILTER BYPASS\|ACTIVE` | FILTER 全体の有効化 |

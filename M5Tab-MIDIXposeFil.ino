@@ -32,6 +32,7 @@
 #include <new>
 #include <SdFat.h>
 #include <M5Unified.h>
+#include <ArduinoJson.h>
 #include <AudioFileSourceFS.h>
 #include <AudioFileSourceID3.h>
 #include <AudioGeneratorMP3.h>
@@ -97,8 +98,12 @@ static constexpr uint16_t COL_BLACKKEY = 0x2104;
 // ==== Modes ====
 // 大メニュー (アプリ): XPOSE / MIDI / PLAY
 enum AppMode { APP_TRANSPOSE, APP_MIDI, APP_PLAY };
-// XPOSE 内のサブモード (4 種)
-enum DisplayMode { DIRECT_MODE, KEY_MODE, INSTANT_MODE, SEQUENCE_MODE };
+// XPOSE 内のサブモード (4 種) — overlay 用に CONFIG_EDIT / BASE_SET を末尾に追加。
+// 既存の `(DisplayMode)i` ループ (modeTab[]) は i=0..3 しか回さないので enum 末尾に
+// 値を増やしても影響しない。drawInterface() / handleTouch() 側で overlay 値を
+// 先に判定して通常のモード dispatch をスキップする。
+enum DisplayMode { DIRECT_MODE, KEY_MODE, INSTANT_MODE, SEQUENCE_MODE,
+                   CONFIG_EDIT_MODE, BASE_SET_MODE };
 // PLAY 内のサブモード (2 種)
 enum PlayMode { PLAY_SMF, PLAY_MP3 };
 enum TransposeRange { RANGE_0_TO_12, RANGE_MINUS12_TO_0, RANGE_MINUS5_TO_6 };
@@ -311,6 +316,9 @@ static Rect playTab[2];
 static const char* playName[2] = { "SMF", "MP3" };
 static Rect btnAllOff;        // aux
 static Rect btnRange;         // aux (DIRECT range cycle / KEY upper/lower swap)
+// Long-tap hit target on the BT-status label drawn at (30, headerArea.y+4, 260, 24).
+// Computed in computeLayout() from headerArea so it follows screen rotation/size.
+static Rect btStatusHitArea;
 static Rect btnPrev, btnNext; // pedal-replacement
 static Rect smfBtnPrev, smfBtnPlay, smfBtnNext, smfBtnLoop;
 static Rect mp3BtnPrev, mp3BtnPlay, mp3BtnNext, mp3BtnVolDown, mp3BtnVolUp;
@@ -442,6 +450,22 @@ static void pedalReportCb(const uint8_t* rpt, size_t len);
 static void processPedal();
 static const char* btStatusLabel(BT_STATUS s);
 static uint16_t     btStatusColor(BT_STATUS s);
+static void updateDirectButtonLabels();
+
+// Device configuration / overlay-mode forward decls.
+static void setDefaultConfig();
+static bool loadDeviceConfigFromSD();
+static bool saveDeviceConfigToSD();
+static void applyDeviceConfig();
+static void enterConfigEditMode();
+static void exitConfigEditMode(bool save, bool apply);
+static void drawConfigEditMode();
+static void processConfigEditTouch(int tx, int ty);
+static void enterBaseSetMode();
+static void exitBaseSetMode();
+static void drawBaseSetMode();
+static void processBaseSetTouch(int tx, int ty);
+static void setTransposeBase(int newBase);
 
 // =================================================================
 //  Button drawing helpers
@@ -588,6 +612,11 @@ static void computeLayout() {
   // Header-side MIDI input selector. Keep it pinned to the upper-right so it
   // stays discoverable without stealing toolbar width.
   midiInputSourceBtn = { appTab[2].x + appTab[2].w + 12, appTabHY, appW, tabH };
+
+  // Long-tap hit area for the BT status label. The label itself is small text
+  // (24 px tall starting at y=headerArea.y+4) but we widen the touch zone
+  // vertically to make the hold gesture reliable on a 1280×720 panel.
+  btStatusHitArea = { 20, headerArea.y, 320, headerArea.h / 2 };
 
   // Bottom nav: large PREV / NEXT.
   int navPad = 20;
@@ -2397,6 +2426,11 @@ static void drawInterface() {
   drawHeader();
   drawToolbarApp();
   drawNavApp();
+  // CONFIG_EDIT / BASE_SET overlay completely takes over the content + nav
+  // areas but leaves the header/toolbar visible (so BT/AOFF/MIDI in still
+  // show through). Falls through to the per-app draw on normal modes.
+  if (currentMode == CONFIG_EDIT_MODE) { drawConfigEditMode(); return; }
+  if (currentMode == BASE_SET_MODE)    { drawBaseSetMode();    return; }
   switch (currentApp) {
     case APP_TRANSPOSE:
       switch (currentMode) {
@@ -2404,6 +2438,7 @@ static void drawInterface() {
         case KEY_MODE:         drawKey();         break;
         case INSTANT_MODE:     drawInstant();     break;
         case SEQUENCE_MODE:    drawSequence();    break;
+        default: break;  // overlay modes are handled above
       }
       break;
     case APP_MIDI: drawMidiManage(); break;
@@ -3602,6 +3637,34 @@ static void handleTouch() {
   if (!t.wasPressed() && !t.wasHold()) return;  // one-shot tap / hold-begin only
 
   int x = t.x, y = t.y;
+
+  // ── Long-tap (wasHold ≥ default M5Unified hold threshold ~500 ms) on header
+  //    BT label / toolbar AOFF button enters overlay modes. We check this
+  //    BEFORE routing the tap further so the gestures work from any app/mode.
+  //    M5Unified treats wasHold() as a one-shot edge so the overlay isn't
+  //    re-entered if the finger is held longer.
+  if (t.wasHold()) {
+    if (currentMode != CONFIG_EDIT_MODE && hit(btStatusHitArea, x, y)) {
+      enterConfigEditMode();
+      return;
+    }
+    if (currentMode != BASE_SET_MODE && hit(btnAllOff, x, y)) {
+      enterBaseSetMode();
+      return;
+    }
+    // fall through — MIDI-page hold gestures (cycler keypad) are still active.
+  }
+
+  // ── Overlay touch dispatch ──
+  if (currentMode == CONFIG_EDIT_MODE) {
+    processConfigEditTouch(x, y);
+    return;
+  }
+  if (currentMode == BASE_SET_MODE) {
+    processBaseSetTouch(x, y);
+    return;
+  }
+
   // Header now hosts the XPOSE/MIDI/PLAY app tabs — route header taps to the
   // same handler as the toolbar (it already gates by rect hit).
   if (y < toolbarArea.y + toolbarArea.h) {
@@ -3623,6 +3686,7 @@ static void handleTouch() {
       case KEY_MODE:         handleKeyTouch(x, y);      break;
       case INSTANT_MODE:     handleInstantTouch(x, y);  break;
       case SEQUENCE_MODE:    handleSequenceTouch(x, y); break;
+      default: break;
     }
   } else if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF)) {
     handleSmfTouch(x, y);
@@ -4327,6 +4391,517 @@ static bool loadSequencesFromSD() {
 }
 
 // =================================================================
+//  Device configuration (/config.json on SD)
+// =================================================================
+// Mirrors the M5Core2-MIDIXposeFilBT schema 1:1 so a single config.json works
+// across both devices. Keys are all optional — missing keys fall back to the
+// built-in defaults set by setDefaultConfig().
+//   DefaultApp:           Play|SMF|MP3|Transpose|Filter|Change
+//   DefaultTransposeMode: DIRECT|KEY|INSTANT|SEQUENCE   (used when DefaultApp=Transpose)
+//   InitialTranspose:     int (offset from TransposeBase)
+//   TransposeBase:        int (base reference for all transpose submodes)
+//   InitialAllNotesOff / InitialFilterBypass / InitialMapperBypass: bool
+//   TransposeRange:       "0..11" | "-11..0" | "-5..6"
+//   MidiInputSource:      USB|MIDIIN|MIX        (Tab5 actually applies this)
+//   MajorUpperTranspose:  bool                  (KEY-mode behaviour)
+//   BTAutoReconnect:      bool                  (accepted; BLE host re-uses bonded peer)
+//   ShowSplash:           bool
+//
+// SD未挿入 / config.json なし / パース失敗 はすべて「default 動作と同じ」として
+// 静かに継続する。ブートを止めない。
+struct DeviceConfig {
+  char defaultApp[16];
+  char defaultTransposeMode[16];
+  int  initialTranspose;
+  int  transposeBase;
+  bool initialAllNotesOff;
+  bool initialFilterBypass;
+  bool initialMapperBypass;
+  char transposeRange[12];
+  char midiInputSource[12];
+  bool majorUpperTranspose;
+  bool btAutoReconnect;
+  bool showSplash;
+};
+
+static DeviceConfig g_config;
+
+static void setDefaultConfig() {
+  strncpy(g_config.defaultApp, "Transpose", sizeof(g_config.defaultApp));
+  strncpy(g_config.defaultTransposeMode, "DIRECT", sizeof(g_config.defaultTransposeMode));
+  g_config.initialTranspose = 0;
+  g_config.transposeBase = 0;
+  g_config.initialAllNotesOff = false;
+  g_config.initialFilterBypass = true;
+  g_config.initialMapperBypass = true;
+  strncpy(g_config.transposeRange, "-5..6", sizeof(g_config.transposeRange));
+  strncpy(g_config.midiInputSource, "MIX", sizeof(g_config.midiInputSource));
+  g_config.majorUpperTranspose = false;
+  g_config.btAutoReconnect = true;
+  g_config.showSplash = true;
+}
+
+static bool loadDeviceConfigFromSD() {
+  if (!ensureSD()) {
+    Serial.println("[CFG] no SD — using defaults");
+    return false;
+  }
+  if (!SD.exists("/config.json")) {
+    Serial.println("[CFG] /config.json not found — using defaults");
+    return false;
+  }
+  File f = SD.open("/config.json", FILE_READ);
+  if (!f) {
+    Serial.println("[CFG] open failed — using defaults");
+    return false;
+  }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) {
+    Serial.printf("[CFG] parse error %s — using defaults\n", err.c_str());
+    return false;
+  }
+  if (doc["DefaultApp"].is<const char*>())           strncpy(g_config.defaultApp, doc["DefaultApp"], sizeof(g_config.defaultApp));
+  if (doc["DefaultTransposeMode"].is<const char*>()) strncpy(g_config.defaultTransposeMode, doc["DefaultTransposeMode"], sizeof(g_config.defaultTransposeMode));
+  if (doc["InitialTranspose"].is<int>())             g_config.initialTranspose = doc["InitialTranspose"];
+  if (doc["TransposeBase"].is<int>())                g_config.transposeBase = doc["TransposeBase"];
+  if (doc["InitialAllNotesOff"].is<bool>())          g_config.initialAllNotesOff = doc["InitialAllNotesOff"];
+  if (doc["InitialFilterBypass"].is<bool>())         g_config.initialFilterBypass = doc["InitialFilterBypass"];
+  if (doc["InitialMapperBypass"].is<bool>())         g_config.initialMapperBypass = doc["InitialMapperBypass"];
+  if (doc["TransposeRange"].is<const char*>())       strncpy(g_config.transposeRange, doc["TransposeRange"], sizeof(g_config.transposeRange));
+  if (doc["MidiInputSource"].is<const char*>())      strncpy(g_config.midiInputSource, doc["MidiInputSource"], sizeof(g_config.midiInputSource));
+  if (doc["MajorUpperTranspose"].is<bool>())         g_config.majorUpperTranspose = doc["MajorUpperTranspose"];
+  if (doc["BTAutoReconnect"].is<bool>())             g_config.btAutoReconnect = doc["BTAutoReconnect"];
+  if (doc["ShowSplash"].is<bool>())                  g_config.showSplash = doc["ShowSplash"];
+  Serial.printf("[CFG] loaded: app=%s base=%d input=%s splash=%d\n",
+                g_config.defaultApp, g_config.transposeBase,
+                g_config.midiInputSource, g_config.showSplash ? 1 : 0);
+  return true;
+}
+
+static bool saveDeviceConfigToSD() {
+  if (!ensureSD()) {
+    Serial.println("[CFG] save failed: SD not ready");
+    return false;
+  }
+  JsonDocument doc;
+  doc["DefaultApp"]            = g_config.defaultApp;
+  doc["DefaultTransposeMode"]  = g_config.defaultTransposeMode;
+  doc["InitialTranspose"]      = g_config.initialTranspose;
+  doc["TransposeBase"]         = g_config.transposeBase;
+  doc["InitialAllNotesOff"]    = g_config.initialAllNotesOff;
+  doc["InitialFilterBypass"]   = g_config.initialFilterBypass;
+  doc["InitialMapperBypass"]   = g_config.initialMapperBypass;
+  doc["TransposeRange"]        = g_config.transposeRange;
+  doc["MidiInputSource"]       = g_config.midiInputSource;
+  doc["MajorUpperTranspose"]   = g_config.majorUpperTranspose;
+  doc["BTAutoReconnect"]       = g_config.btAutoReconnect;
+  doc["ShowSplash"]            = g_config.showSplash;
+  // FILE_WRITE on SD.h appends; remove first so the file is rewritten cleanly.
+  if (SD.exists("/config.json")) SD.remove("/config.json");
+  File f = SD.open("/config.json", FILE_WRITE);
+  if (!f) { Serial.println("[CFG] save: open failed"); return false; }
+  size_t n = serializeJsonPretty(doc, f);
+  f.close();
+  Serial.printf("[CFG] saved %u bytes\n", (unsigned)n);
+  return n > 0;
+}
+
+static void applyDeviceConfig() {
+  allNotesOffEnabled = g_config.initialAllNotesOff;
+  midiFilterBypass   = g_config.initialFilterBypass;
+  midiMapperBypass   = g_config.initialMapperBypass;
+  majorUpperTranspose = g_config.majorUpperTranspose;
+  // Tab5 actually consumes MidiInputSource (Core2 only accepts/ignores it).
+  if      (strcmp(g_config.midiInputSource, "USB")    == 0) setMidiInputSource(MIDI_INPUT_USB);
+  else if (strcmp(g_config.midiInputSource, "MIDIIN") == 0) setMidiInputSource(MIDI_INPUT_UNIT);
+  else                                                       setMidiInputSource(MIDI_INPUT_MIX);
+  if      (strcmp(g_config.transposeRange, "0..11") == 0)   transposeRange = RANGE_0_TO_12;
+  else if (strcmp(g_config.transposeRange, "-11..0") == 0)  transposeRange = RANGE_MINUS12_TO_0;
+  else                                                       transposeRange = RANGE_MINUS5_TO_6;
+  // initial transpose = base + offset
+  handleTransposeChange(clampTranspose((int8_t)(g_config.transposeBase + g_config.initialTranspose)));
+  updateDirectButtonLabels();
+
+  // Switch to default app / submode.
+  if (strcmp(g_config.defaultApp, "Play") == 0
+      || strcmp(g_config.defaultApp, "SMF") == 0
+      || strcmp(g_config.defaultApp, "MP3") == 0) {
+    if (strcmp(g_config.defaultApp, "MP3") == 0) currentPlay = PLAY_MP3;
+    else                                          currentPlay = PLAY_SMF;
+    setCurrentApp(APP_PLAY);
+  } else if (strcmp(g_config.defaultApp, "Filter") == 0) {
+    midiManagePage = MIDI_PAGE_FILTER;
+    setCurrentApp(APP_MIDI);
+  } else if (strcmp(g_config.defaultApp, "Change") == 0) {
+    midiManagePage = MIDI_PAGE_MAPPER;
+    setCurrentApp(APP_MIDI);
+  } else { // Transpose default
+    if      (strcmp(g_config.defaultTransposeMode, "KEY")      == 0) currentMode = KEY_MODE;
+    else if (strcmp(g_config.defaultTransposeMode, "INSTANT")  == 0) currentMode = INSTANT_MODE;
+    else if (strcmp(g_config.defaultTransposeMode, "SEQUENCE") == 0) currentMode = SEQUENCE_MODE;
+    else                                                              currentMode = DIRECT_MODE;
+    setCurrentApp(APP_TRANSPOSE);
+    if (currentMode == DIRECT_MODE) setCurrentTransposeButton();
+  }
+  needFullRedraw = true;
+}
+
+// =================================================================
+//  CONFIG_EDIT_MODE — long-tap on header BT label (or `MODE CONFIG`)
+// =================================================================
+// 12 fields × 3 pages of 4. Footer SAVE / CANCEL / APPLY work the same way as
+// the M5Core2 reference. UI is scaled for the 1280×720 Tab5 panel:
+//   row height 80 px, label/value font FONT_MED, footer 4 buttons (incl.
+//   page L/R) each 220×80 along the bottom of the content area.
+static DeviceConfig g_configSnapshot;
+static AppMode      g_appBeforeOverlay  = APP_TRANSPOSE;
+static DisplayMode  g_modeBeforeOverlay = DIRECT_MODE;
+static PlayMode     g_playBeforeOverlay = PLAY_SMF;
+
+static const int CFG_ROWS = 12;
+static const int CFG_ROWS_PER_PAGE = 4;
+static const int CFG_PAGES = 3;
+static int g_configPage = 0;
+static const char* CFG_LABELS[CFG_ROWS] = {
+  "DefaultApp",
+  "DefTransMode",
+  "InitTranspose",
+  "TransposeBase",
+  "AllNotesOff",
+  "FilterBypass",
+  "MapperBypass",
+  "TransposeRange",
+  "MidiInputSrc",
+  "MajorUpperTr",
+  "BTAutoReconn",
+  "ShowSplash",
+};
+
+static void cfgCycleString(char* dst, size_t cap, const char* const* options, int n) {
+  int idx = 0;
+  for (int i = 0; i < n; i++) if (strcmp(dst, options[i]) == 0) { idx = i; break; }
+  idx = (idx + 1) % n;
+  strncpy(dst, options[idx], cap);
+  dst[cap - 1] = '\0';
+}
+
+static void cfgFormatValue(int row, char* out, size_t outSize) {
+  switch (row) {
+    case 0:  snprintf(out, outSize, "%s", g_config.defaultApp); break;
+    case 1:  snprintf(out, outSize, "%s", g_config.defaultTransposeMode); break;
+    case 2:  snprintf(out, outSize, "%+d", g_config.initialTranspose); break;
+    case 3:  snprintf(out, outSize, "%+d", g_config.transposeBase); break;
+    case 4:  snprintf(out, outSize, "%s", g_config.initialAllNotesOff ? "ON" : "OFF"); break;
+    case 5:  snprintf(out, outSize, "%s", g_config.initialFilterBypass ? "ON" : "OFF"); break;
+    case 6:  snprintf(out, outSize, "%s", g_config.initialMapperBypass ? "ON" : "OFF"); break;
+    case 7:  snprintf(out, outSize, "%s", g_config.transposeRange); break;
+    case 8:  snprintf(out, outSize, "%s", g_config.midiInputSource); break;
+    case 9:  snprintf(out, outSize, "%s", g_config.majorUpperTranspose ? "ON" : "OFF"); break;
+    case 10: snprintf(out, outSize, "%s", g_config.btAutoReconnect ? "ON" : "OFF"); break;
+    case 11: snprintf(out, outSize, "%s", g_config.showSplash ? "ON" : "OFF"); break;
+    default: out[0] = '\0';
+  }
+}
+
+static void cfgCycleValue(int row) {
+  static const char* APPS[]   = {"Transpose","Play","SMF","MP3","Filter","Change"};
+  static const char* TMODES[] = {"DIRECT","KEY","INSTANT","SEQUENCE"};
+  static const char* RANGES[] = {"-5..6","0..11","-11..0"};
+  static const char* INPUTS[] = {"MIX","MIDIIN","USB"};
+  switch (row) {
+    case 0:  cfgCycleString(g_config.defaultApp, sizeof(g_config.defaultApp), APPS, 6); break;
+    case 1:  cfgCycleString(g_config.defaultTransposeMode, sizeof(g_config.defaultTransposeMode), TMODES, 4); break;
+    case 2:  g_config.initialTranspose = (g_config.initialTranspose >= 11) ? -11 : g_config.initialTranspose + 1; break;
+    case 3:  g_config.transposeBase    = (g_config.transposeBase    >= 11) ? -11 : g_config.transposeBase + 1; break;
+    case 4:  g_config.initialAllNotesOff = !g_config.initialAllNotesOff; break;
+    case 5:  g_config.initialFilterBypass = !g_config.initialFilterBypass; break;
+    case 6:  g_config.initialMapperBypass = !g_config.initialMapperBypass; break;
+    case 7:  cfgCycleString(g_config.transposeRange, sizeof(g_config.transposeRange), RANGES, 3); break;
+    case 8:  cfgCycleString(g_config.midiInputSource, sizeof(g_config.midiInputSource), INPUTS, 3); break;
+    case 9:  g_config.majorUpperTranspose = !g_config.majorUpperTranspose; break;
+    case 10: g_config.btAutoReconnect = !g_config.btAutoReconnect; break;
+    case 11: g_config.showSplash = !g_config.showSplash; break;
+  }
+}
+
+// Layout helpers for the overlay: rows + footer use the content area below
+// the toolbar, so the existing header (with BT/AOFF/MIDI input selector) is
+// still visible and tappable.
+static void cfgGetRowRect(int rowOnPage, Rect& r) {
+  const int rowH = 80;
+  const int rowGap = 8;
+  const int marginX = 40;
+  int yTop = contentArea.y + 24;
+  r = { marginX, yTop + rowOnPage * (rowH + rowGap),
+        SCREEN_W - 2 * marginX, rowH };
+}
+
+static void cfgGetFooterRects(Rect out[5]) {
+  // [0]=PAGE-, [1]=PAGE+, [2]=SAVE, [3]=CANCEL, [4]=APPLY
+  const int btnH = 80;
+  const int gap = 16;
+  const int btnW = 200;
+  int y = navArea.y - btnH - 16;
+  int totalW = 5 * btnW + 4 * gap;
+  int x0 = (SCREEN_W - totalW) / 2;
+  for (int i = 0; i < 5; i++) {
+    out[i] = { x0 + i * (btnW + gap), y, btnW, btnH };
+  }
+}
+
+static void enterConfigEditMode() {
+  g_appBeforeOverlay  = currentApp;
+  g_modeBeforeOverlay = currentMode;
+  g_playBeforeOverlay = currentPlay;
+  g_configSnapshot = g_config;
+  g_configPage = 0;
+  currentMode = CONFIG_EDIT_MODE;
+  needFullRedraw = true;
+  Serial.println("[CFG] enter CONFIG_EDIT");
+}
+
+static void exitConfigEditMode(bool save, bool apply) {
+  if (!save && !apply) {
+    g_config = g_configSnapshot;  // CANCEL — revert
+  } else {
+    saveDeviceConfigToSD();
+    if (apply) {
+      // applyDeviceConfig() jumps to the configured app/mode. It also calls
+      // setCurrentApp() which clears overlay state implicitly.
+      currentMode = g_modeBeforeOverlay;  // make sure currentMode is sane before apply
+      currentApp  = g_appBeforeOverlay;
+      currentPlay = g_playBeforeOverlay;
+      applyDeviceConfig();
+      Serial.println("[CFG] APPLY done");
+      return;
+    }
+  }
+  currentMode = g_modeBeforeOverlay;
+  currentApp  = g_appBeforeOverlay;
+  currentPlay = g_playBeforeOverlay;
+  needFullRedraw = true;
+  Serial.println(save ? "[CFG] SAVE done" : "[CFG] CANCEL done");
+}
+
+static void drawConfigEditMode() {
+  // Content + nav area background — but keep the header & toolbar visible so
+  // the user can still see BT / AOFF status while editing.
+  M5.Display.fillRect(0, contentArea.y, SCREEN_W,
+                      SCREEN_H - contentArea.y, COL_BG);
+
+  // Title strip across the top of the content area.
+  M5.Display.setFont(FONT_TITLE);
+  M5.Display.setTextColor(COL_VALUE, COL_BG);
+  M5.Display.setTextDatum(top_center);
+  char title[48];
+  snprintf(title, sizeof(title), "CONFIG  (page %d/%d)", g_configPage + 1, CFG_PAGES);
+  M5.Display.drawString(title, SCREEN_W / 2, contentArea.y - 4);
+
+  // Field rows.
+  M5.Display.setFont(FONT_MED);
+  for (int rOnPage = 0; rOnPage < CFG_ROWS_PER_PAGE; rOnPage++) {
+    int field = g_configPage * CFG_ROWS_PER_PAGE + rOnPage;
+    if (field >= CFG_ROWS) break;
+    Rect rr; cfgGetRowRect(rOnPage, rr);
+    M5.Display.fillRoundRect(rr.x, rr.y, rr.w, rr.h, 12, COL_PANEL);
+    M5.Display.drawRoundRect(rr.x, rr.y, rr.w, rr.h, 12, COL_BTN_BDR);
+
+    M5.Display.setTextColor(COL_BTN_TXT, COL_PANEL);
+    M5.Display.setTextDatum(middle_left);
+    M5.Display.drawString(CFG_LABELS[field], rr.x + 24, rr.y + rr.h / 2);
+
+    char val[24];
+    cfgFormatValue(field, val, sizeof(val));
+    M5.Display.setTextColor(COL_ACCENT, COL_PANEL);
+    M5.Display.setTextDatum(middle_right);
+    M5.Display.drawString(val, rr.x + rr.w - 24, rr.y + rr.h / 2);
+  }
+
+  // Footer buttons: < PAGE | PAGE > | SAVE | CANCEL | APPLY.
+  Rect ft[5]; cfgGetFooterRects(ft);
+  drawRectBtn(ft[0], COL_BTN,    COL_BTN_BDR, "< PAGE",  COL_BTN_TXT, FONT_MED);
+  drawRectBtn(ft[1], COL_BTN,    COL_BTN_BDR, "PAGE >",  COL_BTN_TXT, FONT_MED);
+  drawRectBtn(ft[2], TFT_DARKGREEN, COL_BTN_BDR, "SAVE",    COL_BTN_TXT, FONT_MED);
+  drawRectBtn(ft[3], COL_DANGER, COL_BTN_BDR, "CANCEL",  COL_BTN_TXT, FONT_MED);
+  drawRectBtn(ft[4], TFT_BLUE,   COL_BTN_BDR, "APPLY",   COL_BTN_TXT, FONT_MED);
+}
+
+static void processConfigEditTouch(int tx, int ty) {
+  Rect ft[5]; cfgGetFooterRects(ft);
+  if (hit(ft[0], tx, ty)) { g_configPage = (g_configPage + CFG_PAGES - 1) % CFG_PAGES; needFullRedraw = true; return; }
+  if (hit(ft[1], tx, ty)) { g_configPage = (g_configPage + 1) % CFG_PAGES; needFullRedraw = true; return; }
+  if (hit(ft[2], tx, ty)) { exitConfigEditMode(true, false); return; }
+  if (hit(ft[3], tx, ty)) { exitConfigEditMode(false, false); return; }
+  if (hit(ft[4], tx, ty)) { exitConfigEditMode(true, true);  return; }
+
+  for (int rOnPage = 0; rOnPage < CFG_ROWS_PER_PAGE; rOnPage++) {
+    int field = g_configPage * CFG_ROWS_PER_PAGE + rOnPage;
+    if (field >= CFG_ROWS) break;
+    Rect rr; cfgGetRowRect(rOnPage, rr);
+    if (hit(rr, tx, ty)) {
+      cfgCycleValue(field);
+      needFullRedraw = true;
+      return;
+    }
+  }
+}
+
+// =================================================================
+//  BASE_SET_MODE — long-tap on AOFF (or `MODE BASE`)
+// =================================================================
+// Picks the transpose base reference. Three pages mirror the FilBTUM picker:
+//   page L: -12..-1   (entered by tapping -5 on M)
+//   page M: -5..+6    (default entry)
+//   page R: +1..+12   (entered by tapping +6 on M)
+// Tapping -1 on L or +1 on R returns to M (per spec).
+// On-screen PAGE / EXIT buttons replace the C / A-long buttons of FilBTUM.
+static int g_basePage = 0;          // -1=L, 0=M, +1=R
+
+static void getBasePageRange(int page, int* lo, int* hi) {
+  if (page == -1)     { *lo = -12; *hi = -1; }
+  else if (page == 1) { *lo =   1; *hi = 12; }
+  else                { *lo =  -5; *hi =  6; }
+}
+
+static int basePageValueAt(int page, int idx) {
+  int lo, hi; getBasePageRange(page, &lo, &hi);
+  return lo + idx;
+}
+
+static int pageContainingBase(int base) {
+  if (base < -5)     return -1;
+  else if (base > 6) return 1;
+  else                return 0;
+}
+
+static void setTransposeBase(int newBase) {
+  newBase = clampTranspose((int8_t)newBase);
+  int delta = newBase - g_config.transposeBase;
+  g_config.transposeBase = newBase;
+  if (delta != 0) {
+    // Apply immediately — shift the current effective transpose by delta so
+    // any user-selected offset in DIRECT/KEY/INSTANT/SEQUENCE follows the
+    // new base.
+    handleTransposeChange(clampTranspose((int8_t)(transposeValue + delta)));
+  }
+  needFullRedraw = true;
+}
+
+static void enterBaseSetMode() {
+  g_appBeforeOverlay  = currentApp;
+  g_modeBeforeOverlay = currentMode;
+  g_playBeforeOverlay = currentPlay;
+  g_basePage = pageContainingBase(g_config.transposeBase);
+  currentMode = BASE_SET_MODE;
+  needFullRedraw = true;
+  Serial.println("[BASE] enter BASE_SET");
+}
+
+static void exitBaseSetMode() {
+  currentMode = g_modeBeforeOverlay;
+  currentApp  = g_appBeforeOverlay;
+  currentPlay = g_playBeforeOverlay;
+  needFullRedraw = true;
+  Serial.println("[BASE] exit");
+}
+
+static void cycleBaseSetPage() {
+  if      (g_basePage == -1) g_basePage = 0;
+  else if (g_basePage ==  0) g_basePage = 1;
+  else                        g_basePage = -1;
+  needFullRedraw = true;
+}
+
+static void baseGetGridRect(int idx, Rect& r) {
+  // 4×3 grid mirroring DIRECT mode but at Tab5 scale: 220×120 buttons.
+  const int colsPerRow = 4;
+  const int btnW = 220;
+  const int btnH = 120;
+  const int gapX = 18;
+  const int gapY = 16;
+  int totalW = colsPerRow * btnW + (colsPerRow - 1) * gapX;
+  int totalH = 3 * btnH + 2 * gapY;
+  int x0 = (SCREEN_W - totalW) / 2;
+  int y0 = contentArea.y + 24;
+  // If grid would overflow into navArea/footer, shrink top margin.
+  int avail = navArea.y - 16 - y0 - 96 /* footer */;
+  if (avail < totalH) y0 = navArea.y - 16 - 96 - totalH;
+  int col = idx % colsPerRow;
+  int row = idx / colsPerRow;
+  r = { x0 + col * (btnW + gapX), y0 + row * (btnH + gapY), btnW, btnH };
+}
+
+static void baseGetFooterRects(Rect out[2]) {
+  // [0]=PAGE, [1]=EXIT
+  const int btnH = 80;
+  const int gap = 24;
+  const int btnW = 240;
+  int y = navArea.y - btnH - 16;
+  int totalW = 2 * btnW + gap;
+  int x0 = (SCREEN_W - totalW) / 2;
+  for (int i = 0; i < 2; i++) out[i] = { x0 + i * (btnW + gap), y, btnW, btnH };
+}
+
+static void drawBaseSetMode() {
+  M5.Display.fillRect(0, contentArea.y, SCREEN_W, SCREEN_H - contentArea.y, COL_BG);
+
+  M5.Display.setFont(FONT_TITLE);
+  M5.Display.setTextColor(COL_VALUE, COL_BG);
+  M5.Display.setTextDatum(top_center);
+  const char* pgLabel = (g_basePage == -1) ? "L (-12..-1)"
+                       : (g_basePage == 1) ? "R (+1..+12)"
+                                            : "M (-5..+6)";
+  char title[64];
+  snprintf(title, sizeof(title), "BASE = %+d   Page %s",
+           g_config.transposeBase, pgLabel);
+  M5.Display.drawString(title, SCREEN_W / 2, contentArea.y - 4);
+
+  M5.Display.setFont(FONT_LARGE);
+  for (int i = 0; i < 12; i++) {
+    int val = basePageValueAt(g_basePage, i);
+    bool selected = (val == g_config.transposeBase);
+    Rect rr; baseGetGridRect(i, rr);
+    uint16_t bg  = selected ? COL_BTN_HI : COL_BTN;
+    uint16_t txt = selected ? COL_BTN_TXT_HI : COL_BTN_TXT;
+    char vs[8];
+    if (val > 0) snprintf(vs, sizeof(vs), "+%d", val);
+    else         snprintf(vs, sizeof(vs), "%d",  val);
+    drawRectBtn(rr, bg, COL_BTN_BDR, vs, txt, FONT_LARGE);
+  }
+
+  Rect ft[2]; baseGetFooterRects(ft);
+  drawRectBtn(ft[0], TFT_BLUE,   COL_BTN_BDR, "PAGE",  COL_BTN_TXT, FONT_MED);
+  drawRectBtn(ft[1], COL_DANGER, COL_BTN_BDR, "EXIT",  COL_BTN_TXT, FONT_MED);
+}
+
+static void processBaseSetTouch(int tx, int ty) {
+  Rect ft[2]; baseGetFooterRects(ft);
+  if (hit(ft[0], tx, ty)) { cycleBaseSetPage(); return; }
+  if (hit(ft[1], tx, ty)) { exitBaseSetMode();  return; }
+
+  for (int i = 0; i < 12; i++) {
+    Rect rr; baseGetGridRect(i, rr);
+    if (hit(rr, tx, ty)) {
+      int val = basePageValueAt(g_basePage, i);
+      setTransposeBase(val);
+      // Page transitions per spec: M→R via +6, M→L via -5, R→M via +1, L→M via -1.
+      if (g_basePage == 0) {
+        if (val == 6)       g_basePage = 1;
+        else if (val == -5) g_basePage = -1;
+      } else if (g_basePage == 1) {
+        if (val == 1) g_basePage = 0;
+      } else { // L
+        if (val == -1) g_basePage = 0;
+      }
+      needFullRedraw = true;
+      return;
+    }
+  }
+}
+
+// =================================================================
 //  Arduino entry points
 // =================================================================
 // M5GFX font loading uses a lot of stack on P4; bump the loop-task stack.
@@ -4409,6 +4984,10 @@ static bool setModeFromCommand(const char* mode) {
   }
   if (tokenEqualsIgnoreCase(mode, "SMF"))      { setCurrentApp(APP_PLAY); currentPlay = PLAY_SMF; needFullRedraw = true; return true; }
   if (tokenEqualsIgnoreCase(mode, "MP3"))      { setCurrentApp(APP_PLAY); currentPlay = PLAY_MP3; needFullRedraw = true; return true; }
+  if (tokenEqualsIgnoreCase(mode, "CONFIG") ||
+      tokenEqualsIgnoreCase(mode, "CONFIG_EDIT")) { enterConfigEditMode(); return true; }
+  if (tokenEqualsIgnoreCase(mode, "BASE") ||
+      tokenEqualsIgnoreCase(mode, "BASE_SET"))    { enterBaseSetMode();  return true; }
   return false;
 }
 
@@ -4509,7 +5088,7 @@ static void printUsbSerialHelp() {
   Serial.println("REDRAW");
   Serial.println("BUTTON A|B|C [LONG]");
   Serial.println("TOUCH <x> <y>");
-  Serial.println("MODE DIRECT|KEY|INSTANT|SEQUENCE|FILTER|MAPPER|MIDI|SMF|MP3");
+  Serial.println("MODE DIRECT|KEY|INSTANT|SEQUENCE|FILTER|MAPPER|MIDI|SMF|MP3|CONFIG|BASE");
   Serial.println("GROUP TRANSPOSE|MIDI");
   Serial.println("SET TRANSPOSE <-12..12>");
   Serial.println("SET INPUT USBIN|MIDIIN|MIX");
@@ -4719,7 +5298,16 @@ void setup() {
   M5.Display.setBrightness(220);
   M5.Speaker.setVolume(mp3Volume);
 
-  drawSplash();
+  // Load /config.json before the splash so ShowSplash:false skips it cleanly.
+  // Failures (no SD / no config.json / parse error) silently fall back to
+  // built-in defaults so the boot never stalls.
+  setDefaultConfig();
+  ensureStorage();
+  loadDeviceConfigFromSD();
+
+  if (g_config.showSplash) {
+    drawSplash();
+  }
 
   // setRxBufferSize / setTxBufferSize must be called BEFORE begin() — the
   // arduino-esp32 implementation early-returns once the UART driver is
@@ -4767,6 +5355,12 @@ void setup() {
 
   // Start with transpose 0 highlighted on the DIRECT grid (-5..+6 range).
   setCurrentTransposeButton();
+
+  // Apply the boot config (default app/mode, initial transpose=base+offset,
+  // bypass flags, MIDI input source, range, etc.). Falls back to defaults
+  // if the SD load failed earlier — applyDeviceConfig() reads g_config which
+  // setDefaultConfig() always populated first.
+  applyDeviceConfig();
 
   drawInterface();
 
