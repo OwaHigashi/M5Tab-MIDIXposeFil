@@ -138,7 +138,16 @@ PC から本体を遠隔操作できる (115200 bps、改行 LF / CRLF)。
 | `GROUP TRANSPOSE\|MIDI` | アプリ切替 |
 | `SET TRANSPOSE n` | 転調値を直接設定 (-12..12) |
 | `SET FILTER BYPASS\|ACTIVE` | FILTER 全体の有効化 |
+| `SET FILTER BYPASS 0\|1` | FILTER バイパス (0=ACTIVE, 1=BYPASS) |
+| `SET FILTER ENABLED <n> 0\|1` | FILTER ルール n を個別 EN/DIS |
 | `SET MAPPER BYPASS\|ACTIVE` | MAPPER 全体の有効化 |
+| `SET MAPPER BYPASS 0\|1` | MAPPER バイパス (0=ACTIVE, 1=BYPASS) |
+| `SET MAPPER ENABLED <n> 0\|1` | MAPPER ルール n を個別 EN/DIS |
+| `LOAD TESTRULES` | リグレッション用ルール (PB/CC ブロック + Note Ch1→Ch2 / Ch3 vel スケール) を流し込む |
+
+## 自動リグレッションテスト
+
+`scripts/test_sequence.py` は本機 USB-CDC + UM-ONE 0/1 を使った 6 フェーズの自動回帰テストオーケストレータです。`LOAD TESTRULES` で既知ルールを投入し、`midi_capture_in.py` で MIDI OUT を捕まえて、`STATUS` の MIDI in/out カウンタと `[mem]` (`-DM5TAB_DIAG` ビルド時) のヒープ推移を CSV に書き出します。リーク検出と FILTER/MAPPER のスループット確認を 1 コマンドで回せます。
 
 例:
 

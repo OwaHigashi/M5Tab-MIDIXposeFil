@@ -3949,6 +3949,28 @@ static void initMidiManagementDefaults() {
                                 MIDI_KIND_CONTROL_CHANGE, -1, -1, 0, 127 };
 }
 
+// Populate two filter + two mapper rules with deterministic test content.
+// Used by `LOAD TESTRULES` USB-serial command from the regression script.
+// filter[0] = block all PitchBend
+// filter[1] = block all ControlChange
+// mapper[0] = NoteOn Ch 1 -> NoteOn Ch 2 (keep velocity)
+// mapper[1] = NoteOn Ch 3 velocity 0..127 -> 0..63 (halve)
+// Disjoint by message subset so the mapper's first-match-wins still lets
+// the x2 phase observe both rules acting independently.
+static void loadTestRules() {
+  midiFilterRuleCount = 2;
+  midiSelectedFilterRule = 0;
+  midiFilterRules[0] = { false, MIDI_KIND_PITCH_BEND, -1 };
+  midiFilterRules[1] = { false, MIDI_KIND_CONTROL_CHANGE, -1 };
+
+  midiMapperRuleCount = 2;
+  midiSelectedMapperRule = 0;
+  midiMapperRules[0] = { false, MIDI_KIND_NOTE_ON, 0,  -1, 0, 127,
+                                MIDI_KIND_NOTE_ON, 1,  -1, 0, 127 };
+  midiMapperRules[1] = { false, MIDI_KIND_NOTE_ON, 2,  -1, 0, 127,
+                                MIDI_KIND_NOTE_ON, -1, -1, 0, 63  };
+}
+
 static void addDefaultFilterRule() {
   if (midiFilterRuleCount >= MAX_FILTER_RULES) return;
   midiFilterRules[midiFilterRuleCount] = { false, MIDI_KIND_NOTE_OFF, -1 };
@@ -4491,8 +4513,9 @@ static void printUsbSerialHelp() {
   Serial.println("GROUP TRANSPOSE|MIDI");
   Serial.println("SET TRANSPOSE <-12..12>");
   Serial.println("SET INPUT USBIN|MIDIIN|MIX");
-  Serial.println("SET FILTER BYPASS|ACTIVE");
-  Serial.println("SET MAPPER BYPASS|ACTIVE");
+  Serial.println("SET FILTER BYPASS [0|1] | ACTIVE | ENABLED <n> 0|1");
+  Serial.println("SET MAPPER BYPASS [0|1] | ACTIVE | ENABLED <n> 0|1");
+  Serial.println("LOAD TESTRULES");
   Serial.println("INFO SCREEN");
   Serial.println("OK HELP END");
 }
@@ -4595,21 +4618,69 @@ static void handleUsbSerialCommand(char* line) {
       Serial.println("ERR SET INPUT requires USBIN, MIDIIN, or MIX");
       return;
     }
-    if (target && tokenEqualsIgnoreCase(target, "FILTER")) {
+    if (target && (tokenEqualsIgnoreCase(target, "FILTER") || tokenEqualsIgnoreCase(target, "MAPPER"))) {
+      const bool isFilter = tokenEqualsIgnoreCase(target, "FILTER");
       char* val = strtok_r(nullptr, " \t", &save);
-      if (val && tokenEqualsIgnoreCase(val, "BYPASS")) { midiFilterBypass = true;  needFullRedraw = true; Serial.println("OK SET FILTER BYPASS"); return; }
-      if (val && tokenEqualsIgnoreCase(val, "ACTIVE")) { midiFilterBypass = false; needFullRedraw = true; Serial.println("OK SET FILTER ACTIVE"); return; }
-      Serial.println("ERR SET FILTER requires BYPASS or ACTIVE");
+      if (val && tokenEqualsIgnoreCase(val, "BYPASS")) {
+        // Two forms: `BYPASS` (no arg) sets bypass=true (legacy), `BYPASS 0|1` sets explicit value.
+        char* arg = strtok_r(nullptr, " \t", &save);
+        int v;
+        if (arg == nullptr) {
+          if (isFilter) midiFilterBypass = true; else midiMapperBypass = true;
+          needFullRedraw = true;
+          Serial.printf("OK SET %s BYPASS\n", isFilter ? "FILTER" : "MAPPER");
+          return;
+        }
+        if (parseIntValue(arg, v) && (v == 0 || v == 1)) {
+          if (isFilter) midiFilterBypass = (v != 0); else midiMapperBypass = (v != 0);
+          needFullRedraw = true;
+          Serial.printf("OK SET %s BYPASS %d\n", isFilter ? "FILTER" : "MAPPER", v);
+          return;
+        }
+        Serial.printf("ERR SET %s BYPASS [0|1]\n", isFilter ? "FILTER" : "MAPPER");
+        return;
+      }
+      if (val && tokenEqualsIgnoreCase(val, "ACTIVE")) {
+        if (isFilter) midiFilterBypass = false; else midiMapperBypass = false;
+        needFullRedraw = true;
+        Serial.printf("OK SET %s ACTIVE\n", isFilter ? "FILTER" : "MAPPER");
+        return;
+      }
+      if (val && tokenEqualsIgnoreCase(val, "ENABLED")) {
+        char* idxToken = strtok_r(nullptr, " \t", &save);
+        char* valToken = strtok_r(nullptr, " \t", &save);
+        int idx, v;
+        const int ruleCount = isFilter ? midiFilterRuleCount : midiMapperRuleCount;
+        if (!parseIntValue(idxToken, idx) || !parseIntValue(valToken, v)
+            || idx < 1 || idx > ruleCount || (v != 0 && v != 1)) {
+          Serial.printf("ERR SET %s ENABLED <1..%d> 0|1\n",
+                        isFilter ? "FILTER" : "MAPPER", ruleCount);
+          return;
+        }
+        if (isFilter) midiFilterRules[idx - 1].enabled = (v != 0);
+        else          midiMapperRules[idx - 1].enabled = (v != 0);
+        needFullRedraw = true;
+        Serial.printf("OK SET %s ENABLED %d %d\n",
+                      isFilter ? "FILTER" : "MAPPER", idx, v);
+        return;
+      }
+      Serial.printf("ERR SET %s requires BYPASS, ACTIVE, or ENABLED\n", isFilter ? "FILTER" : "MAPPER");
       return;
     }
-    if (target && tokenEqualsIgnoreCase(target, "MAPPER")) {
-      char* val = strtok_r(nullptr, " \t", &save);
-      if (val && tokenEqualsIgnoreCase(val, "BYPASS")) { midiMapperBypass = true;  needFullRedraw = true; Serial.println("OK SET MAPPER BYPASS"); return; }
-      if (val && tokenEqualsIgnoreCase(val, "ACTIVE")) { midiMapperBypass = false; needFullRedraw = true; Serial.println("OK SET MAPPER ACTIVE"); return; }
-      Serial.println("ERR SET MAPPER requires BYPASS or ACTIVE");
+    Serial.println("ERR SET supports TRANSPOSE / INPUT / FILTER / MAPPER");
+    return;
+  }
+
+  if (tokenEqualsIgnoreCase(cmd, "LOAD")) {
+    char* target = strtok_r(nullptr, " \t", &save);
+    if (target != nullptr && tokenEqualsIgnoreCase(target, "TESTRULES")) {
+      loadTestRules();
+      needFullRedraw = true;
+      Serial.printf("OK LOAD TESTRULES filter=%d mapper=%d\n",
+                    midiFilterRuleCount, midiMapperRuleCount);
       return;
     }
-    Serial.println("ERR SET supports TRANSPOSE / FILTER / MAPPER");
+    Serial.println("ERR LOAD supports only TESTRULES");
     return;
   }
 
@@ -4736,10 +4807,14 @@ static inline void diagMaybeReport(uint32_t nowMs) {
   uint32_t psramNow = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
   uint32_t psramMin = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
   uint32_t stackHW  = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
-  Serial.printf("[mem] heap=%u win_min=%u all_min=%u psram=%u psram_min=%u stack_hw=%u uptime_ms=%u\n",
+  // midi_in / midi_out let the regression script prove the device is
+  // actually receiving + emitting MIDI bytes — a flat all_min with a flat
+  // midi_in is a deaf box, not a leak-free one.
+  Serial.printf("[mem] heap=%u win_min=%u all_min=%u psram=%u psram_min=%u stack_hw=%u midi_in=%lu midi_out=%lu uptime_ms=%u\n",
                 (unsigned)heapNow, (unsigned)g_diagWinMinHeap,
                 (unsigned)allMin, (unsigned)psramNow,
-                (unsigned)psramMin, (unsigned)stackHW, (unsigned)nowMs);
+                (unsigned)psramMin, (unsigned)stackHW,
+                midiInCount, midiOutCount, (unsigned)nowMs);
   g_diagLastReportMs = nowMs;
   g_diagWinMinHeap   = heapNow;
 }
