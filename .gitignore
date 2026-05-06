@@ -1,5 +1,5 @@
 # Claude Code local settings
-.claude/settings.local.json
+.claude/
 
 # Arduino build artifacts
 build/
@@ -7,6 +7,12 @@ build/
 *.elf
 *.map
 *.hex
+
+# Test / capture artifacts
+*.log
+chat.txt
+screenshots/
+*.pdf
 
 # OS / editor
 .DS_Store
