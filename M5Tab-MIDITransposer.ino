@@ -1,3 +1,9 @@
+// ============================================================
+// DEPRECATED — This sketch is no longer maintained.
+// Use M5Core2-MIDIXposeFilBT / M5Core2-MIDIXposeFilBTUM /
+// M5Tab-MIDIXposeFil instead. Kept for history only.
+// ============================================================
+
 // M5Tab-MIDITransposer
 // M5Stack Tab5 MIDI live transposer (port of M5Core2-MIDITransposerBT).
 // Board : M5Stack Tab5 (ESP32-P4 + ESP32-C6 via ESP-Hosted)
