@@ -1099,33 +1099,43 @@ static void drawHeaderStatusApp() {
               cfgOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
   drawMidiInputSourceBtn();
 
+  // Two-line PLAY/STOP readout: small label on top, larger MM:SS below.
+  // Single-line "PLAY 00:27" overflowed left into the MIX button on the
+  // narrow ~150 px strip available right of MIX, so we stack instead.
+  int labelY = headerArea.y + headerArea.h / 2 - 18;
+  int timeY  = headerArea.y + headerArea.h / 2 + 18;
   if (currentApp == APP_PLAY && currentPlay == PLAY_SMF) {
     uint32_t elapsed = smfPlaying
                      ? smfPausedElapsedMs + (millis() - smfPlaybackStartMs)
                      : smfPausedElapsedMs;
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%s %02lu:%02lu",
-             smfPlaying ? "PLAY" : "STOP",
+    char timebuf[16];
+    snprintf(timebuf, sizeof(timebuf), "%02lu:%02lu",
              (unsigned long)(elapsed / 60000UL),
              (unsigned long)((elapsed / 1000UL) % 60UL));
-    M5.Display.setFont(FONT_MED);
-    M5.Display.setTextColor(smfPlaying ? COL_BTN_HI : COL_MUTED, COL_PANEL);
+    uint16_t col = smfPlaying ? COL_BTN_HI : COL_MUTED;
+    M5.Display.setTextColor(col, COL_PANEL);
     M5.Display.setTextDatum(middle_right);
-    M5.Display.drawString(buf, valueX, y + h / 2);
+    M5.Display.setFont(FONT_SMALL);
+    M5.Display.drawString(smfPlaying ? "PLAY" : "STOP", valueX, labelY);
+    M5.Display.setFont(FONT_MED);
+    M5.Display.drawString(timebuf, valueX, timeY);
   } else if (currentApp == APP_PLAY && currentPlay == PLAY_MP3) {
     uint32_t elapsed = (mp3Playing && mp3PlaybackStartMs)
                      ? (millis() - mp3PlaybackStartMs) : 0;
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%s %02lu:%02lu",
-             mp3Playing ? "PLAY" : "STOP",
+    char timebuf[16];
+    snprintf(timebuf, sizeof(timebuf), "%02lu:%02lu",
              (unsigned long)(elapsed / 60000UL),
              (unsigned long)((elapsed / 1000UL) % 60UL));
-    M5.Display.setFont(FONT_MED);
-    M5.Display.setTextColor(mp3Playing ? COL_ACCENT : COL_MUTED, COL_PANEL);
+    uint16_t col = mp3Playing ? COL_ACCENT : COL_MUTED;
+    M5.Display.setTextColor(col, COL_PANEL);
     M5.Display.setTextDatum(middle_right);
-    M5.Display.drawString(buf, valueX, y + h / 2);
+    M5.Display.setFont(FONT_SMALL);
+    M5.Display.drawString(mp3Playing ? "PLAY" : "STOP", valueX, labelY);
+    M5.Display.setFont(FONT_MED);
+    M5.Display.drawString(timebuf, valueX, timeY);
   }
   // currentApp == APP_MIDI: no extra header-right text.
+  (void)y; (void)h;
 
   BT_STATUS bt = ble_hid_status();
   M5.Display.fillRect(30, headerArea.y + 4, 260, 24, COL_PANEL);
