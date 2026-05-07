@@ -402,6 +402,7 @@ static void processMidiManageTouch(const m5::Touch_Class::touch_detail_t& td);
 static void drawSmf();
 static void drawMp3();
 static void drawHeaderStatusApp();
+static void drawHeaderRightButtons();
 static void drawMidiActivityLines();
 static void tickMidiActivityLines();
 static void invalidateMidiActivityStripes();
@@ -930,6 +931,7 @@ static void drawHeader() {
   M5.Display.drawString(getHeaderTitle(), 30, headerArea.y + headerArea.h / 2);
 
   drawAppTabs();
+  drawHeaderRightButtons();
   drawHeaderStatusApp();
   // Full header was just cleared — force the stripes to repaint regardless
   // of the colour cache.
@@ -937,20 +939,13 @@ static void drawHeader() {
   drawMidiActivityLines();
 }
 
-static void updateStatusArea() {
-  // Right-aligned status block. The clear width starts just past the app
-  // tabs in the header so we don't wipe them out on partial refreshes.
-  // Order in this strip: [BASE] [CONF] [MIX] [K +n status text right-aligned].
-  int textRight = SCREEN_W - 24;
-  int statusX = appTab[2].x + appTab[2].w + 12;
-  int statusW = SCREEN_W - statusX;
-  // Skip y=0..9 so the MIDI activity stripes (y=2..7 in the top-right
-  // corner) survive partial header refreshes — clearing the full header
-  // height here causes the stripes to flicker every status update.
-  M5.Display.fillRect(statusX, headerArea.y + 10, statusW, headerArea.h - 10, COL_PANEL);
-
-  // BASE / CONF / MIX redrawn first so the status text on the right edge
-  // can use whatever clear space is left after them.
+// BASE / CONF / MIX live in the right strip but only change state on
+// overlay enter/exit (BASE_SET_MODE / CONFIG_EDIT_MODE) or USB MIDI
+// connect/disconnect — all of which already trigger needFullRedraw. So we
+// only paint these from the full-redraw path; partial updates leave them
+// alone, which prevents the ~5 Hz SMF-playback refresh from making them
+// pulse.
+static void drawHeaderRightButtons() {
   bool baseOn = (currentMode == BASE_SET_MODE);
   bool cfgOn  = (currentMode == CONFIG_EDIT_MODE);
   drawRectBtn(baseEntryBtn,
@@ -960,6 +955,19 @@ static void updateStatusArea() {
               cfgOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "CONF",
               cfgOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
   drawMidiInputSourceBtn();
+}
+
+static void updateStatusArea() {
+  // Order in the right strip: [BASE] [CONF] [MIX] [K +n text right-aligned].
+  // Partial updates only need to repaint the text strip (right of MIX) —
+  // BASE / CONF / MIX themselves only change on overlay enter/exit, which
+  // takes the needFullRedraw path. Clearing only the text strip keeps the
+  // ~5 Hz partial refreshes from making BASE/CONF/MIX pulse and from
+  // touching the y=2..7 MIDI activity stripes at all.
+  int textRight = SCREEN_W - 24;
+  int textX = midiInputSourceBtn.x + midiInputSourceBtn.w + 4;
+  int textW = SCREEN_W - textX;
+  M5.Display.fillRect(textX, headerArea.y + 10, textW, headerArea.h - 10, COL_PANEL);
 
   // "K %+d" readout — right-aligned all the way to SCREEN_W so the most-
   // glanced value lives at the natural reading endpoint. IN/OUT numeric
@@ -1089,23 +1097,12 @@ static void drawHeaderStatusApp() {
   int valueX = SCREEN_W - 24;
   int y  = headerArea.y + 10;
   int h  = headerArea.h - 20;
-  int statusX = appTab[2].x + appTab[2].w + 12;
-  int statusW = SCREEN_W - statusX;
-  // Skip y=0..9 so the top-edge MIDI activity stripes survive partial
-  // refreshes (they live at y=2..7 in the top-right corner).
-  M5.Display.fillRect(statusX, headerArea.y + 10, statusW, headerArea.h - 10, COL_PANEL);
-
-  // BASE / CONF / MIX redrawn first so the time text has a clean strip on
-  // the right edge to render into.
-  bool baseOn = (currentMode == BASE_SET_MODE);
-  bool cfgOn  = (currentMode == CONFIG_EDIT_MODE);
-  drawRectBtn(baseEntryBtn,
-              baseOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "BASE",
-              baseOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
-  drawRectBtn(cfgEntryBtn,
-              cfgOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "CONF",
-              cfgOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
-  drawMidiInputSourceBtn();
+  // Partial refresh only repaints the text strip right of MIX (see
+  // updateStatusArea() comment). BASE/CONF/MIX state changes flow through
+  // needFullRedraw, so they don't need to be repainted here.
+  int textX = midiInputSourceBtn.x + midiInputSourceBtn.w + 4;
+  int textW = SCREEN_W - textX;
+  M5.Display.fillRect(textX, headerArea.y + 10, textW, headerArea.h - 10, COL_PANEL);
 
   // Two-line PLAY/STOP readout: small label on top, larger MM:SS below.
   // Single-line "PLAY 00:27" overflowed left into the MIX button on the
@@ -2750,7 +2747,9 @@ static bool usbMidiClaimAndStart(const usb_config_desc_t* cfg) {
   Serial.printf("[USB] MIDI mounted itf=%u in_ep=0x%02x mps=%u poll=%u\n",
                 (unsigned)midiItfNum, (unsigned)inEp,
                 (unsigned)inEpMaxPacket, (unsigned)inEpInterval);
-  needPartialUpdate = true;
+  // Full redraw because the MIX button highlight depends on g_usbMidiMounted
+  // and partial updates intentionally don't repaint the right-side buttons.
+  needFullRedraw = true;
   return true;
 }
 
@@ -2806,7 +2805,9 @@ static void usbMidiTeardown() {
   portEXIT_CRITICAL(&g_usbMidiRingMux);
   g_midiParserResetRequested = true;
 
-  needPartialUpdate = true;
+  // Full redraw because the MIX button highlight depends on g_usbMidiMounted
+  // and partial updates intentionally don't repaint the right-side buttons.
+  needFullRedraw = true;
 }
 
 // Called by the USB host stack when a device is attached or removed.
@@ -5023,16 +5024,15 @@ static void drawBaseSetMode() {
            g_config.transposeBase, pgLabel);
   M5.Display.drawString(title, SCREEN_W / 2, contentArea.y + 8);
 
-  // Match XPOSE/DIRECT button sizing (FONT_HUGE) and tint the digits yellow
-  // so BASE_SET_MODE is visually distinct from the white-text DIRECT grid.
-  // Selected cell keeps black-on-green so it still stands out clearly.
+  // Match XPOSE/DIRECT button sizing (FONT_HUGE). Digits stay white because
+  // the yellow "BASE = ..." title above already signals which screen this is.
   M5.Display.setFont(FONT_HUGE);
   for (int i = 0; i < 12; i++) {
     int val = basePageValueAt(g_basePage, i);
     bool selected = (val == g_config.transposeBase);
     Rect rr; baseGetGridRect(i, rr);
     uint16_t bg  = selected ? COL_BTN_HI : COL_BTN;
-    uint16_t txt = selected ? COL_BTN_TXT_HI : TFT_YELLOW;
+    uint16_t txt = selected ? COL_BTN_TXT_HI : COL_BTN_TXT;
     char vs[8];
     if (val > 0) snprintf(vs, sizeof(vs), "+%d", val);
     else         snprintf(vs, sizeof(vs), "%d",  val);
