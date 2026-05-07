@@ -623,17 +623,16 @@ static void computeLayout() {
   mp3BtnVolDown = { mp3BtnNext.x + mp3BtnNext.w + playerGap, tabY, mp3VolW, tabH };
   mp3BtnVolUp   = { mp3BtnVolDown.x + mp3BtnVolDown.w + playerGap, tabY, mp3VolW, tabH };
 
-  // Header-side MIDI input selector. Keep it pinned to the upper-right so it
-  // stays discoverable without stealing toolbar width.
-  midiInputSourceBtn = { appTab[2].x + appTab[2].w + 12, appTabHY, appW, tabH };
-
-  // Header-right action buttons. Sized to match the toolbar's auxW × tabH
-  // (138×62) so they read as first-class controls alongside btnAllOff /
-  // btnRange below — not as squashed afterthoughts on the right edge.
-  // CONF takes the rightmost slot; BASE sits to its left with the same
-  // 8 px gap btnRange/btnAllOff use.
-  cfgEntryBtn  = { SCREEN_W - (auxW + 20),                 appTabHY, auxW, tabH };
-  baseEntryBtn = { SCREEN_W - (auxW * 2 + auxGap + 20),    appTabHY, auxW, tabH };
+  // Header right side, left → right:
+  //   appTabs (XPOSE / MSG / PLAY) | BASE | CONF | MIX | <status text>
+  // BASE / CONF sit immediately right of the PLAY tab (auxW=138 each), MIX
+  // sits right of CONF as a narrower selector, and the dynamic status text
+  // (K +n / PLAY MM:SS) is right-aligned to SCREEN_W so the most-glanced
+  // value lands at the natural reading endpoint.
+  baseEntryBtn        = { appTab[2].x + appTab[2].w + 12,                  appTabHY, auxW, tabH };
+  cfgEntryBtn         = { baseEntryBtn.x + baseEntryBtn.w + auxGap,        appTabHY, auxW, tabH };
+  int mixW = 110;
+  midiInputSourceBtn  = { cfgEntryBtn.x + cfgEntryBtn.w + auxGap,          appTabHY, mixW, tabH };
 
   // Long-tap hit area for the BT status label. The label itself is small text
   // (24 px tall starting at y=headerArea.y+4) but we widen the touch zone
@@ -938,27 +937,14 @@ static void drawHeader() {
 static void updateStatusArea() {
   // Right-aligned status block. The clear width starts just past the app
   // tabs in the header so we don't wipe them out on partial refreshes.
-  // Text content stays LEFT of the BASE button so nothing overlaps.
-  int textRight = baseEntryBtn.x - 16;
+  // Order in this strip: [BASE] [CONF] [MIX] [K +n status text right-aligned].
+  int textRight = SCREEN_W - 24;
   int statusX = appTab[2].x + appTab[2].w + 12;
   int statusW = SCREEN_W - statusX;
   M5.Display.fillRect(statusX, headerArea.y, statusW, headerArea.h, COL_PANEL);
 
-  // Single big "K %+d" readout — vertically centred, no IN/OUT counters here
-  // because they overlapped with the K display on the right strip. The
-  // counters are still queryable over the STATUS USB-serial command.
-  char buf[16];
-  snprintf(buf, sizeof(buf), "K %+d", (int)transposeValue);
-  M5.Display.setFont(FONT_LARGE);
-  M5.Display.setTextColor(COL_VALUE, COL_PANEL);
-  M5.Display.setTextDatum(middle_right);
-  M5.Display.drawString(buf, textRight, headerArea.y + headerArea.h / 2);
-
-  drawMidiInputSourceBtn();
-
-  // Header right-side action buttons. Highlight when their overlay is the
-  // active mode, mirroring the XPOSE / MIDI / PLAY app tabs so the user can
-  // see which screen they are on.
+  // BASE / CONF / MIX redrawn first so the status text on the right edge
+  // can use whatever clear space is left after them.
   bool baseOn = (currentMode == BASE_SET_MODE);
   bool cfgOn  = (currentMode == CONFIG_EDIT_MODE);
   drawRectBtn(baseEntryBtn,
@@ -967,6 +953,18 @@ static void updateStatusArea() {
   drawRectBtn(cfgEntryBtn,
               cfgOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "CONF",
               cfgOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
+  drawMidiInputSourceBtn();
+
+  // "K %+d" readout — right-aligned all the way to SCREEN_W so the most-
+  // glanced value lives at the natural reading endpoint. IN/OUT numeric
+  // counters are not drawn here (the top-edge flash stripes show activity
+  // and STATUS USB-serial reports the numbers).
+  char buf[16];
+  snprintf(buf, sizeof(buf), "K %+d", (int)transposeValue);
+  M5.Display.setFont(FONT_LARGE);
+  M5.Display.setTextColor(COL_VALUE, COL_PANEL);
+  M5.Display.setTextDatum(middle_right);
+  M5.Display.drawString(buf, textRight, headerArea.y + headerArea.h / 2);
 
   // BT status indicator above the title on the left side.
   BT_STATUS bt = ble_hid_status();
@@ -1080,21 +1078,27 @@ static void drawHeaderStatusApp() {
     return;
   }
 
-  // Right side now has BASE/CONF buttons; the time-readout has to live to
-  // their LEFT so it doesn't overlap them.
-  int valueX = baseEntryBtn.x - 16;
-  int countX = valueX;
+  // PLAY app's elapsed-time readout lives at the right edge — same slot the
+  // XPOSE app's "K +n" uses — so the most-glanced value is always rightmost.
+  int valueX = SCREEN_W - 24;
   int y  = headerArea.y + 10;
   int h  = headerArea.h - 20;
   int statusX = appTab[2].x + appTab[2].w + 12;
   int statusW = SCREEN_W - statusX;
   M5.Display.fillRect(statusX, headerArea.y, statusW, headerArea.h, COL_PANEL);
 
-  // Compact PLAY/STOP elapsed-time readout (FONT_MED so it doesn't reach
-  // back into the MIX selector). MIDI app shows nothing here. The file
-  // count / Loop state line was dropped because it overlapped the MIX
-  // button on Tab5's header geometry — that info is still visible inside
-  // the SMF / MP3 list panes.
+  // BASE / CONF / MIX redrawn first so the time text has a clean strip on
+  // the right edge to render into.
+  bool baseOn = (currentMode == BASE_SET_MODE);
+  bool cfgOn  = (currentMode == CONFIG_EDIT_MODE);
+  drawRectBtn(baseEntryBtn,
+              baseOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "BASE",
+              baseOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
+  drawRectBtn(cfgEntryBtn,
+              cfgOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "CONF",
+              cfgOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
+  drawMidiInputSourceBtn();
+
   if (currentApp == APP_PLAY && currentPlay == PLAY_SMF) {
     uint32_t elapsed = smfPlaying
                      ? smfPausedElapsedMs + (millis() - smfPlaybackStartMs)
@@ -1123,19 +1127,6 @@ static void drawHeaderStatusApp() {
   }
   // currentApp == APP_MIDI: no extra header-right text.
 
-  drawMidiInputSourceBtn();
-
-  // BASE / CONF buttons (same position regardless of app). Highlight when
-  // their overlay is active so the user can see which screen they're on.
-  bool baseOn = (currentMode == BASE_SET_MODE);
-  bool cfgOn  = (currentMode == CONFIG_EDIT_MODE);
-  drawRectBtn(baseEntryBtn,
-              baseOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "BASE",
-              baseOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
-  drawRectBtn(cfgEntryBtn,
-              cfgOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "CONF",
-              cfgOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
-
   BT_STATUS bt = ble_hid_status();
   M5.Display.fillRect(30, headerArea.y + 4, 260, 24, COL_PANEL);
   M5.Display.setFont(FONT_TINY);
@@ -1152,8 +1143,13 @@ static void drawAllOffBtn() {
 }
 
 static void drawAppTabs() {
+  // While a header overlay (BASE_SET / CONFIG_EDIT) is active we are not
+  // really "in" any of the three apps — the saved app is just a return
+  // target — so suppress the app-tab highlight to make the BASE / CONF
+  // button highlight unambiguous.
+  bool inOverlay = (currentMode == BASE_SET_MODE || currentMode == CONFIG_EDIT_MODE);
   for (int i = 0; i < 3; ++i) {
-    bool on = (currentApp == (AppMode)i);
+    bool on = !inOverlay && (currentApp == (AppMode)i);
     drawRectBtn(appTab[i], on ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, appName[i],
                 on ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
   }
