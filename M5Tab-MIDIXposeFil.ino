@@ -33,6 +33,8 @@
 #include <SdFat.h>
 #include <M5Unified.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <driver/uart.h>
 #include <AudioFileSourceFS.h>
 #include <AudioFileSourceID3.h>
 #include <AudioGeneratorMP3.h>
@@ -184,6 +186,14 @@ static bool   minorUpperTranspose = false;
 static bool allNotesOffEnabled = false;
 static unsigned long midiInCount = 0;
 static unsigned long midiOutCount = 0;
+// Counts that exclude heartbeat traffic (0xFE Active Sense, 0xF8 Clock) —
+// used to drive the top-right flash stripes so they only blink for real
+// musical activity, not for the constant ticking of clock / active-sense.
+// (Macro instead of static inline so the Arduino auto-prototype generator
+// keeps its forward-decl insertion below the existing typedef block.)
+static unsigned long midiInRealCount  = 0;
+static unsigned long midiOutRealCount = 0;
+#define isHeartbeatByte(b) ((b) == 0xF8 || (b) == 0xFE)
 static MidiInputSource midiInputSource = MIDI_INPUT_MIX;
 
 // MIDI Manager state
@@ -311,6 +321,8 @@ static Rect midiAppTabFilter;
 static Rect midiAppTabMapper;
 static Rect midiAppBypassBtn;
 static Rect midiInputSourceBtn;
+static Rect baseEntryBtn;     // header right: enter BASE_SET_MODE
+static Rect cfgEntryBtn;      // header right: enter CONFIG_EDIT_MODE
 // PLAY app sub-mode tabs (SMF / MP3)
 static Rect playTab[2];
 static const char* playName[2] = { "SMF", "MP3" };
@@ -390,6 +402,8 @@ static void processMidiManageTouch(const m5::Touch_Class::touch_detail_t& td);
 static void drawSmf();
 static void drawMp3();
 static void drawHeaderStatusApp();
+static void drawMidiActivityLines();
+static void tickMidiActivityLines();
 static void drawToolbarApp();
 static void drawNavApp();
 static void updateStatusArea();
@@ -612,6 +626,14 @@ static void computeLayout() {
   // Header-side MIDI input selector. Keep it pinned to the upper-right so it
   // stays discoverable without stealing toolbar width.
   midiInputSourceBtn = { appTab[2].x + appTab[2].w + 12, appTabHY, appW, tabH };
+
+  // Header-right action buttons. Sized to match the toolbar's auxW × tabH
+  // (138×62) so they read as first-class controls alongside btnAllOff /
+  // btnRange below — not as squashed afterthoughts on the right edge.
+  // CONF takes the rightmost slot; BASE sits to its left with the same
+  // 8 px gap btnRange/btnAllOff use.
+  cfgEntryBtn  = { SCREEN_W - (auxW + 20),                 appTabHY, auxW, tabH };
+  baseEntryBtn = { SCREEN_W - (auxW * 2 + auxGap + 20),    appTabHY, auxW, tabH };
 
   // Long-tap hit area for the BT status label. The label itself is small text
   // (24 px tall starting at y=headerArea.y+4) but we widen the touch zone
@@ -909,38 +931,42 @@ static void drawHeader() {
 
   drawAppTabs();
   drawHeaderStatusApp();
+  drawMidiActivityLines();   // top edge IN/OUT flash stripes (drawn last so
+                              // they sit on top of the header fill).
 }
 
 static void updateStatusArea() {
   // Right-aligned status block. The clear width starts just past the app
   // tabs in the header so we don't wipe them out on partial refreshes.
-  int valueX = SCREEN_W - 30;
-  int countX = valueX;
-  int y  = headerArea.y + 10;
-  int h  = headerArea.h - 20;
+  // Text content stays LEFT of the BASE button so nothing overlaps.
+  int textRight = baseEntryBtn.x - 16;
   int statusX = appTab[2].x + appTab[2].w + 12;
   int statusW = SCREEN_W - statusX;
   M5.Display.fillRect(statusX, headerArea.y, statusW, headerArea.h, COL_PANEL);
 
-  // Transpose value — large.
-  char buf[32];
-  if (transposeValue > 0)       snprintf(buf, sizeof(buf), "Transpose  +%d", transposeValue);
-  else if (transposeValue < 0)  snprintf(buf, sizeof(buf), "Transpose  %d",  transposeValue);
-  else                          snprintf(buf, sizeof(buf), "Transpose   0");
-  M5.Display.setFont(FONT_HUGE);
+  // Single big "K %+d" readout — vertically centred, no IN/OUT counters here
+  // because they overlapped with the K display on the right strip. The
+  // counters are still queryable over the STATUS USB-serial command.
+  char buf[16];
+  snprintf(buf, sizeof(buf), "K %+d", (int)transposeValue);
+  M5.Display.setFont(FONT_LARGE);
   M5.Display.setTextColor(COL_VALUE, COL_PANEL);
   M5.Display.setTextDatum(middle_right);
-  M5.Display.drawString(buf, valueX, y + h / 2);
-
-  // Small MIDI I/O counters above the value line.
-  char line[48];
-  snprintf(line, sizeof(line), "IN %lu   OUT %lu", midiInCount, midiOutCount);
-  M5.Display.setFont(FONT_TINY);
-  M5.Display.setTextColor(COL_MUTED, COL_PANEL);
-  M5.Display.setTextDatum(top_right);
-  M5.Display.drawString(line, countX, headerArea.y + 8);
+  M5.Display.drawString(buf, textRight, headerArea.y + headerArea.h / 2);
 
   drawMidiInputSourceBtn();
+
+  // Header right-side action buttons. Highlight when their overlay is the
+  // active mode, mirroring the XPOSE / MIDI / PLAY app tabs so the user can
+  // see which screen they are on.
+  bool baseOn = (currentMode == BASE_SET_MODE);
+  bool cfgOn  = (currentMode == CONFIG_EDIT_MODE);
+  drawRectBtn(baseEntryBtn,
+              baseOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "BASE",
+              baseOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
+  drawRectBtn(cfgEntryBtn,
+              cfgOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "CONF",
+              cfgOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
 
   // BT status indicator above the title on the left side.
   BT_STATUS bt = ble_hid_status();
@@ -1054,7 +1080,9 @@ static void drawHeaderStatusApp() {
     return;
   }
 
-  int valueX = SCREEN_W - 30;
+  // Right side now has BASE/CONF buttons; the time-readout has to live to
+  // their LEFT so it doesn't overlap them.
+  int valueX = baseEntryBtn.x - 16;
   int countX = valueX;
   int y  = headerArea.y + 10;
   int h  = headerArea.h - 20;
@@ -1062,48 +1090,51 @@ static void drawHeaderStatusApp() {
   int statusW = SCREEN_W - statusX;
   M5.Display.fillRect(statusX, headerArea.y, statusW, headerArea.h, COL_PANEL);
 
-  M5.Display.setFont(FONT_TINY);
-  M5.Display.setTextColor(COL_MUTED, COL_PANEL);
-  M5.Display.setTextDatum(top_right);
-
-  if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF)) {
-    char line[48];
-    snprintf(line, sizeof(line), "%d file(s)   %s",
-             smfPlaylistCount, smfLoop ? "Loop ON" : "Loop OFF");
-    M5.Display.drawString(line, countX, headerArea.y + 8);
-
+  // Compact PLAY/STOP elapsed-time readout (FONT_MED so it doesn't reach
+  // back into the MIX selector). MIDI app shows nothing here. The file
+  // count / Loop state line was dropped because it overlapped the MIX
+  // button on Tab5's header geometry — that info is still visible inside
+  // the SMF / MP3 list panes.
+  if (currentApp == APP_PLAY && currentPlay == PLAY_SMF) {
     uint32_t elapsed = smfPlaying
                      ? smfPausedElapsedMs + (millis() - smfPlaybackStartMs)
                      : smfPausedElapsedMs;
-    char buf[96];
-    snprintf(buf, sizeof(buf), "%s   %02lu:%02lu",
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s %02lu:%02lu",
              smfPlaying ? "PLAY" : "STOP",
              (unsigned long)(elapsed / 60000UL),
              (unsigned long)((elapsed / 1000UL) % 60UL));
-    M5.Display.setFont(FONT_HUGE);
+    M5.Display.setFont(FONT_MED);
     M5.Display.setTextColor(smfPlaying ? COL_BTN_HI : COL_MUTED, COL_PANEL);
     M5.Display.setTextDatum(middle_right);
     M5.Display.drawString(buf, valueX, y + h / 2);
-  } else {
-    char line[48];
-    snprintf(line, sizeof(line), "%d file(s)   Vol %d%%",
-             mp3PlaylistCount, (mp3Volume * 100) / 255);
-    M5.Display.drawString(line, countX, headerArea.y + 8);
-
+  } else if (currentApp == APP_PLAY && currentPlay == PLAY_MP3) {
     uint32_t elapsed = (mp3Playing && mp3PlaybackStartMs)
                      ? (millis() - mp3PlaybackStartMs) : 0;
     char buf[64];
-    snprintf(buf, sizeof(buf), "%s   %02lu:%02lu",
+    snprintf(buf, sizeof(buf), "%s %02lu:%02lu",
              mp3Playing ? "PLAY" : "STOP",
              (unsigned long)(elapsed / 60000UL),
              (unsigned long)((elapsed / 1000UL) % 60UL));
-    M5.Display.setFont(FONT_HUGE);
+    M5.Display.setFont(FONT_MED);
     M5.Display.setTextColor(mp3Playing ? COL_ACCENT : COL_MUTED, COL_PANEL);
     M5.Display.setTextDatum(middle_right);
     M5.Display.drawString(buf, valueX, y + h / 2);
   }
+  // currentApp == APP_MIDI: no extra header-right text.
 
   drawMidiInputSourceBtn();
+
+  // BASE / CONF buttons (same position regardless of app). Highlight when
+  // their overlay is active so the user can see which screen they're on.
+  bool baseOn = (currentMode == BASE_SET_MODE);
+  bool cfgOn  = (currentMode == CONFIG_EDIT_MODE);
+  drawRectBtn(baseEntryBtn,
+              baseOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "BASE",
+              baseOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
+  drawRectBtn(cfgEntryBtn,
+              cfgOn ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, "CONF",
+              cfgOn ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
 
   BT_STATUS bt = ble_hid_status();
   M5.Display.fillRect(30, headerArea.y + 4, 260, 24, COL_PANEL);
@@ -1126,6 +1157,55 @@ static void drawAppTabs() {
     drawRectBtn(appTab[i], on ? COL_BTN_HI2 : COL_BTN, COL_BTN_BDR, appName[i],
                 on ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
   }
+}
+
+// =================================================================
+//  MIDI activity indicator — replaces the old IN/OUT counter text.
+// =================================================================
+// Two thin horizontal stripes at the very top edge of the screen:
+//   y=0,1  blue   — flashes when midiInCount advances (incoming MIDI)
+//   y=2,3  red    — flashes when midiOutCount advances (outgoing MIDI)
+// The numeric counters are still maintained internally and queryable
+// via the STATUS USB-serial command; they just don't get drawn here.
+// `tickMidiActivityLines()` is called from loop() so the flashes refresh
+// independently of full header redraws.
+static unsigned long g_lastMidiInDrawn  = 0;
+static unsigned long g_lastMidiOutDrawn = 0;
+static unsigned long g_midiInFlashUntil  = 0;
+static unsigned long g_midiOutFlashUntil = 0;
+
+static void tickMidiActivityLines() {
+  unsigned long now = millis();
+  // Compare against the heartbeat-filtered counters so the stripes don't
+  // ticker on idle traffic (Active Sense at ~3 Hz, Clock at 24 ppq).
+  if (midiInRealCount != g_lastMidiInDrawn) {
+    g_lastMidiInDrawn  = midiInRealCount;
+    g_midiInFlashUntil = now + 120;
+  }
+  if (midiOutRealCount != g_lastMidiOutDrawn) {
+    g_lastMidiOutDrawn  = midiOutRealCount;
+    g_midiOutFlashUntil = now + 120;
+  }
+}
+
+static void drawMidiActivityLines() {
+  tickMidiActivityLines();
+  unsigned long now = millis();
+  bool inActive  = now < g_midiInFlashUntil;
+  bool outActive = now < g_midiOutFlashUntil;
+  uint16_t inCol  = inActive  ? TFT_BLUE : 0x0008;  // bright vs dim
+  uint16_t outCol = outActive ? TFT_RED  : 0x0800;
+  // Two ~5 mm stripes side-by-side in the top-right corner. Tab5 panel is
+  // ~213 dpi so 5 mm ≈ 42 px. Tiny enough that the 50 Hz refresh from the
+  // main loop can't drag the loop — only ~250 px filled per stripe.
+  const int stripeW = 42;
+  const int stripeH = 6;
+  const int gap = 8;
+  const int rightMargin = 6;
+  int xOut = SCREEN_W - rightMargin - stripeW;
+  int xIn  = xOut - gap - stripeW;
+  M5.Display.fillRect(xIn,  2, stripeW, stripeH, inCol);
+  M5.Display.fillRect(xOut, 2, stripeW, stripeH, outCol);
 }
 
 static void drawToolbarApp() {
@@ -2802,6 +2882,16 @@ static void handleToolbarTouch(int x, int y) {
     setMidiInputSource(nextMidiInputSource());
     return;
   }
+  // BASE / CONFIG header buttons (preferred dedicated entry points; the
+  // long-tap-on-status fall-backs added earlier still work as alternates).
+  if (hit(baseEntryBtn, x, y)) {
+    enterBaseSetMode();
+    return;
+  }
+  if (hit(cfgEntryBtn, x, y)) {
+    enterConfigEditMode();
+    return;
+  }
   // Top app tabs are always visible.
   for (int i = 0; i < 3; ++i) {
     if (hit(appTab[i], x, y)) {
@@ -3304,6 +3394,7 @@ static void smfMidiEventHandler(midi_event* pev) {
   for (uint8_t i = 0; i < messageSize; ++i) {
     Serial2.write(message[i]);
     ++midiOutCount;
+    if (!isHeartbeatByte(message[i])) ++midiOutRealCount;
   }
 
   uint8_t type = status & 0xF0;
@@ -3335,6 +3426,7 @@ static void smfSysexEventHandler(sysex_event* pev) {
   for (uint16_t i = 0; i < n; ++i) {
     Serial2.write(pev->data[i]);
     ++midiOutCount;
+    if (!isHeartbeatByte(pev->data[i])) ++midiOutRealCount;
   }
 }
 
@@ -3656,6 +3748,24 @@ static void handleTouch() {
   }
 
   // ── Overlay touch dispatch ──
+  // Header buttons (BASE / CONF / MIX / AppTabs / AOFF) stay live even while
+  // an overlay is up. A tap on any of them cancels the overlay first, then
+  // routes the tap to the normal toolbar handler so navigation isn't trapped.
+  if (currentMode == CONFIG_EDIT_MODE || currentMode == BASE_SET_MODE) {
+    bool headerTap = hit(baseEntryBtn, x, y)
+                  || hit(cfgEntryBtn, x, y)
+                  || hit(midiInputSourceBtn, x, y)
+                  || hit(btnAllOff, x, y)
+                  || hit(appTab[0], x, y)
+                  || hit(appTab[1], x, y)
+                  || hit(appTab[2], x, y);
+    if (headerTap) {
+      if (currentMode == CONFIG_EDIT_MODE) exitConfigEditMode(false, false);
+      else                                  exitBaseSetMode();
+      handleToolbarTouch(x, y);
+      return;
+    }
+  }
   if (currentMode == CONFIG_EDIT_MODE) {
     processConfigEditTouch(x, y);
     return;
@@ -4118,6 +4228,7 @@ static void sendMIDIMessage(uint8_t* buffer, int length) {
         Serial2.write((uint8_t)transposed);
         Serial2.write(vel);
         midiOutCount += 3;
+        midiOutRealCount += 3;   // NoteOn — real event
         if (idx >= 0) {
           currentNoteStates[idx] = { true, (int8_t)transposeValue, channel, vel };
         }
@@ -4142,10 +4253,14 @@ static void sendMIDIMessage(uint8_t* buffer, int length) {
         Serial2.write((uint8_t)transposed);
         Serial2.write(vel);
         midiOutCount += 3;
+        midiOutRealCount += 3;   // NoteOff — real event
       }
     }
   } else {
-    for (int i = 0; i < length; i++) Serial2.write(buffer[i]);
+    for (int i = 0; i < length; i++) {
+      Serial2.write(buffer[i]);
+      if (!isHeartbeatByte(buffer[i])) ++midiOutRealCount;
+    }
     midiOutCount += length;
   }
 }
@@ -4192,10 +4307,10 @@ static void processMIDIByte(uint8_t data) {
       // A non-realtime status byte during SysEx is illegal but real-world
       // devices emit them; close the SysEx and fall through so the new
       // status byte is parsed normally instead of being swallowed forever.
-      if (allowCurrentSysEx) { Serial2.write((uint8_t)0xF7); midiOutCount++; }
+      if (allowCurrentSysEx) { Serial2.write((uint8_t)0xF7); midiOutCount++; midiOutRealCount++; }
       inSysEx = false;
     } else {
-      if (allowCurrentSysEx) { Serial2.write(data); midiOutCount++; }
+      if (allowCurrentSysEx) { Serial2.write(data); midiOutCount++; midiOutRealCount++; }
       if (data == 0xF7) inSysEx = false;
       return;
     }
@@ -4271,6 +4386,7 @@ static void processUsbMidiInput() {
     if (b < 0) break;
     sawInput = true;
     midiInCount++;
+    if (!isHeartbeatByte((uint8_t)b)) midiInRealCount++;
     processMIDIByte((uint8_t)b);
   }
   if (sawInput) g_lastMidiInputAt = millis();
@@ -4299,6 +4415,7 @@ static void processMidiInput() {
       uint8_t b = Serial2.read();
       sawInput = true;
       midiInCount++;
+      if (!isHeartbeatByte(b)) midiInRealCount++;
       processMIDIByte(b);
     }
   }
@@ -4314,6 +4431,7 @@ static void processMidiInput() {
         if (b < 0) break;
         sawInput = true;
         midiInCount++;
+        if (!isHeartbeatByte((uint8_t)b)) midiInRealCount++;
         processMIDIByte((uint8_t)b);
       }
     }
@@ -4327,6 +4445,7 @@ static void sendAllNotesOff() {
     Serial2.write(0xB0 | ch); Serial2.write((uint8_t)123); Serial2.write((uint8_t)0);
     Serial2.write(0xB0 | ch); Serial2.write((uint8_t)120); Serial2.write((uint8_t)0);
     midiOutCount += 6;
+    midiOutRealCount += 6;  // CC 120/123 are real events
   }
   clearTrackedNoteStates();
 }
@@ -4338,6 +4457,7 @@ static void sendGSReset() {
   for (uint8_t b : gsReset) {
     Serial2.write(b);
     ++midiOutCount;
+    if (!isHeartbeatByte(b)) ++midiOutRealCount;
   }
 }
 
@@ -4626,24 +4746,30 @@ static void cfgCycleValue(int row) {
   }
 }
 
-// Layout helpers for the overlay: rows + footer use the content area below
-// the toolbar, so the existing header (with BT/AOFF/MIDI input selector) is
-// still visible and tappable.
+// Layout helpers for the overlay. Use the FULL content+nav strip below the
+// toolbar (y=contentArea.y .. SCREEN_H) so nothing is wasted on a 1280×720
+// panel. Header (BT/AOFF/MIDI input selector) stays visible and tappable.
+//
+// Vertical zones (within the content+nav strip):
+//   contentArea.y .. contentArea.y+44     title strip (FONT_LARGE)
+//   +50 .. navArea.y-10                   field rows (4 rows × ~70 px + gaps)
+//   navArea.y+10 .. SCREEN_H-10           footer buttons (80 px tall)
 static void cfgGetRowRect(int rowOnPage, Rect& r) {
-  const int rowH = 80;
-  const int rowGap = 8;
+  const int rowH   = 72;
+  const int rowGap = 12;
   const int marginX = 40;
-  int yTop = contentArea.y + 24;
+  int yTop = contentArea.y + 56;       // below the title strip
   r = { marginX, yTop + rowOnPage * (rowH + rowGap),
         SCREEN_W - 2 * marginX, rowH };
 }
 
 static void cfgGetFooterRects(Rect out[5]) {
-  // [0]=PAGE-, [1]=PAGE+, [2]=SAVE, [3]=CANCEL, [4]=APPLY
+  // [0]=PAGE-, [1]=PAGE+, [2]=SAVE, [3]=CANCEL, [4]=APPLY — placed in the
+  // navArea so they don't crowd the field rows.
   const int btnH = 80;
   const int gap = 16;
-  const int btnW = 200;
-  int y = navArea.y - btnH - 16;
+  const int btnW = 220;
+  int y = navArea.y + (navArea.h - btnH) / 2;
   int totalW = 5 * btnW + 4 * gap;
   int x0 = (SCREEN_W - totalW) / 2;
   for (int i = 0; i < 5; i++) {
@@ -4697,7 +4823,7 @@ static void drawConfigEditMode() {
   M5.Display.setTextDatum(top_center);
   char title[48];
   snprintf(title, sizeof(title), "CONFIG  (page %d/%d)", g_configPage + 1, CFG_PAGES);
-  M5.Display.drawString(title, SCREEN_W / 2, contentArea.y - 4);
+  M5.Display.drawString(title, SCREEN_W / 2, contentArea.y + 8);
 
   // Field rows.
   M5.Display.setFont(FONT_MED);
@@ -4815,30 +4941,32 @@ static void cycleBaseSetPage() {
 }
 
 static void baseGetGridRect(int idx, Rect& r) {
-  // 4×3 grid mirroring DIRECT mode but at Tab5 scale: 220×120 buttons.
+  // 4×3 grid mirroring DIRECT mode style. Tab5 has a 1280×~424 px content
+  // area plus a 100 px nav area below — use the full content strip for
+  // the grid and put PAGE/EXIT buttons in the navArea.
   const int colsPerRow = 4;
-  const int btnW = 220;
-  const int btnH = 120;
-  const int gapX = 18;
-  const int gapY = 16;
-  int totalW = colsPerRow * btnW + (colsPerRow - 1) * gapX;
-  int totalH = 3 * btnH + 2 * gapY;
-  int x0 = (SCREEN_W - totalW) / 2;
-  int y0 = contentArea.y + 24;
-  // If grid would overflow into navArea/footer, shrink top margin.
-  int avail = navArea.y - 16 - y0 - 96 /* footer */;
-  if (avail < totalH) y0 = navArea.y - 16 - 96 - totalH;
+  const int gapX = 14;
+  const int gapY = 10;
+  const int marginX = 30;
+  // Grid spans contentArea.y+56 (below the title strip) down to navArea.y-10.
+  int gridY0     = contentArea.y + 56;
+  int gridYBot   = navArea.y - 10;
+  int gridH      = gridYBot - gridY0;
+  int btnH       = (gridH - 2 * gapY) / 3;
+  int btnW       = (SCREEN_W - 2 * marginX - 3 * gapX) / colsPerRow;
   int col = idx % colsPerRow;
   int row = idx / colsPerRow;
-  r = { x0 + col * (btnW + gapX), y0 + row * (btnH + gapY), btnW, btnH };
+  r = { marginX + col * (btnW + gapX),
+        gridY0  + row * (btnH + gapY),
+        btnW, btnH };
 }
 
 static void baseGetFooterRects(Rect out[2]) {
-  // [0]=PAGE, [1]=EXIT
+  // [0]=PAGE, [1]=EXIT — placed in the nav area so they sit clear of the grid.
   const int btnH = 80;
   const int gap = 24;
-  const int btnW = 240;
-  int y = navArea.y - btnH - 16;
+  const int btnW = 280;
+  int y = navArea.y + (navArea.h - btnH) / 2;
   int totalW = 2 * btnW + gap;
   int x0 = (SCREEN_W - totalW) / 2;
   for (int i = 0; i < 2; i++) out[i] = { x0 + i * (btnW + gap), y, btnW, btnH };
@@ -4856,19 +4984,22 @@ static void drawBaseSetMode() {
   char title[64];
   snprintf(title, sizeof(title), "BASE = %+d   Page %s",
            g_config.transposeBase, pgLabel);
-  M5.Display.drawString(title, SCREEN_W / 2, contentArea.y - 4);
+  M5.Display.drawString(title, SCREEN_W / 2, contentArea.y + 8);
 
-  M5.Display.setFont(FONT_LARGE);
+  // Match XPOSE/DIRECT button sizing (FONT_HUGE) and tint the digits yellow
+  // so BASE_SET_MODE is visually distinct from the white-text DIRECT grid.
+  // Selected cell keeps black-on-green so it still stands out clearly.
+  M5.Display.setFont(FONT_HUGE);
   for (int i = 0; i < 12; i++) {
     int val = basePageValueAt(g_basePage, i);
     bool selected = (val == g_config.transposeBase);
     Rect rr; baseGetGridRect(i, rr);
     uint16_t bg  = selected ? COL_BTN_HI : COL_BTN;
-    uint16_t txt = selected ? COL_BTN_TXT_HI : COL_BTN_TXT;
+    uint16_t txt = selected ? COL_BTN_TXT_HI : TFT_YELLOW;
     char vs[8];
     if (val > 0) snprintf(vs, sizeof(vs), "+%d", val);
     else         snprintf(vs, sizeof(vs), "%d",  val);
-    drawRectBtn(rr, bg, COL_BTN_BDR, vs, txt, FONT_LARGE);
+    drawRectBtn(rr, bg, COL_BTN_BDR, vs, txt, FONT_HUGE);
   }
 
   Rect ft[2]; baseGetFooterRects(ft);
@@ -5063,7 +5194,7 @@ static void printUsbSerialStatus() {
   const char* usbLabel        = g_usbMidiMounted ? "connected" : "disconnected";
   Serial.printf(
     "OK STATUS app=%s mode=%s input=%s transpose=%d range=%d filter_bypass=%d mapper_bypass=%d "
-    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu bt=%s usb_in=%s cables=%u\n",
+    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu bt=%s usb_in=%s cables=%u\n",
     getAppLabel(currentApp),
     getDisplayModeLabel(currentMode),
     inputLabel,
@@ -5075,6 +5206,7 @@ static void printUsbSerialStatus() {
     midiSelectedMapperRule + 1, midiMapperRuleCount,
     pageLabel, mapperPageLabel,
     midiInCount, midiOutCount,
+    midiInRealCount, midiOutRealCount,
     getBtStatusLabelTab(g_lastBtStatus),
     usbLabel,
     (unsigned)g_usbMidiCableCount
@@ -5444,6 +5576,9 @@ void loop() {
     M5.update();
     handleTouch();
     ble_hid_service();
+    // Refresh MIDI activity stripes ~50 Hz so the flash is visible without
+    // requiring a full header redraw.
+    drawMidiActivityLines();
 
     // Refresh the header whenever the BT status changes.
     BT_STATUS bt = ble_hid_status();
