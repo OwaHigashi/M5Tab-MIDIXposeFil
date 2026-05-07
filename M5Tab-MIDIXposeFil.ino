@@ -404,6 +404,7 @@ static void drawMp3();
 static void drawHeaderStatusApp();
 static void drawMidiActivityLines();
 static void tickMidiActivityLines();
+static void invalidateMidiActivityStripes();
 static void drawToolbarApp();
 static void drawNavApp();
 static void updateStatusArea();
@@ -930,8 +931,10 @@ static void drawHeader() {
 
   drawAppTabs();
   drawHeaderStatusApp();
-  drawMidiActivityLines();   // top edge IN/OUT flash stripes (drawn last so
-                              // they sit on top of the header fill).
+  // Full header was just cleared — force the stripes to repaint regardless
+  // of the colour cache.
+  invalidateMidiActivityStripes();
+  drawMidiActivityLines();
 }
 
 static void updateStatusArea() {
@@ -941,7 +944,10 @@ static void updateStatusArea() {
   int textRight = SCREEN_W - 24;
   int statusX = appTab[2].x + appTab[2].w + 12;
   int statusW = SCREEN_W - statusX;
-  M5.Display.fillRect(statusX, headerArea.y, statusW, headerArea.h, COL_PANEL);
+  // Skip y=0..9 so the MIDI activity stripes (y=2..7 in the top-right
+  // corner) survive partial header refreshes — clearing the full header
+  // height here causes the stripes to flicker every status update.
+  M5.Display.fillRect(statusX, headerArea.y + 10, statusW, headerArea.h - 10, COL_PANEL);
 
   // BASE / CONF / MIX redrawn first so the status text on the right edge
   // can use whatever clear space is left after them.
@@ -1085,7 +1091,9 @@ static void drawHeaderStatusApp() {
   int h  = headerArea.h - 20;
   int statusX = appTab[2].x + appTab[2].w + 12;
   int statusW = SCREEN_W - statusX;
-  M5.Display.fillRect(statusX, headerArea.y, statusW, headerArea.h, COL_PANEL);
+  // Skip y=0..9 so the top-edge MIDI activity stripes survive partial
+  // refreshes (they live at y=2..7 in the top-right corner).
+  M5.Display.fillRect(statusX, headerArea.y + 10, statusW, headerArea.h - 10, COL_PANEL);
 
   // BASE / CONF / MIX redrawn first so the time text has a clean strip on
   // the right edge to render into.
@@ -1179,6 +1187,11 @@ static unsigned long g_lastMidiInDrawn  = 0;
 static unsigned long g_lastMidiOutDrawn = 0;
 static unsigned long g_midiInFlashUntil  = 0;
 static unsigned long g_midiOutFlashUntil = 0;
+// Cache of the last colours actually pushed to the LCD for each stripe.
+// 0xFFFF is used as an "invalid" sentinel so the next call repaints
+// unconditionally — see invalidateMidiActivityStripes() below.
+static uint16_t g_lastInColDrawn  = 0xFFFF;
+static uint16_t g_lastOutColDrawn = 0xFFFF;
 
 static void tickMidiActivityLines() {
   unsigned long now = millis();
@@ -1194,6 +1207,14 @@ static void tickMidiActivityLines() {
   }
 }
 
+// Reset the cache so the next drawMidiActivityLines() call repaints the
+// stripes regardless of colour. Call this whenever code clears or paints
+// over the y=0..7 strip in the top-right corner (full header redraw).
+static void invalidateMidiActivityStripes() {
+  g_lastInColDrawn  = 0xFFFF;
+  g_lastOutColDrawn = 0xFFFF;
+}
+
 static void drawMidiActivityLines() {
   tickMidiActivityLines();
   unsigned long now = millis();
@@ -1201,17 +1222,27 @@ static void drawMidiActivityLines() {
   bool outActive = now < g_midiOutFlashUntil;
   uint16_t inCol  = inActive  ? TFT_BLUE : 0x0008;  // bright vs dim
   uint16_t outCol = outActive ? TFT_RED  : 0x0800;
+  // Skip the LCD write entirely when the colour hasn't changed since the
+  // last paint — this is called at 50 Hz from loop() and most ticks have
+  // no transition, so unconditional fillRects were just wasted DSI traffic
+  // (and, on Tab5, perceptible flicker).
+  if (inCol == g_lastInColDrawn && outCol == g_lastOutColDrawn) return;
   // Two ~5 mm stripes side-by-side in the top-right corner. Tab5 panel is
-  // ~213 dpi so 5 mm ≈ 42 px. Tiny enough that the 50 Hz refresh from the
-  // main loop can't drag the loop — only ~250 px filled per stripe.
+  // ~213 dpi so 5 mm ≈ 42 px.
   const int stripeW = 42;
   const int stripeH = 6;
   const int gap = 8;
   const int rightMargin = 6;
   int xOut = SCREEN_W - rightMargin - stripeW;
   int xIn  = xOut - gap - stripeW;
-  M5.Display.fillRect(xIn,  2, stripeW, stripeH, inCol);
-  M5.Display.fillRect(xOut, 2, stripeW, stripeH, outCol);
+  if (inCol != g_lastInColDrawn) {
+    M5.Display.fillRect(xIn, 2, stripeW, stripeH, inCol);
+    g_lastInColDrawn = inCol;
+  }
+  if (outCol != g_lastOutColDrawn) {
+    M5.Display.fillRect(xOut, 2, stripeW, stripeH, outCol);
+    g_lastOutColDrawn = outCol;
+  }
 }
 
 static void drawToolbarApp() {
