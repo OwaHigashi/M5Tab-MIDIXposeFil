@@ -308,7 +308,10 @@ def verdict(phase: dict, in_d: int, out_d: int, cap_bytes: int, cap_pb: int,
 def run_phase(mon: SerialMonitor, phase: dict, args, env) -> dict:
     print(f"\n=== {phase['name']} ===")
 
-    # Apply config commands. Bail early if any returns ERR.
+    # Apply config commands. Bail early if any returns ERR. The 80 ms gap
+    # between commands keeps the firmware's USB-CDC TX queue from backing
+    # up — fired back-to-back with no gap, the OK response to a command can
+    # arrive after our 4 s wait elapses on a busy device.
     for cmd in phase["config"]:
         ack = mon.send_command(cmd)
         ok = ack.startswith("OK")
@@ -316,8 +319,9 @@ def run_phase(mon: SerialMonitor, phase: dict, args, env) -> dict:
         if not ok:
             print(f"  !! aborting phase config at {cmd!r}")
             return {"phase": phase["name"], "config_error": ack}
+        time.sleep(0.08)
 
-    time.sleep(0.5)
+    time.sleep(1.0)
 
     in0, out0, _ = mon.query_status()
     if in0 is None:

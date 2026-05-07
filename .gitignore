@@ -13,6 +13,7 @@ build/
 chat.txt
 screenshots/
 *.pdf
+test_*.csv
 
 # OS / editor
 .DS_Store
