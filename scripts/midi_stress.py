@@ -5,6 +5,8 @@ output port (Roland UM-ONE on this rig) so the device under test can be
 exercised under realistic playing load. Mixes:
 
   - Note-on / note-off pairs across multiple channels with varied velocities
+  - Optional High Resolution Velocity Prefix (CC 88) before notes
+  - Optional sustain-pedal CC 64 pulses
   - Running-status chord stacks
   - Pitch bend sweeps
   - Control change (modulation, expression, sustain on/off)
@@ -13,6 +15,13 @@ exercised under realistic playing load. Mixes:
 The mix is deliberately heavier than a single keyboard player to make any
 backpressure / heap / watchdog problem reproduce within minutes rather than
 hours. Adjust `notes_per_sec` and `bpm` to taste.
+
+For long transpose-mode soak testing, increase the chord burst density and
+note overlap, for example:
+
+    python -X utf8 scripts/midi_stress.py --duration 7200 --notes-per-sec 90 \
+        --bpm 160 --chord-burst-interval 0.75 --chord-voices 8 \
+        --chord-hold-min 0.9 --chord-hold-max 1.8
 """
 
 from __future__ import annotations
@@ -34,6 +43,24 @@ def parse_args() -> argparse.Namespace:
                    help="Average notes (on/off pair) per second")
     p.add_argument("--duration", type=float, default=0.0,
                    help="Run for this many seconds (0 = run until Ctrl-C)")
+    p.add_argument("--chord-burst-interval", type=float, default=1.5,
+                   help="seconds between chord-stack bursts")
+    p.add_argument("--chord-voices", type=int, default=5,
+                   help="notes in each chord burst")
+    p.add_argument("--chord-hold-min", type=float, default=0.60,
+                   help="minimum seconds to hold chord voices")
+    p.add_argument("--chord-hold-max", type=float, default=0.60,
+                   help="maximum seconds to hold chord voices")
+    p.add_argument("--hr-velocity", action="store_true",
+                   help="emit CC 88 High Resolution Velocity Prefix before note messages")
+    p.add_argument("--mute-note-rate", type=float, default=0.10,
+                   help="fraction of note releases sent as note_on velocity 0")
+    p.add_argument("--pedal-period", type=float, default=0.0,
+                   help="seconds between sustain pedal presses (0 disables)")
+    p.add_argument("--pedal-hold", type=float, default=0.8,
+                   help="seconds to hold sustain pedal once pressed")
+    p.add_argument("--pedal-channel", type=int, default=0,
+                   help="channel used for sustain pedal CC messages")
     p.add_argument("--no-clock", action="store_true",
                    help="Suppress 0xF8 clock pulses")
     p.add_argument("--seed", type=int, default=42,
@@ -59,7 +86,7 @@ def main() -> int:
     clock_period = 60.0 / args.bpm / 24.0 if not args.no_clock else 0.0
     note_period = 1.0 / max(args.notes_per_sec, 1.0)
 
-    stats = {"notes": 0, "cc": 0, "pb": 0, "clock": 0}
+    stats = {"notes": 0, "cc": 0, "pb": 0, "clock": 0, "hr_prefix": 0, "pedal": 0}
     deadline = time.monotonic() + args.duration if args.duration > 0 else None
 
     last_clock = time.monotonic()
@@ -70,6 +97,25 @@ def main() -> int:
     pb_value = 0
     pb_dir = 1
     held_notes: list[tuple[int, int, float]] = []  # (ch, note, release_at)
+    chord_pattern = (0, 4, 7, 11, 14, 17, 21, 24)
+    pedal_down = False
+    next_pedal_on = time.monotonic() + max(args.pedal_period, 0.0) if args.pedal_period > 0 else float("inf")
+    pedal_release_at = 0.0
+
+    def send_hr_prefix(channel: int) -> None:
+        if not args.hr_velocity:
+            return
+        prefix = rng.randrange(128)
+        out.send(mido.Message("control_change",
+                              channel=channel,
+                              control=88,
+                              value=prefix))
+        stats["hr_prefix"] += 1
+
+    def send_note(kind: str, channel: int, note: int, velocity: int) -> None:
+        send_hr_prefix(channel)
+        out.send(mido.Message(kind, channel=channel, note=note, velocity=velocity))
+        stats["notes"] += 1
 
     with mido.open_output(port_name) as out:
         # Sane starting state on each channel.
@@ -96,9 +142,7 @@ def main() -> int:
                     ch = rng.randrange(4)
                     note = rng.randint(36, 84)
                     vel = rng.randint(50, 110)
-                    out.send(mido.Message("note_on",
-                                          channel=ch, note=note, velocity=vel))
-                    stats["notes"] += 1
+                    send_note("note_on", ch, note, vel)
                     duration = rng.uniform(0.10, 0.40)
                     held_notes.append((ch, note, now + duration))
 
@@ -106,8 +150,10 @@ def main() -> int:
                 still: list[tuple[int, int, float]] = []
                 for (ch, note, release_at) in held_notes:
                     if now >= release_at:
-                        out.send(mido.Message("note_off",
-                                              channel=ch, note=note, velocity=0))
+                        if args.mute_note_rate > 0.0 and rng.random() < args.mute_note_rate:
+                            send_note("note_on", ch, note, 0)
+                        else:
+                            send_note("note_off", ch, note, 0)
                     else:
                         still.append((ch, note, release_at))
                 held_notes = still
@@ -115,19 +161,39 @@ def main() -> int:
                 # 4) Periodic chord-stack burst — five rapid note-ons within
                 # ~5 ms, each individually released later. This is the worst
                 # case for the TX FIFO, and the whole point of the test.
-                if now - last_chord_burst > 1.5:
+                if now - last_chord_burst > args.chord_burst_interval:
                     last_chord_burst = now
                     base = rng.randint(40, 70)
                     ch = rng.randrange(4)
                     burst_vel = rng.randint(80, 110)
-                    for offset in (0, 4, 7, 11, 14):
+                    voices = max(1, min(args.chord_voices, len(chord_pattern)))
+                    hold_min = min(args.chord_hold_min, args.chord_hold_max)
+                    hold_max = max(args.chord_hold_min, args.chord_hold_max)
+                    for offset in chord_pattern[:voices]:
                         n = base + offset
-                        out.send(mido.Message("note_on",
-                                              channel=ch, note=n, velocity=burst_vel))
-                        held_notes.append((ch, n, now + 0.6))
-                        stats["notes"] += 1
+                        send_note("note_on", ch, n, burst_vel)
+                        held_notes.append((ch, n, now + rng.uniform(hold_min, hold_max)))
 
-                # 5) Pitch bend sweep.
+                # 5) Pedal pulses.
+                if args.pedal_period > 0.0:
+                    if pedal_down and now >= pedal_release_at:
+                        out.send(mido.Message("control_change",
+                                              channel=args.pedal_channel,
+                                              control=64,
+                                              value=0))
+                        pedal_down = False
+                        stats["pedal"] += 1
+                        next_pedal_on = now + args.pedal_period
+                    elif (not pedal_down) and now >= next_pedal_on:
+                        out.send(mido.Message("control_change",
+                                              channel=args.pedal_channel,
+                                              control=64,
+                                              value=127))
+                        pedal_down = True
+                        pedal_release_at = now + max(args.pedal_hold, 0.01)
+                        stats["pedal"] += 1
+
+                # 6) Pitch bend sweep.
                 if now - last_pb_step >= 0.020:
                     last_pb_step = now
                     pb_value += pb_dir * 512
@@ -138,7 +204,7 @@ def main() -> int:
                     out.send(mido.Message("pitchwheel", channel=0, pitch=pb_value))
                     stats["pb"] += 1
 
-                # 6) Modulation / expression / sustain CCs.
+                # 7) Modulation / expression CCs.
                 if rng.random() < 0.02:
                     cc = rng.choice([1, 11, 64, 7])
                     val = rng.randint(0, 127)
@@ -147,11 +213,12 @@ def main() -> int:
                                           control=cc, value=val))
                     stats["cc"] += 1
 
-                # 7) Status report once per second.
+                # 8) Status report once per second.
                 if now - last_report >= 1.0:
                     last_report = now
                     print(f"[gen] notes={stats['notes']} cc={stats['cc']} "
                           f"pb={stats['pb']} clock={stats['clock']} "
+                          f"hr_prefix={stats['hr_prefix']} pedal={stats['pedal']} "
                           f"held={len(held_notes)}",
                           flush=True)
 

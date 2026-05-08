@@ -25,6 +25,7 @@ static BLEClient* g_client = nullptr;
 static BLEAdvertisedDevice* g_target = nullptr;
 static volatile bool g_doConnect = false;
 static volatile bool g_doScan = false;
+static volatile bool g_connectInProgress = false;
 static uint32_t g_lastScanRestart = 0;
 
 // g_target is touched by both the BLE scan task (allocates a new one on
@@ -283,24 +284,53 @@ void ble_hid_start_scan() {
 
 BT_STATUS ble_hid_status() { return g_status; }
 
+// connectAndSubscribe() walks the GATT and can take several seconds. Running
+// it inline from ble_hid_service() (which is called every 20 ms from the main
+// loop) freezes the loop for that whole duration, including processMidiInput()
+// and the Serial2 TX drain. The visible symptom for live transpose use is a
+// 1–2 s gap of silence followed by a burst of stacked notes once the loop
+// resumes and the RX/TX rings catch up. Push the connect work to a one-shot
+// FreeRTOS task pinned to core 0 (loopTask runs on core 1) so the main loop
+// keeps servicing MIDI while NimBLE is doing its handshake.
+static void ble_connect_task(void* /*pv*/) {
+  bool ok = connectAndSubscribe();
+  {
+    TargetLock lk;
+    if (g_target) { delete g_target; g_target = nullptr; }
+  }
+  BLEDevice::getScan()->clearResults();
+  if (!ok) {
+    g_status = BT_DISCONNECTED;
+    g_doScan = true;
+  }
+  g_connectInProgress = false;
+  vTaskDelete(nullptr);
+}
+
 void ble_hid_service() {
-  if (g_doConnect) {
+  if (g_doConnect && !g_connectInProgress) {
     g_doConnect = false;
-    bool ok = connectAndSubscribe();
-    // Whether connect succeeded or not, the scan-supplied advertiser data is
-    // no longer needed. Holding it indefinitely would slowly bloat the heap
-    // across reconnect cycles and create stale pointers.
-    {
-      TargetLock lk;
-      if (g_target) { delete g_target; g_target = nullptr; }
-    }
-    BLEDevice::getScan()->clearResults();
-    if (!ok) {
-      g_status = BT_DISCONNECTED;
-      g_doScan = true;
+    g_connectInProgress = true;
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        ble_connect_task, "ble_conn", 8192, nullptr, 4, nullptr, 0);
+    if (ok != pdPASS) {
+      // Out of heap — fall back to inline connect rather than dropping the
+      // candidate entirely. This regresses to the old behavior only in a
+      // genuine OOM, which is also when the user least cares about latency.
+      g_connectInProgress = false;
+      bool r = connectAndSubscribe();
+      {
+        TargetLock lk;
+        if (g_target) { delete g_target; g_target = nullptr; }
+      }
+      BLEDevice::getScan()->clearResults();
+      if (!r) {
+        g_status = BT_DISCONNECTED;
+        g_doScan = true;
+      }
     }
   }
-  if (g_doScan && g_status == BT_DISCONNECTED) {
+  if (g_doScan && g_status == BT_DISCONNECTED && !g_connectInProgress) {
     g_doScan = false;
     BLEDevice::getScan()->clearResults();
     ble_hid_start_scan();
