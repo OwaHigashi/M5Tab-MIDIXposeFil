@@ -23,6 +23,10 @@ CRASH_HINTS = (
     "watchdog",
     "wdt",
     "abort()",
+    "brownout",
+    "brown out",
+    "brown-out",
+    "brownout detector was triggered",
     "rst:0x",      # esp boot prefix
     "rst cause",
     "stack canary",

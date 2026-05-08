@@ -10,10 +10,15 @@ build/
 
 # Test / capture artifacts
 *.log
+logs/
 chat.txt
 screenshots/
 *.pdf
 test_*.csv
+
+# Python bytecode caches
+__pycache__/
+*.pyc
 
 # OS / editor
 .DS_Store

@@ -42,6 +42,32 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/portmacro.h>
+#include <freertos/semphr.h>
+
+// =================================================================
+//  Serial2 TX mutex — coordinates writes between the dedicated MIDI
+//  task (core 0) and the UI thread (core 1). Without it, a chord
+//  Note Off coming from the MIDI task can interleave with a UI-driven
+//  send (GS Reset / Program Change / All Notes Off) and produce
+//  garbled bytes the synth cannot interpret as a Note Off — leaving
+//  voices stuck on. Recursive so a function that already holds the
+//  lock can call another locked helper safely.
+// =================================================================
+static SemaphoreHandle_t g_serial2TxMux = nullptr;
+
+class Serial2TxLock {
+  bool taken;
+ public:
+  Serial2TxLock() {
+    taken = (g_serial2TxMux != nullptr) &&
+            (xSemaphoreTakeRecursive(g_serial2TxMux, portMAX_DELAY) == pdTRUE);
+  }
+  ~Serial2TxLock() {
+    if (taken && g_serial2TxMux) xSemaphoreGiveRecursive(g_serial2TxMux);
+  }
+  Serial2TxLock(const Serial2TxLock&) = delete;
+  Serial2TxLock& operator=(const Serial2TxLock&) = delete;
+};
 
 // Define M5TAB_DIAG (e.g. via -DM5TAB_DIAG in build.cmd or the IDE) to
 // enable the lightweight `[mem]` heap / stack monitor printed every 5 s.
@@ -55,6 +81,7 @@
 #include "src/MD_MIDIFile.h"
 #include "src/AudioOutputM5Speaker.h"
 #include "src/ble_hid.h"
+#include "src/gm_instruments.h"
 
 // ==== Tab5 PortA repurposed as UART for M5 Unit MIDI (SAM2695) ====
 #define RXD2 54
@@ -107,7 +134,7 @@ enum AppMode { APP_TRANSPOSE, APP_MIDI, APP_PLAY };
 enum DisplayMode { DIRECT_MODE, KEY_MODE, INSTANT_MODE, SEQUENCE_MODE,
                    CONFIG_EDIT_MODE, BASE_SET_MODE };
 // PLAY 内のサブモード (2 種)
-enum PlayMode { PLAY_SMF, PLAY_MP3 };
+enum PlayMode { PLAY_SRC, PLAY_SMF, PLAY_MP3 };
 enum TransposeRange { RANGE_0_TO_12, RANGE_MINUS12_TO_0, RANGE_MINUS5_TO_6 };
 enum MidiInputSource { MIDI_INPUT_UNIT, MIDI_INPUT_USB, MIDI_INPUT_MIX };
 
@@ -173,7 +200,7 @@ struct SmfKeyGeom { Rect r; bool isBlackKey; };
 // ==== State ====
 static AppMode currentApp = APP_TRANSPOSE;
 static DisplayMode currentMode = DIRECT_MODE;
-static PlayMode currentPlay = PLAY_SMF;
+static PlayMode currentPlay = PLAY_SRC;
 static TransposeRange transposeRange = RANGE_MINUS5_TO_6;
 static volatile int8_t transposeValue = 0;
 static bool transposeButtonsOn[12] = {false};
@@ -305,6 +332,54 @@ static char mp3Title[128] = {};
 static char mp3Artist[128] = {};
 static char mp3CurrentName[128] = {};
 
+// ==== Device-wide configuration (persisted to /config.json on SD) ====
+// The struct is defined here, near the other top-level state, so functions
+// declared later in the .ino (which the Arduino preprocessor can't auto-
+// forward) can still reference g_config at compile time. The save/load/apply
+// helpers themselves live further down with the rest of the SD I/O code.
+struct DeviceConfig {
+  char defaultApp[16];
+  char defaultTransposeMode[16];
+  int  initialTranspose;
+  int  transposeBase;
+  bool initialAllNotesOff;
+  bool initialFilterBypass;
+  bool initialMapperBypass;
+  char transposeRange[12];
+  char midiInputSource[12];
+  bool majorUpperTranspose;
+  bool btAutoReconnect;
+  bool showSplash;
+  // Reset behaviour: SAM2695 retains its program/CC state across reboots, so
+  // unconditionally blasting GS Reset at boot can stomp the user's last setup.
+  // Both flags default such that startup is silent (off) but SMF playback
+  // still resets the synth before each track (existing behaviour).
+  bool startupGSReset;       // boot: send Roland GS Reset SysEx
+  bool smfStartGSReset;      // SMF play start: send Roland GS Reset SysEx
+  // SRC playback mode: per-channel synth state restored at boot.
+  uint8_t srcInitChannel;    // 1..16 (UI is 1-based)
+  uint8_t srcInitProgram;    // 0..127 (GM program number for melodic chs)
+  uint8_t srcInitVolume;     // 0..127 (CC #7)
+  bool    srcAutoChannel;    // follow incoming MIDI channel automatically
+};
+static DeviceConfig g_config;
+
+// ==== SRC (Sound source / instrument selection) ====
+// Per-channel state for the M5 Unit MIDI (SAM2695) GM synth. Mirrors the
+// state model used by M5Core2-MIDIXposeFilBTUM but extends it to 16 channels
+// so the user can drive any channel from the Tab UI. Channel 10 (index 9)
+// uses the drum-kit catalog; everything else uses the GM melodic catalog.
+static const int SRC_CH_COUNT = 16;
+static const int SRC_DRUM_CHANNEL = 9;     // 0-based MIDI channel 10
+static uint8_t  srcChannel = 0;            // active UI channel (0..15)
+static uint8_t  srcProgram[SRC_CH_COUNT];  // last sent program per channel
+static uint8_t  srcVolume[SRC_CH_COUNT];   // CC #7 cached value
+static uint16_t srcPitchBend[SRC_CH_COUNT];// 14-bit, 8192 = center
+static bool     srcSustain[SRC_CH_COUNT];  // CC #64 cached value
+static bool     srcAutoFollow = true;      // follow incoming MIDI channel
+static int      srcListScroll = 0;         // first item index in the picker
+static bool     srcDirtyAll = true;        // force a full SRC redraw next tick
+
 // ==== Layout (computed in computeLayout()) ====
 static Rect headerArea;       // top banner
 static Rect toolbarArea;      // mode tabs + aux
@@ -323,9 +398,9 @@ static Rect midiAppBypassBtn;
 static Rect midiInputSourceBtn;
 static Rect baseEntryBtn;     // header right: enter BASE_SET_MODE
 static Rect cfgEntryBtn;      // header right: enter CONFIG_EDIT_MODE
-// PLAY app sub-mode tabs (SMF / MP3)
-static Rect playTab[2];
-static const char* playName[2] = { "SMF", "MP3" };
+// PLAY app sub-mode tabs (SRC / SMF / MP3)
+static Rect playTab[3];
+static const char* playName[3] = { "SRC", "SMF", "MP3" };
 static Rect btnAllOff;        // aux
 static Rect btnRange;         // aux (DIRECT range cycle / KEY upper/lower swap)
 // Long-tap hit target on the BT-status label drawn at (30, headerArea.y+4, 260, 24).
@@ -334,6 +409,7 @@ static Rect btStatusHitArea;
 static Rect btnPrev, btnNext; // pedal-replacement
 static Rect smfBtnPrev, smfBtnPlay, smfBtnNext, smfBtnLoop;
 static Rect mp3BtnPrev, mp3BtnPlay, mp3BtnNext, mp3BtnVolDown, mp3BtnVolUp;
+static Rect srcBtnGm, srcBtnGs, srcBtnInit, srcBtnAuto;
 
 static ValueBtn directBtns[12];
 static KeyBtn   majorKeys[12];
@@ -347,6 +423,56 @@ static Rect     smfListArea, smfInfoArea, smfPianoArea;
 static Rect     smfListUpBtn, smfListDownBtn;
 static Rect     mp3ListArea, mp3InfoArea, mp3VisualArea;
 static Rect     mp3ListUpBtn, mp3ListDownBtn;
+
+// SRC layout rectangles (computed in computeLayout()).
+static Rect srcChannelRow;       // strip showing CH 01..16 cells
+static Rect srcChannelCells[16];
+static Rect srcProgramHeader;    // "PRG:nnn  Name"  — also tappable to open picker
+static Rect srcPrgDownBtn, srcPrgUpBtn;
+static Rect srcListArea;         // outer container for label / piano roll / keyboard
+static Rect srcLabelArea;        // top-of-srcListArea band hosting the channel label
+static Rect srcRollArea;         // piano-roll history strip above the keyboard
+static Rect srcKeyboardArea;     // 88-key live monitor at the bottom of srcListArea
+static Rect srcListUpBtn, srcListDownBtn;  // (legacy, zeroed; kept to avoid dangling refs)
+static Rect srcVolDownBtn, srcVolUpBtn, srcVolLabel;
+static Rect srcPbDownBtn,  srcPbUpBtn,  srcPbLabel;
+static Rect srcSusBtn;
+
+// Per-channel live note state for the SRC active-channel keyboard. Updated
+// from handleParsedMidiMessage so any MIDI passing through the pipeline
+// shows up on the keyboard while in SRC mode. Channel is 0..15.
+static uint8_t srcKeyVel[16][128]   = {};
+static bool    srcKeyDirty[16][128] = {};
+static bool    srcKeyAllDirty       = true;
+struct SrcKeyGeom { Rect r; bool isBlack; };
+static SrcKeyGeom srcKeyGeom[128];   // pre-computed rectangles for notes 21..108 (88 keys)
+static bool       srcKeyGeomReady = false;
+// Notes outside the 88-key range (21..108) get drawn into the leftmost white
+// key as a tint for visibility, but we mostly ignore them.
+static const int  SRC_KEY_LO = 21;   // A0
+static const int  SRC_KEY_HI = 108;  // C8
+
+// Piano-roll history. Captures recent note events on the active channel so
+// we can render scrolling vertical bars above the keyboard. The roll spans
+// SRC_ROLL_T_MS milliseconds of wall time, with the present moment at the
+// bottom edge and older events scrolling upward off the top.
+static const uint32_t SRC_ROLL_T_MS = 3000;   // 3 s window (faster scroll)
+static const int      SRC_ROLL_HISTORY = 96;  // ring buffer size for finished notes
+struct SrcRollEvent { uint8_t note; uint8_t vel; uint8_t channel; uint32_t startMs; uint32_t endMs; };
+static SrcRollEvent srcRollHist[SRC_ROLL_HISTORY];
+static int srcRollHistCount = 0;     // total writes (mod SRC_ROLL_HISTORY for ring)
+static uint32_t srcNoteStartMs[16][128];  // 0 = note not currently held
+
+// SRC fullscreen instrument picker overlay state. Opens when the user taps
+// the PRG name banner; covers the entire screen with a paged grid of all
+// 128 GM instruments (or the 9 drum kits when active channel is Ch10).
+static bool g_srcPickerOpen = false;
+static int  g_srcPickerPage = 0;
+static const int SRC_PICKER_COLS    = 4;
+static const int SRC_PICKER_ROWS    = 8;
+static const int SRC_PICKER_PERPAGE = SRC_PICKER_COLS * SRC_PICKER_ROWS;  // 32
+static Rect srcPickerCells[SRC_PICKER_PERPAGE];
+static Rect srcPickerPrevBtn, srcPickerNextBtn, srcPickerCloseBtn;
 
 // Touch input uses M5Unified's edge-triggered wasPressed(), so no manual latch.
 
@@ -366,16 +492,32 @@ static volatile uint8_t g_usbMidiInEpAddr    = 0;    // address of the IN endpoi
 static volatile uint8_t g_usbMidiClaimedItf  = 0xFF; // interface number we claimed
 static usb_host_client_handle_t g_usbClient = nullptr;
 static usb_device_handle_t      g_usbDevice = nullptr;
-static usb_transfer_t*          g_usbInXfer = nullptr;
+// Multiple IN transfers in flight at once. Single transfer left a window
+// while we processed a completed buffer where no transfer was queued; the
+// keyboard's data on the next USB poll had nowhere to land and got dropped
+// at the USB host driver layer (never reached our ring, hence usb_drop=0
+// even though notes were lost). Aggressive chord trills can saturate
+// short-lived bursts; 16 × 64-byte buffers ≈ 1 KB of always-queued receive
+// capacity gives the IDF host driver plenty of room while a callback is
+// processing one of them.
+static const int                USB_MIDI_IN_XFERS = 16;
+static usb_transfer_t*          g_usbInXfers[USB_MIDI_IN_XFERS] = {};
+// Drop counter for transfers we couldn't re-submit (usually transient, but
+// without a counter we can't tell). Surfaced via STATUS too.
+static volatile uint32_t        g_usbInResubmitFails = 0;
 static TaskHandle_t             g_usbTask   = nullptr;
 
 // Lock-free-ish ring buffer the USB task uses to hand raw MIDI bytes to the
 // main loop. processMIDIByte() touches Serial2 and global UI state, so it
 // must run on the loop task only.
-static constexpr size_t USB_MIDI_RING_SIZE = 1024;
+// Generous USB MIDI ring. 1024 was too small once a heavy chord burst
+// arrived faster than the consumer could drain (USB Full-Speed bursts are
+// far quicker than 31.25 kbaud MIDI OUT). 8 KB ≈ 2.6 s of headroom.
+static constexpr size_t USB_MIDI_RING_SIZE = 8192;
 static uint8_t  g_usbMidiRing[USB_MIDI_RING_SIZE];
-static volatile uint16_t g_usbMidiRingHead = 0;  // written by USB task
-static volatile uint16_t g_usbMidiRingTail = 0;  // read by loop
+static volatile uint32_t g_usbMidiRingHead = 0;  // written by USB task
+static volatile uint32_t g_usbMidiRingTail = 0;  // read by loop
+static volatile uint32_t g_usbMidiRingDropCount = 0;  // bytes dropped on full-ring
 static portMUX_TYPE g_usbMidiRingMux = portMUX_INITIALIZER_UNLOCKED;
 
 enum CyclerKind : uint8_t;
@@ -401,6 +543,12 @@ static void drawMidiManage();
 static void processMidiManageTouch(const m5::Touch_Class::touch_detail_t& td);
 static void drawSmf();
 static void drawMp3();
+static void drawSrc();
+static void handleSrcTouch(int x, int y);
+static void drawSrcPicker();
+static void handleSrcPickerTouch(int x, int y);
+static void srcPickerOpen();
+static void srcPickerClose();
 static void drawHeaderStatusApp();
 static void drawHeaderRightButtons();
 static void drawMidiActivityLines();
@@ -588,42 +736,54 @@ static void computeLayout() {
   midiAppTabFilter = { toolStartX,                              tabY, midiTabW, tabH };
   midiAppTabMapper = { toolStartX + 1 * (midiTabW + midiTabGap), tabY, midiTabW, tabH };
   midiAppBypassBtn = { toolStartX + 2 * (midiTabW + midiTabGap), tabY, midiTabW, tabH };
-  // PLAY: 2 mode tabs SMF/MP3 share the toolbar with transport buttons.
+  // PLAY: 3 mode tabs SRC/SMF/MP3 share the toolbar with transport buttons.
   int playTabW = 130;
   int playTabGap = 8;
-  playTab[0] = { toolStartX,                            tabY, playTabW, tabH };
-  playTab[1] = { toolStartX + playTabW + playTabGap,    tabY, playTabW, tabH };
-  // Transport buttons start to the right of PLAY tabs.
-  int transStartX = toolStartX + (playTabW + playTabGap) * 2;
+  playTab[0] = { toolStartX,                                  tabY, playTabW, tabH };
+  playTab[1] = { toolStartX + 1 * (playTabW + playTabGap),    tabY, playTabW, tabH };
+  playTab[2] = { toolStartX + 2 * (playTabW + playTabGap),    tabY, playTabW, tabH };
+  // Transport buttons start to the right of PLAY tabs (3 tab widths over).
+  int transStartX = toolStartX + 3 * (playTabW + playTabGap);
 
   btnRange  = { SCREEN_W - (auxW * 2 + auxGap + 20), tabY, auxW, tabH };
   btnAllOff = { SCREEN_W - (auxW + 20),              tabY, auxW, tabH };
 
   int playerGap = 12;
-  // Transport buttons share the right portion next to the SMF/MP3 mode tabs and
-  // before the AOFF button. Compute available width from transStartX.
+  // Transport / synth-control buttons share the right portion next to the
+  // SRC/SMF/MP3 mode tabs and before the AOFF button. Compute available width
+  // from transStartX. SMF (4 btns), MP3 (5 btns) and SRC (4 btns) all live in
+  // this band — only the active sub-mode is drawn at any moment, so the
+  // rectangles can overlap cleanly.
   int transRightX = btnAllOff.x - 12;  // leave some space before AOFF
   int playerAvail = transRightX - transStartX;
-  int smfPrevW = 170;
-  int smfPlayW = 230;
-  int smfNextW = 170;
-  int smfLoopW = playerAvail - (smfPrevW + smfPlayW + smfNextW + playerGap * 3);
-  if (smfLoopW < 120) smfLoopW = 120;
-  smfBtnPrev = { transStartX, tabY, smfPrevW, tabH };
-  smfBtnPlay = { smfBtnPrev.x + smfBtnPrev.w + playerGap, tabY, smfPlayW, tabH };
-  smfBtnNext = { smfBtnPlay.x + smfBtnPlay.w + playerGap, tabY, smfNextW, tabH };
-  smfBtnLoop = { smfBtnNext.x + smfBtnNext.w + playerGap, tabY, smfLoopW, tabH };
 
-  int mp3PrevW = 160;
-  int mp3PlayW = 220;
-  int mp3NextW = 160;
-  int mp3VolW = (playerAvail - (mp3PrevW + mp3PlayW + mp3NextW + playerGap * 4)) / 2;
-  if (mp3VolW < 100) mp3VolW = 100;
-  mp3BtnPrev    = { transStartX, tabY, mp3PrevW, tabH };
-  mp3BtnPlay    = { mp3BtnPrev.x + mp3BtnPrev.w + playerGap, tabY, mp3PlayW, tabH };
-  mp3BtnNext    = { mp3BtnPlay.x + mp3BtnPlay.w + playerGap, tabY, mp3NextW, tabH };
-  mp3BtnVolDown = { mp3BtnNext.x + mp3BtnNext.w + playerGap, tabY, mp3VolW, tabH };
+  // Common main-button width: PREV/PLAY/NEXT are the same width across SMF
+  // and MP3 so the eye doesn't track between sub-modes. SMF's 4 buttons
+  // exactly tile the available width; MP3's PREV/PLAY/NEXT match and the
+  // VOL-/VOL+ pair splits the remaining slot.
+  int mainW = (playerAvail - playerGap * 3) / 4;
+  if (mainW < 120) mainW = 120;
+
+  smfBtnPrev = { transStartX,                                tabY, mainW, tabH };
+  smfBtnPlay = { smfBtnPrev.x + smfBtnPrev.w + playerGap,     tabY, mainW, tabH };
+  smfBtnNext = { smfBtnPlay.x + smfBtnPlay.w + playerGap,     tabY, mainW, tabH };
+  smfBtnLoop = { smfBtnNext.x + smfBtnNext.w + playerGap,     tabY, mainW, tabH };
+
+  // MP3: 3 matching main buttons + 2 narrower VOL buttons (4 inter-button gaps).
+  int mp3VolW = (playerAvail - mainW * 3 - playerGap * 4) / 2;
+  if (mp3VolW < 60) mp3VolW = 60;
+  mp3BtnPrev    = { transStartX,                                  tabY, mainW,   tabH };
+  mp3BtnPlay    = { mp3BtnPrev.x + mp3BtnPrev.w + playerGap,       tabY, mainW,   tabH };
+  mp3BtnNext    = { mp3BtnPlay.x + mp3BtnPlay.w + playerGap,       tabY, mainW,   tabH };
+  mp3BtnVolDown = { mp3BtnNext.x + mp3BtnNext.w + playerGap,       tabY, mp3VolW, tabH };
   mp3BtnVolUp   = { mp3BtnVolDown.x + mp3BtnVolDown.w + playerGap, tabY, mp3VolW, tabH };
+
+  // SRC: 4 matching buttons (GMRST / GSRST / INIT / AUTO), same width as SMF
+  // main buttons so the toolbar feels consistent when switching sub-modes.
+  srcBtnGm   = { transStartX,                              tabY, mainW, tabH };
+  srcBtnGs   = { srcBtnGm.x   + srcBtnGm.w   + playerGap,  tabY, mainW, tabH };
+  srcBtnInit = { srcBtnGs.x   + srcBtnGs.w   + playerGap,  tabY, mainW, tabH };
+  srcBtnAuto = { srcBtnInit.x + srcBtnInit.w + playerGap,  tabY, mainW, tabH };
 
   // Header right side, left → right:
   //   appTabs (XPOSE / MSG / PLAY) | BASE | CONF | MIX | <status text>
@@ -674,7 +834,116 @@ static void computeLayout() {
   mp3VisualArea = { rightX, mp3InfoArea.y + mp3InfoArea.h + 12,
                     rightW, listBottom - (mp3InfoArea.y + mp3InfoArea.h + 12) };
 
+  // SRC layout: channel strip on top, program header + ±buttons, then a
+  // wide piano roll + a thin live-monitor keyboard. VOL / PB / SUS controls
+  // live in navArea below. Margins are kept tight so the piano roll gets the
+  // bulk of the vertical space.
+  {
+    const int srcSideMargin = 20;   // left/right
+    const int srcTopMargin  = 6;    // toolbar bottom -> channel strip
+    const int srcGap        = 6;    // between rows in this band
+    const int srcBottomGap  = 4;    // keyboard bottom -> navArea top
+    int sxL = contentArea.x + srcSideMargin;
+    int sxR = contentArea.x + contentArea.w - srcSideMargin;
+    int sxW = sxR - sxL;
+    int sy  = contentArea.y + srcTopMargin;
+
+    // Channel strip: 16 cells × ~50 px wide × 56 px tall
+    int chCellH = 56;
+    int chCellGap = 4;
+    int chCellW = (sxW - chCellGap * 15) / 16;
+    srcChannelRow = { sxL, sy, sxW, chCellH };
+    for (int i = 0; i < 16; ++i) {
+      srcChannelCells[i] = { sxL + i * (chCellW + chCellGap), sy, chCellW, chCellH };
+    }
+    sy += chCellH + srcGap;
+
+    // Program header row: PRG- (160) | name banner (flex) | PRG+ (160), 80 tall
+    int prgBtnW = 160;
+    int prgRowH = 80;
+    int prgGap = 12;
+    srcPrgDownBtn   = { sxL, sy, prgBtnW, prgRowH };
+    srcPrgUpBtn     = { sxR - prgBtnW, sy, prgBtnW, prgRowH };
+    srcProgramHeader = { srcPrgDownBtn.x + srcPrgDownBtn.w + prgGap, sy,
+                         srcPrgUpBtn.x - prgGap - (srcPrgDownBtn.x + srcPrgDownBtn.w + prgGap),
+                         prgRowH };
+    sy += prgRowH + srcGap;
+
+    // Middle band: piano roll history + 88-key keyboard.
+    // Keyboard is intentionally short (≈1/4 of the band) so the piano roll
+    // above gets the bulk of the vertical space — that's where the per-note
+    // history actually conveys playing dynamics. The "Ch nn live monitor"
+    // label is dropped: the channel strip already shows which ch is active,
+    // and the colour key on every bar makes the panel self-explanatory.
+    int listBottomPx = contentArea.y + contentArea.h - srcBottomGap;
+    srcListArea = { sxL, sy, sxW, listBottomPx - sy };
+    int kbH       = max(80, srcListArea.h / 4);
+    srcLabelArea    = { 0, 0, 0, 0 };  // unused
+    srcRollArea     = { srcListArea.x, srcListArea.y,
+                        srcListArea.w, srcListArea.h - kbH - 2 };
+    srcKeyboardArea = { srcListArea.x, srcListArea.y + srcListArea.h - kbH,
+                        srcListArea.w, kbH };
+    // Up/down arrow rectangles are kept (zeroed) only so the legacy decls
+    // don't dangle; nothing draws or hit-tests them anymore.
+    srcListUpBtn   = { 0, 0, 0, 0 };
+    srcListDownBtn = { 0, 0, 0, 0 };
+
+    // Bottom row inside navArea: VOL- VOL VOL+ | PB- PB PB+ | SUS — each
+    // cluster 1/3 of width.
+    int botRowH = navArea.h - 20;
+    int yBot = navArea.y + (navArea.h - botRowH) / 2;
+    int clusterW = (sxW - 16 * 2) / 3;     // 16 px gaps between clusters
+    int subBtnW = 110;
+    int volX = sxL;
+    int pbX  = sxL + clusterW + 16;
+    int susX = pbX + clusterW + 16;
+    srcVolDownBtn = { volX, yBot, subBtnW, botRowH };
+    srcVolUpBtn   = { volX + clusterW - subBtnW, yBot, subBtnW, botRowH };
+    srcVolLabel   = { srcVolDownBtn.x + srcVolDownBtn.w, yBot,
+                      srcVolUpBtn.x - (srcVolDownBtn.x + srcVolDownBtn.w), botRowH };
+    srcPbDownBtn  = { pbX, yBot, subBtnW, botRowH };
+    srcPbUpBtn    = { pbX + clusterW - subBtnW, yBot, subBtnW, botRowH };
+    srcPbLabel    = { srcPbDownBtn.x + srcPbDownBtn.w, yBot,
+                      srcPbUpBtn.x - (srcPbDownBtn.x + srcPbDownBtn.w), botRowH };
+    srcSusBtn     = { susX, yBot, clusterW, botRowH };
+  }
+
+  // ---- SRC fullscreen instrument picker layout ----
+  // Cover the entire screen with: title strip, paged grid (4×8 = 32 cells),
+  // footer with [< PAGE] [PAGE >] [CLOSE]. Cells are big enough to read GM
+  // names at FONT_MED.
+  {
+    int pickerMargin = 24;
+    int titleH = 60;
+    int footerH = 92;
+    int gridX = pickerMargin;
+    int gridY = pickerMargin + titleH;
+    int gridW = SCREEN_W - pickerMargin * 2;
+    int gridH = SCREEN_H - pickerMargin * 2 - titleH - footerH - 16;
+    int gap = 10;
+    int cellW = (gridW - gap * (SRC_PICKER_COLS - 1)) / SRC_PICKER_COLS;
+    int cellH = (gridH - gap * (SRC_PICKER_ROWS - 1)) / SRC_PICKER_ROWS;
+    for (int row = 0; row < SRC_PICKER_ROWS; ++row) {
+      for (int col = 0; col < SRC_PICKER_COLS; ++col) {
+        int idx = row * SRC_PICKER_COLS + col;
+        srcPickerCells[idx] = {
+          gridX + col * (cellW + gap),
+          gridY + row * (cellH + gap),
+          cellW,
+          cellH
+        };
+      }
+    }
+    int footerY = SCREEN_H - pickerMargin - footerH;
+    int footerW = (SCREEN_W - pickerMargin * 2 - gap * 2) / 3;
+    srcPickerPrevBtn  = { pickerMargin,                                   footerY, footerW, footerH };
+    srcPickerNextBtn  = { pickerMargin + footerW + gap,                   footerY, footerW, footerH };
+    srcPickerCloseBtn = { pickerMargin + (footerW + gap) * 2,             footerY, footerW, footerH };
+  }
+
   initPianoKeys(smfPianoArea);
+  // SRC keyboard geometry depends on srcListArea; force a recompute next draw.
+  srcKeyGeomReady = false;
 }
 
 // =================================================================
@@ -1010,6 +1279,8 @@ static uint16_t btStatusColor(BT_STATUS s) {
 static const char* getHeaderTitle() {
   if (currentApp == APP_MIDI) {
     return (midiManagePage == MIDI_PAGE_FILTER) ? "Filter" : "Mapper";
+  } else if ((currentApp == APP_PLAY && currentPlay == PLAY_SRC)) {
+    return "SND Source";
   } else if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF)) {
     return "SMF Player";
   } else if ((currentApp == APP_PLAY && currentPlay == PLAY_MP3)) {
@@ -1109,7 +1380,24 @@ static void drawHeaderStatusApp() {
   // narrow ~150 px strip available right of MIX, so we stack instead.
   int labelY = headerArea.y + headerArea.h / 2 - 18;
   int timeY  = headerArea.y + headerArea.h / 2 + 18;
-  if (currentApp == APP_PLAY && currentPlay == PLAY_SMF) {
+  if (currentApp == APP_PLAY && currentPlay == PLAY_SRC) {
+    char chBuf[16];
+    snprintf(chBuf, sizeof(chBuf), "CH:%02u", (unsigned)(srcChannel + 1));
+    char prgBuf[16];
+    if (srcChannel == SRC_DRUM_CHANNEL) {
+      snprintf(prgBuf, sizeof(prgBuf), "DRUM:%03u", (unsigned)srcProgram[srcChannel]);
+    } else {
+      snprintf(prgBuf, sizeof(prgBuf), "PRG:%03u", (unsigned)(srcProgram[srcChannel] + 1));
+    }
+    uint16_t col = srcAutoFollow ? COL_BTN_HI : COL_ACCENT;
+    M5.Display.setTextColor(col, COL_PANEL);
+    M5.Display.setTextDatum(middle_right);
+    // Both lines use FONT_SMALL so the wider "PRG:nnn" doesn't overflow the
+    // narrow strip between the MIX button and the right edge.
+    M5.Display.setFont(FONT_SMALL);
+    M5.Display.drawString(chBuf,  valueX, labelY);
+    M5.Display.drawString(prgBuf, valueX, timeY);
+  } else if (currentApp == APP_PLAY && currentPlay == PLAY_SMF) {
     uint32_t elapsed = smfPlaying
                      ? smfPausedElapsedMs + (millis() - smfPlaybackStartMs)
                      : smfPausedElapsedMs;
@@ -1268,20 +1556,30 @@ static void drawToolbarApp() {
     return;
   }
 
-  // APP_PLAY: SMF/MP3 mode tabs + transport buttons of the active sub-mode.
-  for (int i = 0; i < 2; i++) {
+  // APP_PLAY: SRC/SMF/MP3 mode tabs + transport/aux buttons of the active sub-mode.
+  for (int i = 0; i < 3; i++) {
     bool on = ((PlayMode)i == currentPlay);
     drawRectBtn(playTab[i], on ? COL_BTN_HI : COL_BTN, COL_BTN_BDR, playName[i],
                 on ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
   }
-  if (currentPlay == PLAY_SMF) {
+  if (currentPlay == PLAY_SRC) {
+    // SRC: 4 narrow buttons — GMRST / GSRST / INIT / AUTO. Labels shortened
+    // so they fit comfortably in the same toolbar slots as SMF transport.
+    // AUTO's state is shown by highlight colour (no "ON"/"OFF" suffix needed).
+    drawRectBtn(srcBtnGm,   TFT_BLUE,   COL_BTN_BDR, "GMRST", COL_BTN_TXT, FONT_MED);
+    drawRectBtn(srcBtnGs,   TFT_BLUE,   COL_BTN_BDR, "GSRST", COL_BTN_TXT, FONT_MED);
+    drawRectBtn(srcBtnInit, COL_DANGER, COL_BTN_BDR, "INIT",  COL_BTN_TXT, FONT_MED);
+    drawRectBtn(srcBtnAuto,
+                srcAutoFollow ? COL_BTN_HI : COL_BTN, COL_BTN_BDR, "AUTO",
+                srcAutoFollow ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
+  } else if (currentPlay == PLAY_SMF) {
     drawRectBtn(smfBtnPrev, TFT_BLUE, COL_BTN_BDR, "PREV", COL_BTN_TXT, FONT_MED);
     drawRectBtn(smfBtnPlay, smfPlaying ? COL_DANGER : COL_BTN_HI, COL_BTN_BDR,
                 smfPlaying ? "STOP" : "PLAY",
                 smfPlaying ? COL_BTN_TXT : COL_BTN_TXT_HI, FONT_MED);
     drawRectBtn(smfBtnNext, TFT_BLUE, COL_BTN_BDR, "NEXT", COL_BTN_TXT, FONT_MED);
     drawRectBtn(smfBtnLoop, smfLoop ? COL_BTN_HI : COL_BTN, COL_BTN_BDR,
-                smfLoop ? "LOOP ON" : "LOOP OFF",
+                smfLoop ? "RPTON" : "RPTOFF",
                 smfLoop ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
   } else {
     drawRectBtn(mp3BtnPrev, TFT_BLUE, COL_BTN_BDR, "PREV", COL_BTN_TXT, FONT_MED);
@@ -1289,8 +1587,8 @@ static void drawToolbarApp() {
                 mp3Playing ? "STOP" : "PLAY",
                 mp3Playing ? COL_BTN_TXT : COL_BTN_TXT_HI, FONT_MED);
     drawRectBtn(mp3BtnNext, TFT_BLUE, COL_BTN_BDR, "NEXT", COL_BTN_TXT, FONT_MED);
-    drawRectBtn(mp3BtnVolDown, COL_BTN, COL_BTN_BDR, "VOL-", COL_BTN_TXT, FONT_MED);
-    drawRectBtn(mp3BtnVolUp, COL_BTN, COL_BTN_BDR, "VOL+", COL_BTN_TXT, FONT_MED);
+    drawRectBtn(mp3BtnVolDown, COL_BTN, COL_BTN_BDR, "V-", COL_BTN_TXT, FONT_MED);
+    drawRectBtn(mp3BtnVolUp,   COL_BTN, COL_BTN_BDR, "V+", COL_BTN_TXT, FONT_MED);
   }
 }
 
@@ -2483,6 +2781,558 @@ static void drawMp3Visual() {
   mp3StaticDirty = false;
 }
 
+// =================================================================
+//  SRC mode rendering
+// =================================================================
+static bool srcNoteIsBlack(uint8_t note) {
+  switch (note % 12) {
+    case 1: case 3: case 6: case 8: case 10: return true;
+    default: return false;
+  }
+}
+
+// Per-pitch-class colour: 12 distinct hues stepping through the colour wheel
+// so neighbouring keys are easy to tell apart, while the same pitch in
+// different octaves shares a colour. Computed once with HSV→RGB565 for the
+// 12 chromatic classes (note % 12 indexes into the table).
+static uint16_t srcPitchColor(uint8_t note) {
+  static uint16_t cache[12] = {0};
+  static bool inited = false;
+  if (!inited) {
+    for (int pc = 0; pc < 12; ++pc) {
+      // hue 0..6 (HSV sextant), s=v=1 → bright saturated colours
+      float h = (float)pc * 6.0f / 12.0f;
+      int   i = (int)h;
+      float f = h - i;
+      float p = 0.0f;
+      float q = 1.0f - f;
+      float t = f;
+      float r=0, g=0, b=0;
+      switch (i) {
+        case 0: r=1; g=t; b=p; break;
+        case 1: r=q; g=1; b=p; break;
+        case 2: r=p; g=1; b=t; break;
+        case 3: r=p; g=q; b=1; break;
+        case 4: r=t; g=p; b=1; break;
+        default:r=1; g=p; b=q; break;
+      }
+      uint8_t r8 = (uint8_t)(r * 255);
+      uint8_t g8 = (uint8_t)(g * 255);
+      uint8_t b8 = (uint8_t)(b * 255);
+      cache[pc] = M5.Display.color565(r8, g8, b8);
+    }
+    inited = true;
+  }
+  return cache[note % 12];
+}
+
+// Compute the 88-key piano geometry inside srcKeyboardArea. White keys tile
+// the width evenly; black keys overlap on top, narrower and shorter.
+static void srcInitKeyboardGeometry() {
+  int x0 = srcKeyboardArea.x + 8;
+  int y0 = srcKeyboardArea.y + 4;
+  int w  = srcKeyboardArea.w - 16;
+  int h  = srcKeyboardArea.h - 8;
+  if (w < 88 || h < 30) { srcKeyGeomReady = false; return; }
+
+  // 52 white keys in 88-key range (21..108).
+  int whiteCount = 0;
+  for (int n = SRC_KEY_LO; n <= SRC_KEY_HI; ++n) if (!srcNoteIsBlack((uint8_t)n)) ++whiteCount;
+  int whiteW = w / whiteCount;
+  int blackW = (whiteW * 60) / 100;
+  if (blackW < 4) blackW = 4;
+  int blackH = (h * 60) / 100;
+
+  for (int n = 0; n < 128; ++n) {
+    srcKeyGeom[n].isBlack = srcNoteIsBlack((uint8_t)n);
+    srcKeyGeom[n].r = { 0, 0, 0, 0 };
+  }
+  int whiteIdx = 0;
+  for (int n = SRC_KEY_LO; n <= SRC_KEY_HI; ++n) {
+    bool black = srcNoteIsBlack((uint8_t)n);
+    if (!black) {
+      srcKeyGeom[n].r = { x0 + whiteIdx * whiteW, y0, whiteW + 1, h };
+      ++whiteIdx;
+    } else {
+      // Black key sits in the gap to the right of the previous white key.
+      int prevWhiteRightX = x0 + whiteIdx * whiteW;
+      srcKeyGeom[n].r = { prevWhiteRightX - blackW / 2, y0, blackW, blackH };
+    }
+  }
+  srcKeyGeomReady = true;
+}
+
+static void srcKeyboardClearVisualState() {
+  // Forces a full redraw next time drawSrc runs. Call when the active channel
+  // changes so the displayed keyboard reflects the new channel.
+  srcKeyAllDirty = true;
+}
+
+static void srcDrawSingleKey(uint8_t note) {
+  if (note < SRC_KEY_LO || note > SRC_KEY_HI) return;
+  if (!srcKeyGeomReady) return;
+  const Rect& r = srcKeyGeom[note].r;
+  bool black = srcKeyGeom[note].isBlack;
+  uint8_t vel = srcKeyVel[srcChannel][note];
+  uint16_t fill;
+  if (vel) {
+    // Lit — colour by pitch class so each note in the chord stands out.
+    fill = srcPitchColor(note);
+  } else {
+    fill = black ? TFT_BLACK : TFT_WHITE;
+  }
+  M5.Display.fillRect(r.x, r.y, r.w, r.h, fill);
+  M5.Display.drawRect(r.x, r.y, r.w, r.h, black ? 0x4208 : 0x8410);
+}
+
+// Full redraw of the SRC keyboard panel (background + all keys).
+static void srcDrawKeyboardFull() {
+  if (!srcKeyGeomReady) srcInitKeyboardGeometry();
+  if (!srcKeyGeomReady) return;
+  M5.Display.fillRoundRect(srcKeyboardArea.x, srcKeyboardArea.y,
+                           srcKeyboardArea.w, srcKeyboardArea.h, 10, 0x4208);
+  M5.Display.drawRoundRect(srcKeyboardArea.x, srcKeyboardArea.y,
+                           srcKeyboardArea.w, srcKeyboardArea.h, 10, COL_BTN_BDR);
+  // White keys first so black keys overlap on top.
+  for (int n = SRC_KEY_LO; n <= SRC_KEY_HI; ++n) {
+    if (!srcKeyGeom[n].isBlack) srcDrawSingleKey((uint8_t)n);
+  }
+  for (int n = SRC_KEY_LO; n <= SRC_KEY_HI; ++n) {
+    if (srcKeyGeom[n].isBlack) srcDrawSingleKey((uint8_t)n);
+  }
+  // Clear all dirty flags (full repaint already covered them).
+  for (int n = 0; n < 128; ++n) srcKeyDirty[srcChannel][n] = false;
+  srcKeyAllDirty = false;
+}
+
+// Incremental: redraw only keys flagged dirty for the current channel.
+static void srcFlushKeyboardDirty() {
+  if (!srcKeyGeomReady) return;
+  // Always need the white-then-black ordering when a black-adjacent white
+  // toggles, so redraw the white first then any dirty black on top.
+  for (int n = SRC_KEY_LO; n <= SRC_KEY_HI; ++n) {
+    if (!srcKeyGeom[n].isBlack && srcKeyDirty[srcChannel][n]) {
+      srcDrawSingleKey((uint8_t)n);
+      srcKeyDirty[srcChannel][n] = false;
+      // Repaint adjacent black keys so their borders aren't clobbered.
+      if (n > 0 && srcKeyGeom[n - 1].isBlack)   srcDrawSingleKey((uint8_t)(n - 1));
+      if (n < 127 && srcKeyGeom[n + 1].isBlack) srcDrawSingleKey((uint8_t)(n + 1));
+    }
+  }
+  for (int n = SRC_KEY_LO; n <= SRC_KEY_HI; ++n) {
+    if (srcKeyGeom[n].isBlack && srcKeyDirty[srcChannel][n]) {
+      srcDrawSingleKey((uint8_t)n);
+      srcKeyDirty[srcChannel][n] = false;
+    }
+  }
+}
+
+// Append a finished note to the piano-roll history ring buffer.
+static void srcRollAppend(uint8_t note, uint8_t vel, uint8_t channel, uint32_t startMs, uint32_t endMs) {
+  int slot = srcRollHistCount % SRC_ROLL_HISTORY;
+  srcRollHist[slot] = { note, vel, channel, startMs, endMs };
+  ++srcRollHistCount;
+}
+
+// Update srcKeyVel from a parsed MIDI message. Called by handleParsedMidiMessage.
+static void srcKeyboardOnNote(int channel, int note, int velocity, bool noteOn) {
+  if (channel < 0 || channel >= 16) return;
+  if (note < 0 || note >= 128) return;
+  uint8_t v = (uint8_t)((noteOn && velocity > 0) ? velocity : 0);
+
+  // Piano-roll bookkeeping: every Note On stamps a start-time; every Note Off
+  // closes the interval and pushes it to the history ring.
+  uint32_t now = millis();
+  if (v > 0) {
+    if (srcNoteStartMs[channel][note] == 0) {
+      srcNoteStartMs[channel][note] = (now == 0) ? 1 : now;  // 0 means "not held"
+    }
+  } else {
+    uint32_t s = srcNoteStartMs[channel][note];
+    if (s != 0) {
+      srcRollAppend((uint8_t)note, srcKeyVel[channel][note], (uint8_t)channel, s, now);
+      srcNoteStartMs[channel][note] = 0;
+    }
+  }
+
+  if (srcKeyVel[channel][note] == v) return;
+  srcKeyVel[channel][note] = v;
+  srcKeyDirty[channel][note] = true;
+  if (currentApp == APP_PLAY && currentPlay == PLAY_SRC && (uint8_t)channel == srcChannel) {
+    // The next UI tick's partial-redraw branch will flush keys for SRC mode.
+    needPartialUpdate = true;
+  }
+}
+
+// Map a millisecond age (now - eventMs) to a Y coordinate inside the piano-
+// roll panel. Now is at the bottom; older events scroll upward and disappear
+// off the top once they age past SRC_ROLL_T_MS.
+static int srcRollYForAge(uint32_t ageMs) {
+  if (ageMs > SRC_ROLL_T_MS) ageMs = SRC_ROLL_T_MS;
+  int h = srcRollArea.h - 4;
+  int yBottom = srcRollArea.y + srcRollArea.h - 2;
+  return yBottom - (int)((uint64_t)ageMs * h / SRC_ROLL_T_MS);
+}
+
+// Draw one note bar inside the roll. xCol is the centre x of the matching
+// keyboard column below; we use a narrow bar (whiteW or blackW) to align.
+static void srcRollDrawBar(uint8_t note, uint32_t startMs, uint32_t endMs, uint32_t now) {
+  if (note < SRC_KEY_LO || note > SRC_KEY_HI) return;
+  if (!srcKeyGeomReady) return;
+  if (endMs <= now - SRC_ROLL_T_MS) return;            // entirely off the top
+  if (startMs > now) startMs = now;                    // future-clamp (shouldn't happen)
+  uint32_t ageStart = (now > startMs) ? (now - startMs) : 0;
+  uint32_t ageEnd   = (now > endMs)   ? (now - endMs)   : 0;
+  int yStart = srcRollYForAge(ageEnd);                 // newer end → lower y → higher on screen
+  int yEnd   = srcRollYForAge(ageStart);               // older start → higher y? Actually
+  // age 0 → bottom, age SRC_ROLL_T_MS → top. The note's lifetime: youngest
+  // edge is endMs (smallest age), oldest edge is startMs (largest age). So
+  // yTop is at age=ageStart, yBottom is at age=ageEnd. Swap and clip:
+  if (yStart > yEnd) { int t = yStart; yStart = yEnd; yEnd = t; }
+  // Clip to the same interior region that the per-tick fillRect clears
+  // (inset 4 px from the panel edges) so leftover bar pixels at the very top
+  // and bottom of the panel can't survive between repaints.
+  const int inset = 4;
+  int areaTop = srcRollArea.y + inset;
+  int areaBot = srcRollArea.y + srcRollArea.h - inset;
+  if (yEnd   <= areaTop) return;
+  if (yStart >= areaBot) return;
+  if (yStart < areaTop) yStart = areaTop;
+  if (yEnd   > areaBot) yEnd   = areaBot;
+  if (yEnd <= yStart) yEnd = yStart + 1;
+
+  const Rect& kr = srcKeyGeom[note].r;
+  int colX = kr.x;
+  int colW = kr.w;
+  // Black-key roll bars are slightly inset so they don't smear over their
+  // neighbouring white-key bars.
+  if (srcKeyGeom[note].isBlack) { colX += 1; colW = max(2, colW - 2); }
+
+  // Same per-pitch-class colour as the lit key, so a held note's bar matches
+  // the key it's coming from below.
+  uint16_t fill = srcPitchColor(note);
+  M5.Display.fillRect(colX, yStart, colW, yEnd - yStart, fill);
+}
+
+// Draw the static panel border for the piano roll. Called once on full
+// redraw (drawSrc) — NOT on every tick. Per-tick scrolling only repaints
+// the interior so the rounded edge doesn't flicker.
+static void srcDrawRollFrame() {
+  M5.Display.fillRoundRect(srcRollArea.x, srcRollArea.y,
+                           srcRollArea.w, srcRollArea.h, 8, 0x10A2);
+  M5.Display.drawRoundRect(srcRollArea.x, srcRollArea.y,
+                           srcRollArea.w, srcRollArea.h, 8, COL_BTN_BDR);
+}
+
+// Per-tick incremental repaint of the piano roll's interior. The panel border
+// drawn by srcDrawRollFrame() is left untouched so it stays put while the
+// notes inside scroll upward. Called every UI tick (~50 Hz).
+static void srcDrawRoll() {
+  // Inset by 4 px from each edge so we never write over the rounded border.
+  const int inset = 4;
+  M5.Display.fillRect(srcRollArea.x + inset, srcRollArea.y + inset,
+                      srcRollArea.w - inset * 2, srcRollArea.h - inset * 2,
+                      0x10A2);
+
+  if (!srcKeyGeomReady) return;
+  uint32_t now = millis();
+  uint32_t cutoff = (now > SRC_ROLL_T_MS) ? (now - SRC_ROLL_T_MS) : 0;
+
+  // Finished notes from the ring buffer — active channel only.
+  int n = (srcRollHistCount < SRC_ROLL_HISTORY) ? srcRollHistCount : SRC_ROLL_HISTORY;
+  for (int i = 0; i < n; ++i) {
+    int slot = (srcRollHistCount < SRC_ROLL_HISTORY) ? i
+              : (srcRollHistCount + i) % SRC_ROLL_HISTORY;
+    const SrcRollEvent& e = srcRollHist[slot];
+    if (e.channel != srcChannel) continue;
+    if (e.endMs < cutoff) continue;
+    srcRollDrawBar(e.note, e.startMs, e.endMs, now);
+  }
+
+  // Currently-held notes on the active channel — extend bar to "now"
+  for (int note = SRC_KEY_LO; note <= SRC_KEY_HI; ++note) {
+    uint32_t s = srcNoteStartMs[srcChannel][note];
+    if (s == 0) continue;
+    srcRollDrawBar((uint8_t)note, s, now, now);
+  }
+}
+
+static int srcCatalogCount() {
+  return (srcChannel == SRC_DRUM_CHANNEL) ? kGmDrumKitCount : 128;
+}
+
+static const char* srcCatalogNameAt(int index) {
+  if (srcChannel == SRC_DRUM_CHANNEL) {
+    if (index < 0 || index >= kGmDrumKitCount) return "";
+    return kGmDrumKits[index].name;
+  }
+  if (index < 0 || index >= 128) return "";
+  return kGmInstrumentNames[index];
+}
+
+static int srcCatalogProgramAt(int index) {
+  if (srcChannel == SRC_DRUM_CHANNEL) {
+    if (index < 0 || index >= kGmDrumKitCount) return 0;
+    return kGmDrumKits[index].program;
+  }
+  return index;  // melodic GM: index == program number
+}
+
+static int srcCurrentCatalogIndex() {
+  if (srcChannel == SRC_DRUM_CHANNEL) return gmDrumKitIndex(srcProgram[srcChannel]);
+  return srcProgram[srcChannel];
+}
+
+static const char* srcCurrentProgramName() {
+  if (srcChannel == SRC_DRUM_CHANNEL) return gmDrumKitName(srcProgram[srcChannel]);
+  return gmInstrumentName(srcProgram[srcChannel]);
+}
+
+static void drawSrc() {
+  M5.Display.fillRect(contentArea.x, contentArea.y, contentArea.w, contentArea.h, COL_BG);
+  M5.Display.fillRect(navArea.x, navArea.y, navArea.w, navArea.h, COL_BG);
+  srcDirtyAll = false;
+
+  // ---- Channel strip ----
+  for (int i = 0; i < 16; ++i) {
+    bool sel = (i == srcChannel);
+    bool drum = (i == SRC_DRUM_CHANNEL);
+    uint16_t bg  = sel ? COL_BTN_HI : (drum ? COL_BTN_HI2 : COL_BTN);
+    uint16_t txt = sel ? COL_BTN_TXT_HI : COL_BTN_TXT;
+    char lab[4]; snprintf(lab, sizeof(lab), "%02d", i + 1);
+    drawRectBtn(srcChannelCells[i], bg, COL_BTN_BDR, lab, txt, FONT_SMALL);
+  }
+
+  // ---- Program header (PRG- | name | PRG+) ----
+  drawRectBtn(srcPrgDownBtn, TFT_BLUE, COL_BTN_BDR, "PRG-", COL_BTN_TXT, FONT_MED);
+  drawRectBtn(srcPrgUpBtn,   TFT_BLUE, COL_BTN_BDR, "PRG+", COL_BTN_TXT, FONT_MED);
+  M5.Display.fillRoundRect(srcProgramHeader.x, srcProgramHeader.y,
+                           srcProgramHeader.w, srcProgramHeader.h, 12, COL_PANEL);
+  M5.Display.drawRoundRect(srcProgramHeader.x, srcProgramHeader.y,
+                           srcProgramHeader.w, srcProgramHeader.h, 12, COL_BTN_BDR);
+  M5.Display.setFont(FONT_LARGE);
+  M5.Display.setTextColor(COL_TITLE, COL_PANEL);
+  M5.Display.setTextDatum(middle_left);
+  char prgBuf[64];
+  if (srcChannel == SRC_DRUM_CHANNEL) {
+    snprintf(prgBuf, sizeof(prgBuf), "DRUM:%03u  %s",
+             (unsigned)srcProgram[srcChannel], srcCurrentProgramName());
+  } else {
+    snprintf(prgBuf, sizeof(prgBuf), "PRG:%03u  %s",
+             (unsigned)(srcProgram[srcChannel] + 1), srcCurrentProgramName());
+  }
+  M5.Display.drawString(prgBuf, srcProgramHeader.x + 16,
+                        srcProgramHeader.y + srcProgramHeader.h / 2);
+
+  // ---- Piano roll + 88-key live monitor ----
+  // The "Ch nn live monitor" header is gone: the channel strip above already
+  // shows which channel is active, and the colour-coded roll/keys are
+  // self-explanatory.
+  // Frame is drawn ONCE here; per-tick scrolling refills only the interior so
+  // the rounded border doesn't flicker as bars move.
+  if (!srcKeyGeomReady) srcInitKeyboardGeometry();
+  srcDrawKeyboardFull();
+  srcDrawRollFrame();
+  srcDrawRoll();
+
+  // ---- VOL / PB / SUS bottom row ----
+  drawRectBtn(srcVolDownBtn, COL_BTN, COL_BTN_BDR, "VOL-", COL_BTN_TXT, FONT_MED);
+  drawRectBtn(srcVolUpBtn,   COL_BTN, COL_BTN_BDR, "VOL+", COL_BTN_TXT, FONT_MED);
+  M5.Display.fillRoundRect(srcVolLabel.x, srcVolLabel.y, srcVolLabel.w, srcVolLabel.h, 10, COL_PANEL);
+  M5.Display.drawRoundRect(srcVolLabel.x, srcVolLabel.y, srcVolLabel.w, srcVolLabel.h, 10, COL_BTN_BDR);
+  M5.Display.setFont(FONT_MED);
+  M5.Display.setTextColor(COL_TITLE, COL_PANEL);
+  M5.Display.setTextDatum(middle_center);
+  char vbuf[16]; snprintf(vbuf, sizeof(vbuf), "VOL:%u", (unsigned)srcVolume[srcChannel]);
+  M5.Display.drawString(vbuf, srcVolLabel.x + srcVolLabel.w / 2,
+                        srcVolLabel.y + srcVolLabel.h / 2);
+
+  drawRectBtn(srcPbDownBtn, COL_BTN, COL_BTN_BDR, "PB-",  COL_BTN_TXT, FONT_MED);
+  drawRectBtn(srcPbUpBtn,   COL_BTN, COL_BTN_BDR, "PB+",  COL_BTN_TXT, FONT_MED);
+  M5.Display.fillRoundRect(srcPbLabel.x, srcPbLabel.y, srcPbLabel.w, srcPbLabel.h, 10, COL_PANEL);
+  M5.Display.drawRoundRect(srcPbLabel.x, srcPbLabel.y, srcPbLabel.w, srcPbLabel.h, 10, COL_BTN_BDR);
+  char pbuf[24];
+  int pbDelta = (int)srcPitchBend[srcChannel] - 8192;
+  snprintf(pbuf, sizeof(pbuf), "PB:%+d", pbDelta);
+  M5.Display.drawString(pbuf, srcPbLabel.x + srcPbLabel.w / 2,
+                        srcPbLabel.y + srcPbLabel.h / 2);
+
+  bool sus = srcSustain[srcChannel];
+  drawRectBtn(srcSusBtn, sus ? COL_BTN_HI : COL_BTN, COL_BTN_BDR,
+              sus ? "SUS ON" : "SUS OFF",
+              sus ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
+}
+
+static void handleSrcTouch(int x, int y) {
+  // Channel strip — manual select disables auto-follow so the user's pick
+  // sticks even while live MIDI is flowing on a different channel.
+  for (int i = 0; i < 16; ++i) {
+    if (hit(srcChannelCells[i], x, y)) {
+      if (srcChannel != (uint8_t)i) {
+        srcChannel = (uint8_t)i;
+        srcAutoFollow = false;
+        // Re-send program so the synth reflects the cached selection on the
+        // newly-active channel even if it was previously silent.
+        srcSendCurrentProgram(srcChannel);
+        sendUnitCC(srcChannel, 7, srcVolume[srcChannel]);
+        srcKeyboardClearVisualState();
+        srcDirtyAll = true;
+        needFullRedraw = true;
+      }
+      return;
+    }
+  }
+
+  // Program header ± buttons
+  if (hit(srcPrgDownBtn, x, y)) {
+    int total = srcCatalogCount();
+    int cur = srcCurrentCatalogIndex();
+    int next = (cur - 1 + total) % total;
+    srcSetProgram(srcChannel, (uint8_t)srcCatalogProgramAt(next));
+    needFullRedraw = true;
+    return;
+  }
+  if (hit(srcPrgUpBtn, x, y)) {
+    int total = srcCatalogCount();
+    int cur = srcCurrentCatalogIndex();
+    int next = (cur + 1) % total;
+    srcSetProgram(srcChannel, (uint8_t)srcCatalogProgramAt(next));
+    needFullRedraw = true;
+    return;
+  }
+
+  // Tap on the program-name banner opens the fullscreen instrument picker.
+  if (hit(srcProgramHeader, x, y)) {
+    srcPickerOpen();
+    return;
+  }
+
+  // VOL / PB / SUS buttons
+  if (hit(srcVolDownBtn, x, y)) {
+    int v = (int)srcVolume[srcChannel] - 4; if (v < 0) v = 0;
+    srcSetVolume(srcChannel, (uint8_t)v); needPartialUpdate = true; needFullRedraw = true; return;
+  }
+  if (hit(srcVolUpBtn, x, y)) {
+    int v = (int)srcVolume[srcChannel] + 4; if (v > 127) v = 127;
+    srcSetVolume(srcChannel, (uint8_t)v); needFullRedraw = true; return;
+  }
+  if (hit(srcPbDownBtn, x, y)) {
+    int v = (int)srcPitchBend[srcChannel] - 512; if (v < 0) v = 0;
+    srcSetPitchBend(srcChannel, (uint16_t)v); needFullRedraw = true; return;
+  }
+  if (hit(srcPbUpBtn, x, y)) {
+    int v = (int)srcPitchBend[srcChannel] + 512; if (v > 16383) v = 16383;
+    srcSetPitchBend(srcChannel, (uint16_t)v); needFullRedraw = true; return;
+  }
+  if (hit(srcSusBtn, x, y)) {
+    srcSetSustain(srcChannel, !srcSustain[srcChannel]);
+    needFullRedraw = true;
+    return;
+  }
+}
+
+// =================================================================
+//  SRC fullscreen instrument picker
+// =================================================================
+static void srcPickerOpen() {
+  // Snap to the page that contains the current selection so the user sees
+  // their pick highlighted on entry.
+  int cur = srcCurrentCatalogIndex();
+  g_srcPickerPage = cur / SRC_PICKER_PERPAGE;
+  g_srcPickerOpen = true;
+  needFullRedraw = true;
+}
+
+static void srcPickerClose() {
+  g_srcPickerOpen = false;
+  needFullRedraw = true;
+}
+
+static int srcPickerPageCount() {
+  int total = srcCatalogCount();
+  return (total + SRC_PICKER_PERPAGE - 1) / SRC_PICKER_PERPAGE;
+}
+
+static void drawSrcPicker() {
+  M5.Display.fillScreen(COL_BG);
+
+  // Title
+  M5.Display.setFont(FONT_LARGE);
+  M5.Display.setTextColor(COL_TITLE, COL_BG);
+  M5.Display.setTextDatum(middle_left);
+  char title[64];
+  int pageCount = srcPickerPageCount();
+  if (srcChannel == SRC_DRUM_CHANNEL) {
+    snprintf(title, sizeof(title), "Drum Kits — Ch10  (page %d/%d)",
+             g_srcPickerPage + 1, pageCount);
+  } else {
+    snprintf(title, sizeof(title), "GM Instruments — Ch%02u  (page %d/%d)",
+             (unsigned)(srcChannel + 1), g_srcPickerPage + 1, pageCount);
+  }
+  M5.Display.drawString(title, 32, 24 + 30);
+
+  // Cells
+  int total = srcCatalogCount();
+  int curIdx = srcCurrentCatalogIndex();
+  int base = g_srcPickerPage * SRC_PICKER_PERPAGE;
+  for (int i = 0; i < SRC_PICKER_PERPAGE; ++i) {
+    int idx = base + i;
+    Rect& r = srcPickerCells[i];
+    if (idx >= total) {
+      // Empty slot — paint a faint placeholder so the grid stays uniform.
+      M5.Display.fillRoundRect(r.x, r.y, r.w, r.h, 12, COL_BG);
+      M5.Display.drawRoundRect(r.x, r.y, r.w, r.h, 12, 0x18C3);
+      continue;
+    }
+    bool sel = (idx == curIdx);
+    uint16_t bg  = sel ? COL_BTN_HI2 : COL_PANEL;
+    uint16_t txt = sel ? COL_BTN_TXT_HI : COL_BTN_TXT;
+    M5.Display.fillRoundRect(r.x, r.y, r.w, r.h, 12, bg);
+    M5.Display.drawRoundRect(r.x, r.y, r.w, r.h, 12, COL_BTN_BDR);
+    int prgVal = srcCatalogProgramAt(idx);
+    char line[80];
+    if (srcChannel == SRC_DRUM_CHANNEL) {
+      snprintf(line, sizeof(line), "%03d  %s", prgVal, srcCatalogNameAt(idx));
+    } else {
+      snprintf(line, sizeof(line), "%03d  %s", prgVal + 1, srcCatalogNameAt(idx));
+    }
+    drawTextFit(r, line, FONT_MED, txt, bg, 12);
+  }
+
+  // Footer
+  drawRectBtn(srcPickerPrevBtn,  TFT_BLUE,    COL_BTN_BDR, "< PAGE", COL_BTN_TXT, FONT_LARGE);
+  drawRectBtn(srcPickerNextBtn,  TFT_BLUE,    COL_BTN_BDR, "PAGE >", COL_BTN_TXT, FONT_LARGE);
+  drawRectBtn(srcPickerCloseBtn, COL_DANGER,  COL_BTN_BDR, "CLOSE",  COL_BTN_TXT, FONT_LARGE);
+}
+
+static void handleSrcPickerTouch(int x, int y) {
+  // Footer first
+  if (hit(srcPickerCloseBtn, x, y)) { srcPickerClose(); return; }
+  int pageCount = srcPickerPageCount();
+  if (hit(srcPickerPrevBtn, x, y)) {
+    g_srcPickerPage = (g_srcPickerPage + pageCount - 1) % pageCount;
+    needFullRedraw = true;
+    return;
+  }
+  if (hit(srcPickerNextBtn, x, y)) {
+    g_srcPickerPage = (g_srcPickerPage + 1) % pageCount;
+    needFullRedraw = true;
+    return;
+  }
+  // Cells
+  int total = srcCatalogCount();
+  int base = g_srcPickerPage * SRC_PICKER_PERPAGE;
+  for (int i = 0; i < SRC_PICKER_PERPAGE; ++i) {
+    int idx = base + i;
+    if (idx >= total) break;
+    if (hit(srcPickerCells[i], x, y)) {
+      srcSetProgram(srcChannel, (uint8_t)srcCatalogProgramAt(idx));
+      srcPickerClose();
+      return;
+    }
+  }
+}
+
 static void drawSmf() {
   M5.Display.fillRect(contentArea.x, contentArea.y, contentArea.w, contentArea.h, COL_BG);
   M5.Display.fillRect(navArea.x, navArea.y, navArea.w, navArea.h, COL_BG);
@@ -2536,6 +3386,12 @@ static void drawMp3() {
 }
 
 static void drawInterface() {
+  // SRC fullscreen instrument picker takes over the entire screen, including
+  // header/toolbar, so it draws first and short-circuits.
+  if (g_srcPickerOpen) {
+    drawSrcPicker();
+    return;
+  }
   M5.Display.fillScreen(COL_BG);
   drawHeader();
   drawToolbarApp();
@@ -2556,7 +3412,11 @@ static void drawInterface() {
       }
       break;
     case APP_MIDI: drawMidiManage(); break;
-    case APP_PLAY: if (currentPlay == PLAY_SMF) drawSmf(); else drawMp3(); break;
+    case APP_PLAY:
+      if      (currentPlay == PLAY_SRC) drawSrc();
+      else if (currentPlay == PLAY_SMF) drawSmf();
+      else                              drawMp3();
+      break;
   }
 }
 
@@ -2588,9 +3448,12 @@ static void resetMidiInputParser() {
 // =================================================================
 static void usbMidiRingPush(const uint8_t* bytes, size_t n) {
   portENTER_CRITICAL(&g_usbMidiRingMux);
-  for (size_t i = 0; i < n; i++) {
-    uint16_t next = (uint16_t)((g_usbMidiRingHead + 1) % USB_MIDI_RING_SIZE);
-    if (next == g_usbMidiRingTail) break;  // full → drop the rest
+  for (size_t i = 0; i < n; ++i) {
+    uint32_t next = (g_usbMidiRingHead + 1) % USB_MIDI_RING_SIZE;
+    if (next == g_usbMidiRingTail) {
+      g_usbMidiRingDropCount += (uint32_t)(n - i);  // count what didn't fit
+      break;
+    }
     g_usbMidiRing[g_usbMidiRingHead] = bytes[i];
     g_usbMidiRingHead = next;
   }
@@ -2602,7 +3465,7 @@ static int usbMidiRingPop() {
   portENTER_CRITICAL(&g_usbMidiRingMux);
   if (g_usbMidiRingHead != g_usbMidiRingTail) {
     v = g_usbMidiRing[g_usbMidiRingTail];
-    g_usbMidiRingTail = (uint16_t)((g_usbMidiRingTail + 1) % USB_MIDI_RING_SIZE);
+    g_usbMidiRingTail = (g_usbMidiRingTail + 1) % USB_MIDI_RING_SIZE;
   }
   portEXIT_CRITICAL(&g_usbMidiRingMux);
   return v;
@@ -2611,7 +3474,7 @@ static int usbMidiRingPop() {
 static size_t usbMidiRingAvailable() {
   size_t a;
   portENTER_CRITICAL(&g_usbMidiRingMux);
-  uint16_t h = g_usbMidiRingHead, t = g_usbMidiRingTail;
+  uint32_t h = g_usbMidiRingHead, t = g_usbMidiRingTail;
   a = (h >= t) ? (size_t)(h - t) : (size_t)(USB_MIDI_RING_SIZE - t + h);
   portEXIT_CRITICAL(&g_usbMidiRingMux);
   return a;
@@ -2649,8 +3512,17 @@ static void usbMidiInDoneCb(usb_transfer_t* t) {
   if (g_usbMidiMounted &&
       t->status != USB_TRANSFER_STATUS_NO_DEVICE &&
       t->status != USB_TRANSFER_STATUS_CANCELED) {
-    if (usb_host_transfer_submit(t) != ESP_OK) {
-      // submit failed → leave it to the next mount cycle
+    // Tight retry: transient submit failures under heavy load shouldn't
+    // permanently retire this slot (which would silently shrink our queue
+    // depth and re-introduce the gap that drops USB chord bytes).
+    esp_err_t e = usb_host_transfer_submit(t);
+    if (e != ESP_OK) {
+      for (int retry = 0; retry < 3 && e != ESP_OK; ++retry) {
+        e = usb_host_transfer_submit(t);
+      }
+      if (e != ESP_OK) {
+        ++g_usbInResubmitFails;
+      }
     }
   }
 }
@@ -2722,18 +3594,30 @@ static bool usbMidiClaimAndStart(const usb_config_desc_t* cfg) {
     return false;
   }
 
-  err = usb_host_transfer_alloc(inEpMaxPacket, 0, &g_usbInXfer);
-  if (err != ESP_OK || g_usbInXfer == nullptr) {
-    Serial.printf("[USB] transfer_alloc err=0x%x\n", (unsigned)err);
+  // Allocate USB_MIDI_IN_XFERS transfers and prime them all so the host
+  // controller always has at least one buffer queued — eliminates the gap
+  // during callback execution where chord bytes were silently dropped at
+  // the USB layer (before reaching our ring counter, which is why
+  // `usb_drop` stayed at 0 even when notes went missing).
+  int allocated = 0;
+  for (int i = 0; i < USB_MIDI_IN_XFERS; ++i) {
+    err = usb_host_transfer_alloc(inEpMaxPacket, 0, &g_usbInXfers[i]);
+    if (err != ESP_OK || g_usbInXfers[i] == nullptr) {
+      Serial.printf("[USB] transfer_alloc[%d] err=0x%x\n", i, (unsigned)err);
+      break;
+    }
+    g_usbInXfers[i]->device_handle    = g_usbDevice;
+    g_usbInXfers[i]->bEndpointAddress = inEp;
+    g_usbInXfers[i]->callback         = usbMidiInDoneCb;
+    g_usbInXfers[i]->context          = nullptr;
+    g_usbInXfers[i]->num_bytes        = inEpMaxPacket;
+    g_usbInXfers[i]->timeout_ms       = 0;
+    ++allocated;
+  }
+  if (allocated == 0) {
     usb_host_interface_release(g_usbClient, g_usbDevice, midiItfNum);
     return false;
   }
-  g_usbInXfer->device_handle    = g_usbDevice;
-  g_usbInXfer->bEndpointAddress = inEp;
-  g_usbInXfer->callback         = usbMidiInDoneCb;
-  g_usbInXfer->context          = nullptr;
-  g_usbInXfer->num_bytes        = inEpMaxPacket;
-  g_usbInXfer->timeout_ms       = 0;
 
   g_usbMidiClaimedItf = midiItfNum;
   g_usbMidiInEpAddr   = inEp;
@@ -2741,8 +3625,10 @@ static bool usbMidiClaimAndStart(const usb_config_desc_t* cfg) {
   g_usbMidiActiveIndex = 0;
   g_usbMidiMounted    = true;
 
-  if (usb_host_transfer_submit(g_usbInXfer) != ESP_OK) {
-    Serial.println("[USB] initial IN submit failed");
+  for (int i = 0; i < allocated; ++i) {
+    if (usb_host_transfer_submit(g_usbInXfers[i]) != ESP_OK) {
+      Serial.printf("[USB] initial IN submit[%d] failed\n", i);
+    }
   }
   Serial.printf("[USB] MIDI mounted itf=%u in_ep=0x%02x mps=%u poll=%u\n",
                 (unsigned)midiItfNum, (unsigned)inEp,
@@ -2782,9 +3668,11 @@ static void usbMidiTeardown() {
     usb_host_interface_release(g_usbClient, g_usbDevice, g_usbMidiClaimedItf);
   }
 
-  if (g_usbInXfer) {
-    usb_host_transfer_free(g_usbInXfer);
-    g_usbInXfer = nullptr;
+  for (int i = 0; i < USB_MIDI_IN_XFERS; ++i) {
+    if (g_usbInXfers[i]) {
+      usb_host_transfer_free(g_usbInXfers[i]);
+      g_usbInXfers[i] = nullptr;
+    }
   }
 
   g_usbMidiClaimedItf = 0xFF;
@@ -2958,15 +3846,17 @@ static void handleToolbarTouch(int x, int y) {
     return;
   }
 
-  // PLAY app: SMF / MP3 mode tabs
+  // PLAY app: SRC / SMF / MP3 mode tabs
   if (currentApp == APP_PLAY) {
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
       if (hit(playTab[i], x, y)) {
         if (currentPlay == (PlayMode)i) return;
         if (currentPlay == PLAY_SMF) stopSmf();
         else if (currentPlay == PLAY_MP3) stopMp3();
         currentPlay = (PlayMode)i;
-        if (currentPlay == PLAY_SMF) {
+        if (currentPlay == PLAY_SRC) {
+          srcDirtyAll = true;
+        } else if (currentPlay == PLAY_SMF) {
           ensureStorage();
           if (smfPlaylistCount == 0) scanSmfFiles();
           invalidateSmfMonitorAll();
@@ -2978,6 +3868,33 @@ static void handleToolbarTouch(int x, int y) {
         return;
       }
     }
+  }
+
+  // SRC: 4 dedicated synth-control buttons in the toolbar slot.
+  if ((currentApp == APP_PLAY && currentPlay == PLAY_SRC)) {
+    if (hit(srcBtnGm, x, y)) {
+      sendGMReset(); delay(30);
+      srcResetState(true);
+      needFullRedraw = true;
+      return;
+    }
+    if (hit(srcBtnGs, x, y)) {
+      sendGSReset(); delay(30);
+      srcResetState(true);
+      needFullRedraw = true;
+      return;
+    }
+    if (hit(srcBtnInit, x, y)) {
+      srcHardReset();
+      needFullRedraw = true;
+      return;
+    }
+    if (hit(srcBtnAuto, x, y)) {
+      srcAutoFollow = !srcAutoFollow;
+      needFullRedraw = true;
+      return;
+    }
+    return;  // toolbar y-range; content widgets are handled by handleSrcTouch.
   }
 
   if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF)) {
@@ -3116,8 +4033,13 @@ static void handleNavTouch(int x, int y) {
     else if (hit(btnNext, x, y)) shiftTransposeBy(+1);
     return;
   }
-
-  return;
+  // SRC parks its VOL / PB / SUS row in the navArea band (otherwise that ~100
+  // px at the bottom of the screen is unused for non-XPOSE apps). Forward
+  // those taps to the SRC handler so the controls work when tapped.
+  if (currentApp == APP_PLAY && currentPlay == PLAY_SRC) {
+    handleSrcTouch(x, y);
+    return;
+  }
 }
 
 static void handleDirectTouch(int x, int y) {
@@ -3387,7 +4309,7 @@ static void playSmf(bool sendReset) {
   }
   resetSmfKeyboard();
   sendAllNotesOff();
-  if (sendReset) {
+  if (sendReset && g_config.smfStartGSReset) {
     sendGSReset();
     delay(30);
   }
@@ -3429,10 +4351,13 @@ static void smfMidiEventHandler(midi_event* pev) {
   for (uint8_t i = 1; i < messageSize; ++i) {
     message[i] = pev->data[i];
   }
-  for (uint8_t i = 0; i < messageSize; ++i) {
-    Serial2.write(message[i]);
-    ++midiOutCount;
-    if (!isHeartbeatByte(message[i])) ++midiOutRealCount;
+  {
+    Serial2TxLock lk;
+    for (uint8_t i = 0; i < messageSize; ++i) {
+      Serial2.write(message[i]);
+      ++midiOutCount;
+      if (!isHeartbeatByte(message[i])) ++midiOutRealCount;
+    }
   }
 
   uint8_t type = status & 0xF0;
@@ -3461,6 +4386,7 @@ static void smfSysexEventHandler(sysex_event* pev) {
   uint16_t cap = (uint16_t)sizeof(pev->data);
   uint16_t n = pev->size;
   if (n > cap) n = cap;
+  Serial2TxLock lk;
   for (uint16_t i = 0; i < n; ++i) {
     Serial2.write(pev->data[i]);
     ++midiOutCount;
@@ -3768,6 +4694,13 @@ static void handleTouch() {
 
   int x = t.x, y = t.y;
 
+  // SRC fullscreen instrument picker swallows all touch input while open.
+  // Only its own widgets (cells, prev/next/close) are reachable.
+  if (g_srcPickerOpen) {
+    handleSrcPickerTouch(x, y);
+    return;
+  }
+
   // ── Long-tap (wasHold ≥ default M5Unified hold threshold ~500 ms) on header
   //    BT label / toolbar AOFF button enters overlay modes. We check this
   //    BEFORE routing the tap further so the gestures work from any app/mode.
@@ -3836,6 +4769,8 @@ static void handleTouch() {
       case SEQUENCE_MODE:    handleSequenceTouch(x, y); break;
       default: break;
     }
+  } else if ((currentApp == APP_PLAY && currentPlay == PLAY_SRC)) {
+    handleSrcTouch(x, y);
   } else if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF)) {
     handleSmfTouch(x, y);
   } else {
@@ -4245,10 +5180,26 @@ static void outputMidiMessage(const MidiMessage& msg);
 static void handleParsedMidiMessage(const MidiMessage& inMsg) {
   if (!shouldAllowMidiMessage(inMsg)) return;          // FILTER で破棄
   MidiMessage mapped = applyMidiMapper(inMsg);          // MAPPER で書換
+  // Auto-follow incoming MIDI channel for the SRC mode. We sample after the
+  // MAPPER so a channel-remap is reflected on the UI; sampling before would
+  // chase the input channel even when the user has remapped it.
+  if (mapped.hasChannel && mapped.channel >= 0) {
+    srcOnIncomingChannel((uint8_t)mapped.channel);
+    // Live keyboard monitor for SRC mode: track Note On / Note Off per
+    // channel so the active-channel keyboard panel can light up the keys
+    // currently held. Note On with velocity 0 is a Note Off in the MIDI spec.
+    if (mapped.kind == MIDI_KIND_NOTE_ON) {
+      bool isOn = (mapped.length >= 3) && (mapped.bytes[2] > 0);
+      srcKeyboardOnNote(mapped.channel, mapped.bytes[1], mapped.bytes[2], isOn);
+    } else if (mapped.kind == MIDI_KIND_NOTE_OFF) {
+      srcKeyboardOnNote(mapped.channel, mapped.bytes[1], 0, false);
+    }
+  }
   outputMidiMessage(mapped);                            // Transpose + 送信
 }
 
 static void sendMIDIMessage(uint8_t* buffer, int length) {
+  Serial2TxLock lk;  // serialise with UI-thread sends so chord bytes don't tangle
   uint8_t status = buffer[0];
   uint8_t type = status & 0xF0;
   uint8_t channel = status & 0x0F;
@@ -4431,15 +5382,19 @@ static void processUsbMidiInput() {
 }
 
 static void processMidiInput() {
-  // Cap the work done per loop iteration. A keyboard player driving heavy
-  // running-status + clock + chord traffic can sustain bursts that outpace
-  // the 31.25 kbaud MIDI OUT, and Serial2.write() blocks once the TX ring
-  // is full. Without a budget, draining-to-empty inside a single loop()
-  // iteration prevents M5.update() / handleTouch() / ble_hid_service() /
-  // the IDLE task from running and the task watchdog resets the device.
-  // Unconsumed bytes stay in the source buffer (Serial2 RX ring or the
-  // USB ring) and are picked up on the next loop iteration. 3 ms keeps
-  // the worst-case response latency under one MIDI clock tick at 240 BPM.
+  // Cap the work done per drain pass. A keyboard player driving heavy
+  // running-status + chord traffic can sustain bursts that outpace the
+  // 31.25 kbaud MIDI OUT, and Serial2.write() blocks once the TX ring is
+  // full. Without a budget, the MIDI task could hold the Serial2 mutex too
+  // long and starve UI-driven sends. Unconsumed bytes stay in the source
+  // buffer (Serial2 RX ring or the USB ring) and are picked up on the next
+  // pass. 3 ms keeps the worst-case latency under one MIDI clock tick at
+  // 240 BPM.
+  //
+  // The Serial2 TX mutex is taken for the whole drain pass so SysEx
+  // pass-through bytes (written byte-by-byte across many processMIDIByte
+  // calls) cannot tangle with a UI-driven send.
+  Serial2TxLock lk;
   const uint32_t startUs = micros();
   const uint32_t kBudgetUs = 3000UL;
   bool sawInput = false;
@@ -4478,7 +5433,47 @@ static void processMidiInput() {
   if (sawInput) g_lastMidiInputAt = millis();
 }
 
+// =================================================================
+//  Dedicated MIDI I/O task (core 0)
+// =================================================================
+// Runs processMidiInput()/processPedal() on a separate FreeRTOS task pinned
+// to core 0 at high priority, so heavy UI redraws on the main loop (core 1
+// loopTask) — like the SRC piano-roll repaint — don't starve the MIDI input
+// drain. Without this, a 7–10 ms fillRect on the piano-roll panel could let
+// the Serial2 RX buffer accumulate enough bytes that a chord Note Off in
+// the middle of a burst gets cut off mid-message.
+//
+// The task wakes every 1 ms via vTaskDelay so it doesn't busy-spin. At
+// 31.25 kbaud, 1 ms covers ~3 incoming bytes — plenty of headroom.
+static TaskHandle_t g_midiTaskHandle = nullptr;
+
+static void midi_io_task(void* /*pv*/) {
+  for (;;) {
+    processMidiInput();
+    processPedal();
+    // 1 ms wake-up interval, expressed in tick-rate-agnostic units. With
+    // arduino-esp32's default 1 kHz tick this is 1 tick; on builds with a
+    // slower tick rate it floors to 0 and we yield without sleeping (still
+    // bounded — the task is the highest-priority cooperative consumer here).
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+static void startMidiIoTask() {
+  if (g_midiTaskHandle) return;
+  // Pin to core 1 (alongside loopTask) so we don't preempt the USB host task
+  // (priority 5, core 0). When the MIDI task ran on core 0 at priority 10
+  // it starved usb_host_lib_handle_events()/usb_host_client_handle_events(),
+  // causing USB-MIDI IN transfers to back up at the USB driver layer and
+  // chord bytes to be silently dropped. Priority 10 on core 1 still
+  // preempts the priority-1 loopTask whenever MIDI bytes need handling, so
+  // heavy UI redraws can't starve MIDI either.
+  xTaskCreatePinnedToCore(midi_io_task, "midi_io", 8192, nullptr, 10,
+                          &g_midiTaskHandle, 1);
+}
+
 static void sendAllNotesOff() {
+  Serial2TxLock lk;
   for (int ch = 0; ch < 16; ch++) {
     Serial2.write(0xB0 | ch); Serial2.write((uint8_t)123); Serial2.write((uint8_t)0);
     Serial2.write(0xB0 | ch); Serial2.write((uint8_t)120); Serial2.write((uint8_t)0);
@@ -4486,9 +5481,20 @@ static void sendAllNotesOff() {
     midiOutRealCount += 6;  // CC 120/123 are real events
   }
   clearTrackedNoteStates();
+  // Also clear the SRC live-monitor state so any stuck visual notes (from a
+  // dropped Note Off etc.) get released along with the synth's voices.
+  for (int ch = 0; ch < 16; ++ch) {
+    for (int note = 0; note < 128; ++note) {
+      if (srcKeyVel[ch][note]) srcKeyDirty[ch][note] = true;
+      srcKeyVel[ch][note] = 0;
+      srcNoteStartMs[ch][note] = 0;
+    }
+  }
+  srcKeyAllDirty = true;
 }
 
 static void sendGSReset() {
+  Serial2TxLock lk;
   static const uint8_t gsReset[] = {
     0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7
   };
@@ -4496,6 +5502,142 @@ static void sendGSReset() {
     Serial2.write(b);
     ++midiOutCount;
     if (!isHeartbeatByte(b)) ++midiOutRealCount;
+  }
+}
+
+// Universal Non-Realtime SysEx "GM System On" (turns the synth into a clean
+// GM-compliant state). This is what most synth manuals call "GM Reset".
+static void sendGMReset() {
+  Serial2TxLock lk;
+  static const uint8_t gmReset[] = { 0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7 };
+  for (uint8_t b : gmReset) {
+    Serial2.write(b);
+    ++midiOutCount;
+    if (!isHeartbeatByte(b)) ++midiOutRealCount;
+  }
+}
+
+// =================================================================
+//  SRC (Sound source) playback mode — Program Change / per-channel state
+// =================================================================
+static void sendUnitProgramChange(uint8_t channel, uint8_t program) {
+  Serial2TxLock lk;
+  Serial2.write((uint8_t)(0xC0 | (channel & 0x0F)));
+  Serial2.write((uint8_t)(program & 0x7F));
+  midiOutCount += 2;
+  midiOutRealCount += 2;
+}
+
+static void sendUnitCC(uint8_t channel, uint8_t cc, uint8_t value) {
+  Serial2TxLock lk;
+  Serial2.write((uint8_t)(0xB0 | (channel & 0x0F)));
+  Serial2.write((uint8_t)(cc & 0x7F));
+  Serial2.write((uint8_t)(value & 0x7F));
+  midiOutCount += 3;
+  midiOutRealCount += 3;
+}
+
+static void sendUnitPitchBend(uint8_t channel, uint16_t bend14) {
+  Serial2TxLock lk;
+  Serial2.write((uint8_t)(0xE0 | (channel & 0x0F)));
+  Serial2.write((uint8_t)(bend14 & 0x7F));
+  Serial2.write((uint8_t)((bend14 >> 7) & 0x7F));
+  midiOutCount += 3;
+  midiOutRealCount += 3;
+}
+
+// Initialise per-channel SRC state. Optionally re-broadcasts the cached
+// program / volume / pitch-bend / sustain values to the synth so the device
+// reflects what the UI shows.
+static void srcResetState(bool resendToSynth) {
+  for (int i = 0; i < SRC_CH_COUNT; ++i) {
+    srcProgram[i]   = 0;
+    srcVolume[i]    = 100;
+    srcPitchBend[i] = 8192;
+    srcSustain[i]   = false;
+  }
+  if (resendToSynth) {
+    for (int i = 0; i < SRC_CH_COUNT; ++i) {
+      sendUnitProgramChange((uint8_t)i, srcProgram[i]);
+      sendUnitCC((uint8_t)i, 7,  srcVolume[i]);
+      sendUnitCC((uint8_t)i, 64, srcSustain[i] ? 127 : 0);
+      sendUnitPitchBend((uint8_t)i, srcPitchBend[i]);
+    }
+  }
+  srcDirtyAll = true;
+}
+
+// Pull SRC defaults from the device config and push them to the active
+// channel. Other channels keep program 0 / vol 100 (clean GM defaults).
+static void srcApplyConfigDefaults() {
+  srcResetState(false);
+  uint8_t ch = (uint8_t)(g_config.srcInitChannel >= 1 && g_config.srcInitChannel <= 16
+                           ? (g_config.srcInitChannel - 1) : 0);
+  srcChannel = ch;
+  srcProgram[ch] = (uint8_t)(g_config.srcInitProgram & 0x7F);
+  srcVolume[ch]  = (uint8_t)(g_config.srcInitVolume  & 0x7F);
+  srcAutoFollow  = g_config.srcAutoChannel;
+}
+
+// User-pressed INIT: nuke synth state and resync everything.
+static void srcHardReset() {
+  sendAllNotesOff();
+  sendGSReset();
+  delay(30);
+  // CC#121 Reset All Controllers — separate from the GS SysEx because some
+  // synths only honour the SysEx for tone state, not for controllers.
+  for (int ch = 0; ch < 16; ++ch) sendUnitCC((uint8_t)ch, 121, 0);
+  srcResetState(true);
+}
+
+// Send Program Change for a given channel using the current cached program.
+// For Ch10 the SAM2695 interprets the program as a drum-kit selector.
+static void srcSendCurrentProgram(uint8_t channel) {
+  if (channel >= SRC_CH_COUNT) return;
+  sendUnitProgramChange(channel, srcProgram[channel]);
+}
+
+static void srcSetProgram(uint8_t channel, uint8_t program) {
+  if (channel >= SRC_CH_COUNT) return;
+  srcProgram[channel] = (uint8_t)(program & 0x7F);
+  srcSendCurrentProgram(channel);
+  srcDirtyAll = true;
+}
+
+static void srcSetVolume(uint8_t channel, uint8_t volume) {
+  if (channel >= SRC_CH_COUNT) return;
+  srcVolume[channel] = (uint8_t)(volume & 0x7F);
+  sendUnitCC(channel, 7, srcVolume[channel]);
+  srcDirtyAll = true;
+}
+
+static void srcSetPitchBend(uint8_t channel, uint16_t bend14) {
+  if (channel >= SRC_CH_COUNT) return;
+  if (bend14 > 16383) bend14 = 16383;
+  srcPitchBend[channel] = bend14;
+  sendUnitPitchBend(channel, bend14);
+  srcDirtyAll = true;
+}
+
+static void srcSetSustain(uint8_t channel, bool on) {
+  if (channel >= SRC_CH_COUNT) return;
+  srcSustain[channel] = on;
+  sendUnitCC(channel, 64, on ? 127 : 0);
+  srcDirtyAll = true;
+}
+
+// Called from MIDI parsing when a channel-bearing message arrives. Updates
+// the active channel highlight while srcAutoFollow is on. Cheap to call from
+// any input path — only mutates state when the channel changes.
+static void srcOnIncomingChannel(uint8_t channel) {
+  if (!srcAutoFollow) return;
+  if (channel >= SRC_CH_COUNT) return;
+  if (srcChannel == channel) return;
+  srcChannel = channel;
+  srcKeyboardClearVisualState();
+  srcDirtyAll = true;
+  if (currentApp == APP_PLAY && currentPlay == PLAY_SRC) {
+    needPartialUpdate = true;
   }
 }
 
@@ -4567,23 +5709,6 @@ static bool loadSequencesFromSD() {
 //
 // SD未挿入 / config.json なし / パース失敗 はすべて「default 動作と同じ」として
 // 静かに継続する。ブートを止めない。
-struct DeviceConfig {
-  char defaultApp[16];
-  char defaultTransposeMode[16];
-  int  initialTranspose;
-  int  transposeBase;
-  bool initialAllNotesOff;
-  bool initialFilterBypass;
-  bool initialMapperBypass;
-  char transposeRange[12];
-  char midiInputSource[12];
-  bool majorUpperTranspose;
-  bool btAutoReconnect;
-  bool showSplash;
-};
-
-static DeviceConfig g_config;
-
 static void setDefaultConfig() {
   strncpy(g_config.defaultApp, "Transpose", sizeof(g_config.defaultApp));
   strncpy(g_config.defaultTransposeMode, "DIRECT", sizeof(g_config.defaultTransposeMode));
@@ -4597,6 +5722,12 @@ static void setDefaultConfig() {
   g_config.majorUpperTranspose = false;
   g_config.btAutoReconnect = true;
   g_config.showSplash = true;
+  g_config.startupGSReset   = false;
+  g_config.smfStartGSReset  = true;
+  g_config.srcInitChannel   = 1;
+  g_config.srcInitProgram   = 0;
+  g_config.srcInitVolume    = 100;
+  g_config.srcAutoChannel   = true;
 }
 
 static bool loadDeviceConfigFromSD() {
@@ -4632,9 +5763,16 @@ static bool loadDeviceConfigFromSD() {
   if (doc["MajorUpperTranspose"].is<bool>())         g_config.majorUpperTranspose = doc["MajorUpperTranspose"];
   if (doc["BTAutoReconnect"].is<bool>())             g_config.btAutoReconnect = doc["BTAutoReconnect"];
   if (doc["ShowSplash"].is<bool>())                  g_config.showSplash = doc["ShowSplash"];
-  Serial.printf("[CFG] loaded: app=%s base=%d input=%s splash=%d\n",
+  if (doc["StartupGSReset"].is<bool>())              g_config.startupGSReset = doc["StartupGSReset"];
+  if (doc["SmfStartGSReset"].is<bool>())             g_config.smfStartGSReset = doc["SmfStartGSReset"];
+  if (doc["SrcInitChannel"].is<int>())               g_config.srcInitChannel = (uint8_t)constrain((int)doc["SrcInitChannel"], 1, 16);
+  if (doc["SrcInitProgram"].is<int>())               g_config.srcInitProgram = (uint8_t)constrain((int)doc["SrcInitProgram"], 0, 127);
+  if (doc["SrcInitVolume"].is<int>())                g_config.srcInitVolume  = (uint8_t)constrain((int)doc["SrcInitVolume"], 0, 127);
+  if (doc["SrcAutoChannel"].is<bool>())              g_config.srcAutoChannel = doc["SrcAutoChannel"];
+  Serial.printf("[CFG] loaded: app=%s base=%d input=%s splash=%d gsBoot=%d srcCh=%d\n",
                 g_config.defaultApp, g_config.transposeBase,
-                g_config.midiInputSource, g_config.showSplash ? 1 : 0);
+                g_config.midiInputSource, g_config.showSplash ? 1 : 0,
+                g_config.startupGSReset ? 1 : 0, g_config.srcInitChannel);
   return true;
 }
 
@@ -4656,6 +5794,12 @@ static bool saveDeviceConfigToSD() {
   doc["MajorUpperTranspose"]   = g_config.majorUpperTranspose;
   doc["BTAutoReconnect"]       = g_config.btAutoReconnect;
   doc["ShowSplash"]            = g_config.showSplash;
+  doc["StartupGSReset"]        = g_config.startupGSReset;
+  doc["SmfStartGSReset"]       = g_config.smfStartGSReset;
+  doc["SrcInitChannel"]        = g_config.srcInitChannel;
+  doc["SrcInitProgram"]        = g_config.srcInitProgram;
+  doc["SrcInitVolume"]         = g_config.srcInitVolume;
+  doc["SrcAutoChannel"]        = g_config.srcAutoChannel;
   // FILE_WRITE on SD.h appends; remove first so the file is rewritten cleanly.
   if (SD.exists("/config.json")) SD.remove("/config.json");
   File f = SD.open("/config.json", FILE_WRITE);
@@ -4682,12 +5826,17 @@ static void applyDeviceConfig() {
   handleTransposeChange(clampTranspose((int8_t)(g_config.transposeBase + g_config.initialTranspose)));
   updateDirectButtonLabels();
 
+  // SRC defaults from config (active channel / program / volume / auto-follow).
+  srcApplyConfigDefaults();
+
   // Switch to default app / submode.
   if (strcmp(g_config.defaultApp, "Play") == 0
+      || strcmp(g_config.defaultApp, "SRC") == 0
       || strcmp(g_config.defaultApp, "SMF") == 0
       || strcmp(g_config.defaultApp, "MP3") == 0) {
-    if (strcmp(g_config.defaultApp, "MP3") == 0) currentPlay = PLAY_MP3;
-    else                                          currentPlay = PLAY_SMF;
+    if      (strcmp(g_config.defaultApp, "MP3") == 0) currentPlay = PLAY_MP3;
+    else if (strcmp(g_config.defaultApp, "SMF") == 0) currentPlay = PLAY_SMF;
+    else                                              currentPlay = PLAY_SRC; // "Play" / "SRC"
     setCurrentApp(APP_PLAY);
   } else if (strcmp(g_config.defaultApp, "Filter") == 0) {
     midiManagePage = MIDI_PAGE_FILTER;
@@ -4716,11 +5865,11 @@ static void applyDeviceConfig() {
 static DeviceConfig g_configSnapshot;
 static AppMode      g_appBeforeOverlay  = APP_TRANSPOSE;
 static DisplayMode  g_modeBeforeOverlay = DIRECT_MODE;
-static PlayMode     g_playBeforeOverlay = PLAY_SMF;
+static PlayMode     g_playBeforeOverlay = PLAY_SRC;
 
-static const int CFG_ROWS = 12;
+static const int CFG_ROWS = 18;
 static const int CFG_ROWS_PER_PAGE = 4;
-static const int CFG_PAGES = 3;
+static const int CFG_PAGES = 5;       // 18 fields / 4 per page = 5 (last page partially used)
 static int g_configPage = 0;
 static const char* CFG_LABELS[CFG_ROWS] = {
   "DefaultApp",
@@ -4735,6 +5884,12 @@ static const char* CFG_LABELS[CFG_ROWS] = {
   "MajorUpperTr",
   "BTAutoReconn",
   "ShowSplash",
+  "StartupGSRst",
+  "SmfStartGSRst",
+  "SrcInitCh",
+  "SrcInitPrg",
+  "SrcInitVol",
+  "SrcAutoCh",
 };
 
 static void cfgCycleString(char* dst, size_t cap, const char* const* options, int n) {
@@ -4759,17 +5914,23 @@ static void cfgFormatValue(int row, char* out, size_t outSize) {
     case 9:  snprintf(out, outSize, "%s", g_config.majorUpperTranspose ? "ON" : "OFF"); break;
     case 10: snprintf(out, outSize, "%s", g_config.btAutoReconnect ? "ON" : "OFF"); break;
     case 11: snprintf(out, outSize, "%s", g_config.showSplash ? "ON" : "OFF"); break;
+    case 12: snprintf(out, outSize, "%s", g_config.startupGSReset  ? "ON" : "OFF"); break;
+    case 13: snprintf(out, outSize, "%s", g_config.smfStartGSReset ? "ON" : "OFF"); break;
+    case 14: snprintf(out, outSize, "%u", (unsigned)g_config.srcInitChannel); break;
+    case 15: snprintf(out, outSize, "%u", (unsigned)g_config.srcInitProgram); break;
+    case 16: snprintf(out, outSize, "%u", (unsigned)g_config.srcInitVolume); break;
+    case 17: snprintf(out, outSize, "%s", g_config.srcAutoChannel  ? "ON" : "OFF"); break;
     default: out[0] = '\0';
   }
 }
 
 static void cfgCycleValue(int row) {
-  static const char* APPS[]   = {"Transpose","Play","SMF","MP3","Filter","Change"};
+  static const char* APPS[]   = {"Transpose","Play","SRC","SMF","MP3","Filter","Change"};
   static const char* TMODES[] = {"DIRECT","KEY","INSTANT","SEQUENCE"};
   static const char* RANGES[] = {"-5..6","0..11","-11..0"};
   static const char* INPUTS[] = {"MIX","MIDIIN","USB"};
   switch (row) {
-    case 0:  cfgCycleString(g_config.defaultApp, sizeof(g_config.defaultApp), APPS, 6); break;
+    case 0:  cfgCycleString(g_config.defaultApp, sizeof(g_config.defaultApp), APPS, 7); break;
     case 1:  cfgCycleString(g_config.defaultTransposeMode, sizeof(g_config.defaultTransposeMode), TMODES, 4); break;
     case 2:  g_config.initialTranspose = (g_config.initialTranspose >= 11) ? -11 : g_config.initialTranspose + 1; break;
     case 3:  g_config.transposeBase    = (g_config.transposeBase    >= 11) ? -11 : g_config.transposeBase + 1; break;
@@ -4781,6 +5942,12 @@ static void cfgCycleValue(int row) {
     case 9:  g_config.majorUpperTranspose = !g_config.majorUpperTranspose; break;
     case 10: g_config.btAutoReconnect = !g_config.btAutoReconnect; break;
     case 11: g_config.showSplash = !g_config.showSplash; break;
+    case 12: g_config.startupGSReset  = !g_config.startupGSReset; break;
+    case 13: g_config.smfStartGSReset = !g_config.smfStartGSReset; break;
+    case 14: g_config.srcInitChannel  = (g_config.srcInitChannel >= 16) ? 1 : (uint8_t)(g_config.srcInitChannel + 1); break;
+    case 15: g_config.srcInitProgram  = (g_config.srcInitProgram >= 127) ? 0 : (uint8_t)(g_config.srcInitProgram + 1); break;
+    case 16: g_config.srcInitVolume   = (g_config.srcInitVolume  >= 127) ? 0 : (uint8_t)(g_config.srcInitVolume  + 1); break;
+    case 17: g_config.srcAutoChannel  = !g_config.srcAutoChannel; break;
   }
 }
 
@@ -5094,7 +6261,10 @@ static const char* getAppLabel(AppMode app) {
   switch (app) {
     case APP_TRANSPOSE: return "XPOSE";
     case APP_MIDI:      return "MIDI";
-    case APP_PLAY:      return (currentPlay == PLAY_SMF) ? "PLAY:SMF" : "PLAY:MP3";
+    case APP_PLAY:
+      if (currentPlay == PLAY_SRC) return "PLAY:SRC";
+      if (currentPlay == PLAY_SMF) return "PLAY:SMF";
+      return "PLAY:MP3";
     default:            return "UNKNOWN";
   }
 }
@@ -5150,6 +6320,7 @@ static bool setModeFromCommand(const char* mode) {
       tokenEqualsIgnoreCase(mode, "MIDI_MANAGER")) {
     setCurrentApp(APP_MIDI); needFullRedraw = true; return true;
   }
+  if (tokenEqualsIgnoreCase(mode, "SRC"))      { setCurrentApp(APP_PLAY); currentPlay = PLAY_SRC; needFullRedraw = true; return true; }
   if (tokenEqualsIgnoreCase(mode, "SMF"))      { setCurrentApp(APP_PLAY); currentPlay = PLAY_SMF; needFullRedraw = true; return true; }
   if (tokenEqualsIgnoreCase(mode, "MP3"))      { setCurrentApp(APP_PLAY); currentPlay = PLAY_MP3; needFullRedraw = true; return true; }
   if (tokenEqualsIgnoreCase(mode, "CONFIG") ||
@@ -5231,7 +6402,7 @@ static void printUsbSerialStatus() {
   const char* usbLabel        = g_usbMidiMounted ? "connected" : "disconnected";
   Serial.printf(
     "OK STATUS app=%s mode=%s input=%s transpose=%d range=%d filter_bypass=%d mapper_bypass=%d "
-    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu bt=%s usb_in=%s cables=%u\n",
+    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu bt=%s usb_in=%s cables=%u usb_drop=%lu usb_resub_fail=%lu\n",
     getAppLabel(currentApp),
     getDisplayModeLabel(currentMode),
     inputLabel,
@@ -5246,7 +6417,9 @@ static void printUsbSerialStatus() {
     midiInRealCount, midiOutRealCount,
     getBtStatusLabelTab(g_lastBtStatus),
     usbLabel,
-    (unsigned)g_usbMidiCableCount
+    (unsigned)g_usbMidiCableCount,
+    (unsigned long)g_usbMidiRingDropCount,
+    (unsigned long)g_usbInResubmitFails
   );
 }
 
@@ -5257,7 +6430,7 @@ static void printUsbSerialHelp() {
   Serial.println("REDRAW");
   Serial.println("BUTTON A|B|C [LONG]");
   Serial.println("TOUCH <x> <y>");
-  Serial.println("MODE DIRECT|KEY|INSTANT|SEQUENCE|FILTER|MAPPER|MIDI|SMF|MP3|CONFIG|BASE");
+  Serial.println("MODE DIRECT|KEY|INSTANT|SEQUENCE|FILTER|MAPPER|MIDI|SRC|SMF|MP3|CONFIG|BASE");
   Serial.println("GROUP TRANSPOSE|MIDI");
   Serial.println("SET TRANSPOSE <-12..12>");
   Serial.println("SET INPUT USBIN|MIDIIN|MIX");
@@ -5488,9 +6661,17 @@ void setup() {
   // blocked waiting for the hardware FIFO to drain — starving the loop and
   // tripping the task watchdog. Generous TX/RX rings absorb realistic
   // bursts (a 4 KB TX ring buys ~125 ms of headroom).
-  Serial2.setRxBufferSize(2048);
+  // Generous RX/TX rings: the dedicated MIDI task drains RX every ~1 ms but
+  // a heavy chord burst (6 notes × 3 bytes = 18 bytes for NoteOn alone) can
+  // arrive in <6 ms, and stacking with Active Sense / clock heartbeat is
+  // common. 8 KB RX = ~2.6 s of headroom even if the task is briefly stalled.
+  Serial2.setRxBufferSize(8192);
   Serial2.setTxBufferSize(4096);
   Serial2.begin(MIDI_BAUD, SERIAL_8N1, RXD2, TXD2);
+  // Recursive mutex protects the Serial2 TX FIFO across the MIDI task on
+  // core 0 and any UI-driven sends on core 1. Must exist before either
+  // sendGSReset() below or the midi_io_task spin-up touches Serial2.
+  g_serial2TxMux = xSemaphoreCreateRecursiveMutex();
 
   // Start USB host once at boot. Input-source changes only toggle whether
   // received data is consumed, never the USB host itself.
@@ -5500,8 +6681,13 @@ void setup() {
     Serial.println("[USB] host init failed; UART-only fallback active");
   }
 
-  sendGSReset();
-  delay(30);
+  // GS Reset on boot is opt-in (config: StartupGSReset). Some users keep
+  // tone/effect state on their connected synth across power cycles and don't
+  // want the M5Tab to clobber it on every boot.
+  if (g_config.startupGSReset) {
+    sendGSReset();
+    delay(30);
+  }
   sendAllNotesOff();
 
   for (int i = 0; i < TRACKED_NOTE_STATE_COUNT; i++) {
@@ -5532,6 +6718,12 @@ void setup() {
   applyDeviceConfig();
 
   drawInterface();
+
+  // Start the dedicated MIDI I/O task on core 0 so input drain / output
+  // pass-through stay responsive even when the main loop is busy redrawing
+  // the SRC piano roll or other heavy UI work. Must come AFTER Serial2 is
+  // initialised and the Serial2 TX mutex is created.
+  startMidiIoTask();
 
   // BLE HID pedal — initialise asynchronously so the UI stays responsive
   // while the C6 radio comes up and NimBLE does its setup.
@@ -5592,15 +6784,17 @@ void loop() {
   diagMaybeReport(now);
   serviceUsbHost(now);
 
+  // MIDI input drain (processMidiInput) and pedal-event consumption
+  // (processPedal) now run on the dedicated midi_io_task (core 0). Heavy UI
+  // work in this loop no longer affects MIDI throughput. Only the
+  // mode-specific OUTPUT/PLAYBACK helpers stay on the main loop here.
   if (currentApp == APP_PLAY && currentPlay == PLAY_SMF) {
-    processMidiInput();
     processSmf();
-  } else if (currentApp == APP_TRANSPOSE || currentApp == APP_MIDI) {
-    processMidiInput();
-    processPedal();
-  } else {
+  } else if (currentApp == APP_PLAY && currentPlay == PLAY_MP3) {
     processMp3();
   }
+  // PLAY_SRC, APP_TRANSPOSE, APP_MIDI need no extra per-loop work — the MIDI
+  // task already handles them.
 
   processUsbSerialCommands();
 
@@ -5643,6 +6837,25 @@ void loop() {
       if (currentApp == APP_MIDI && midiManageDirty) {
         drawMidiManage();
         midiManageDirty = false;
+      }
+      // SRC partial-redraw: only run when the SRC screen is actually showing.
+      // Skip during CONFIG/BASE overlays (they cover the whole content area)
+      // and while the fullscreen instrument picker is open — otherwise the
+      // piano roll paints right on top of the overlay's UI.
+      bool srcVisible = (currentApp == APP_PLAY && currentPlay == PLAY_SRC)
+                     && (currentMode != CONFIG_EDIT_MODE)
+                     && (currentMode != BASE_SET_MODE)
+                     && !g_srcPickerOpen;
+      if (srcVisible && srcDirtyAll) {
+        drawSrc();
+      }
+      if (srcVisible) {
+        // Incremental key-light updates so the live keyboard tracks input
+        // without a full repaint every tick. Piano roll interior scrolls
+        // every tick (cheap fillRect over a small panel — its border was
+        // drawn once during the full repaint and stays put).
+        srcFlushKeyboardDirty();
+        srcDrawRoll();
       }
       if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF) && smfPlaying) {
         Rect fullArea = {
