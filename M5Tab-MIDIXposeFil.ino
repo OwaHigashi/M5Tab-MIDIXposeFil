@@ -18,10 +18,6 @@
 //   - Full 1280x720 layout, FreeSans proportional fonts, larger tap targets.
 //   - No hardware buttons on Tab5, so A/B/C are replaced by on-screen toolbar
 //     buttons (ALL OFF, RANGE, MODE).
-//   - BT foot pedal support moved from classic-BT L2CAP HID (unavailable on
-//     ESP32-P4) to BLE HID host.  The pedal must advertise as a BLE HID
-//     device (HID service 0x1812).  Most modern "Bluetooth music pedals"
-//     are BLE HID by default.
 //   - SD access is unified on the Tab5 SPI-wired microSD slot so the SMF
 //     library, MP3 decoder and transposer sequence storage share one card.
 
@@ -80,7 +76,6 @@ class Serial2TxLock {
 #define SD_FAT_TYPE 3
 #include "src/MD_MIDIFile.h"
 #include "src/AudioOutputM5Speaker.h"
-#include "src/ble_hid.h"
 #include "src/gm_instruments.h"
 
 // ==== Tab5 PortA repurposed as UART for M5 Unit MIDI (SAM2695) ====
@@ -257,19 +252,6 @@ static NoteState currentNoteStates[TRACKED_NOTE_STATE_COUNT];
 static NoteState savedNoteStates  [TRACKED_NOTE_STATE_COUNT];
 static PianoKeyGeom pianoKeys[PIANO_KEY_COUNT];
 
-// ==== BT HID foot pedal ====
-// The pedal reports are 8-byte HID boot-keyboard reports:
-//   [0]=modifier, [1]=reserved, [2..7]=up to 6 keys (USB HID Usage IDs).
-// SPT-10 / generic music pedals send Up-Arrow (0x52) and Down-Arrow (0x51).
-static const uint8_t PEDAL_LEFT_KEY  = 0x52;  // Up arrow
-static const uint8_t PEDAL_RIGHT_KEY = 0x51;  // Down arrow
-
-static portMUX_TYPE    g_pedalMux = portMUX_INITIALIZER_UNLOCKED;
-static volatile bool   g_pedalLeftHeld  = false;
-static volatile bool   g_pedalRightHeld = false;
-static volatile bool   g_pedalDirty     = false;
-static BT_STATUS       g_lastBtStatus   = BT_UNINITIALIZED;
-
 // ==== Sequence mode ====
 #define SEQ_PATTERN_COUNT 16
 #define SEQ_STEP_COUNT     6
@@ -348,7 +330,6 @@ struct DeviceConfig {
   char transposeRange[12];
   char midiInputSource[12];
   bool majorUpperTranspose;
-  bool btAutoReconnect;
   bool showSplash;
   // Reset behaviour: SAM2695 retains its program/CC state across reboots, so
   // unconditionally blasting GS Reset at boot can stomp the user's last setup.
@@ -403,10 +384,7 @@ static Rect playTab[3];
 static const char* playName[3] = { "SRC", "SMF", "MP3" };
 static Rect btnAllOff;        // aux
 static Rect btnRange;         // aux (DIRECT range cycle / KEY upper/lower swap)
-// Long-tap hit target on the BT-status label drawn at (30, headerArea.y+4, 260, 24).
-// Computed in computeLayout() from headerArea so it follows screen rotation/size.
-static Rect btStatusHitArea;
-static Rect btnPrev, btnNext; // pedal-replacement
+static Rect btnPrev, btnNext; // bottom-nav transpose prev/next
 static Rect smfBtnPrev, smfBtnPlay, smfBtnNext, smfBtnLoop;
 static Rect mp3BtnPrev, mp3BtnPlay, mp3BtnNext, mp3BtnVolDown, mp3BtnVolUp;
 static Rect srcBtnGm, srcBtnGs, srcBtnInit, srcBtnAuto;
@@ -610,10 +588,6 @@ static bool saveSequencesToSD();
 static bool loadSequencesFromSD();
 static void setCurrentTransposeButton();
 static void shiftTransposeBy(int dir);
-static void pedalReportCb(const uint8_t* rpt, size_t len);
-static void processPedal();
-static const char* btStatusLabel(BT_STATUS s);
-static uint16_t     btStatusColor(BT_STATUS s);
 static void updateDirectButtonLabels();
 
 // Device configuration / overlay-mode forward decls.
@@ -795,11 +769,6 @@ static void computeLayout() {
   cfgEntryBtn         = { baseEntryBtn.x + baseEntryBtn.w + auxGap,        appTabHY, auxW, tabH };
   int mixW = 110;
   midiInputSourceBtn  = { cfgEntryBtn.x + cfgEntryBtn.w + auxGap,          appTabHY, mixW, tabH };
-
-  // Long-tap hit area for the BT status label. The label itself is small text
-  // (24 px tall starting at y=headerArea.y+4) but we widen the touch zone
-  // vertically to make the hold gesture reliable on a 1280×720 panel.
-  btStatusHitArea = { 20, headerArea.y, 320, headerArea.h / 2 };
 
   // Bottom nav: large PREV / NEXT.
   int navPad = 20;
@@ -1142,7 +1111,7 @@ static void drawSplash() {
   M5.Display.setFont(FONT_MED);
   M5.Display.setTextDatum(middle_center);
   M5.Display.setTextColor(0x8C71, TFT_BLACK);
-  M5.Display.drawString("MIDI Transposer  -  Player  -  BLE Pedal", cx, cy + 40);
+  M5.Display.drawString("MIDI Transposer  -  Player", cx, cy + 40);
 
   // Footer.
   M5.Display.setFont(FONT_TINY);
@@ -1248,32 +1217,6 @@ static void updateStatusArea() {
   M5.Display.setTextColor(COL_VALUE, COL_PANEL);
   M5.Display.setTextDatum(middle_right);
   M5.Display.drawString(buf, textRight, headerArea.y + headerArea.h / 2);
-
-  // BT status indicator above the title on the left side.
-  BT_STATUS bt = ble_hid_status();
-  M5.Display.fillRect(30, headerArea.y + 4, 260, 24, COL_PANEL);
-  M5.Display.setFont(FONT_TINY);
-  M5.Display.setTextColor(btStatusColor(bt), COL_PANEL);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.drawString(btStatusLabel(bt), 30, headerArea.y + 8);
-}
-
-static const char* btStatusLabel(BT_STATUS s) {
-  switch (s) {
-    case BT_CONNECTED:   return "BT PEDAL: connected";
-    case BT_CONNECTING:  return "BT PEDAL: connecting...";
-    case BT_SCANNING:    return "BT PEDAL: scanning...";
-    case BT_DISCONNECTED:return "BT PEDAL: disconnected";
-    default:             return "BT PEDAL: off";
-  }
-}
-static uint16_t btStatusColor(BT_STATUS s) {
-  switch (s) {
-    case BT_CONNECTED:  return TFT_GREEN;
-    case BT_CONNECTING: return TFT_YELLOW;
-    case BT_SCANNING:   return TFT_CYAN;
-    default:            return COL_MUTED;
-  }
 }
 
 static const char* getHeaderTitle() {
@@ -1429,13 +1372,6 @@ static void drawHeaderStatusApp() {
   }
   // currentApp == APP_MIDI: no extra header-right text.
   (void)y; (void)h;
-
-  BT_STATUS bt = ble_hid_status();
-  M5.Display.fillRect(30, headerArea.y + 4, 260, 24, COL_PANEL);
-  M5.Display.setFont(FONT_TINY);
-  M5.Display.setTextColor(btStatusColor(bt), COL_PANEL);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.drawString(btStatusLabel(bt), 30, headerArea.y + 8);
 }
 
 static void drawAllOffBtn() {
@@ -4633,61 +4569,6 @@ static void handleMp3Touch(int x, int y) {
   }
 }
 
-// =================================================================
-//  BLE HID foot pedal
-// =================================================================
-// Runs in BLE-host task context: do not touch UI/MIDI state here.
-static void pedalReportCb(const uint8_t* rpt, size_t len) {
-  if (len < 3) return;  // too short to be a keyboard report
-  // Keyboard reports are [mod][reserved][key1..key6].  Some stacks drop the
-  // reserved byte, so accept both "boot" (8) and "short" (>=3) forms.
-  const uint8_t* keys;
-  size_t nkeys;
-  if (len >= 8) { keys = rpt + 2; nkeys = 6; }
-  else          { keys = rpt + 1; nkeys = len - 1; }
-
-  bool leftPressed  = false;
-  bool rightPressed = false;
-  for (size_t i = 0; i < nkeys; i++) {
-    uint8_t k = keys[i];
-    if (k == 0) continue;
-    if (k == PEDAL_LEFT_KEY)  leftPressed  = true;
-    if (k == PEDAL_RIGHT_KEY) rightPressed = true;
-  }
-  portENTER_CRITICAL(&g_pedalMux);
-  if (leftPressed != g_pedalLeftHeld || rightPressed != g_pedalRightHeld) {
-    g_pedalLeftHeld  = leftPressed;
-    g_pedalRightHeld = rightPressed;
-    g_pedalDirty = true;
-  }
-  portEXIT_CRITICAL(&g_pedalMux);
-}
-
-// Drains the pedal report state into edge events and dispatches them through
-// the same shift-transpose path used by the on-screen PREV / NEXT buttons.
-static void processPedal() {
-  if (currentApp != APP_TRANSPOSE) return;
-  bool dirty = false;
-  bool left = false, right = false;
-  portENTER_CRITICAL(&g_pedalMux);
-  if (g_pedalDirty) {
-    g_pedalDirty = false;
-    left  = g_pedalLeftHeld;
-    right = g_pedalRightHeld;
-    dirty = true;
-  }
-  portEXIT_CRITICAL(&g_pedalMux);
-  if (!dirty) return;
-
-  static bool lastLeft = false, lastRight = false;
-  bool leftEdge  = left  && !lastLeft;
-  bool rightEdge = right && !lastRight;
-  lastLeft  = left;
-  lastRight = right;
-  if (leftEdge)  shiftTransposeBy(-1);
-  if (rightEdge) shiftTransposeBy(+1);
-}
-
 static void handleTouch() {
   auto t = M5.Touch.getDetail();
   if (!t.wasPressed() && !t.wasHold()) return;  // one-shot tap / hold-begin only
@@ -4701,16 +4582,10 @@ static void handleTouch() {
     return;
   }
 
-  // ── Long-tap (wasHold ≥ default M5Unified hold threshold ~500 ms) on header
-  //    BT label / toolbar AOFF button enters overlay modes. We check this
-  //    BEFORE routing the tap further so the gestures work from any app/mode.
-  //    M5Unified treats wasHold() as a one-shot edge so the overlay isn't
-  //    re-entered if the finger is held longer.
+  // ── Long-tap (wasHold ≥ default M5Unified hold threshold ~500 ms) on the
+  //    toolbar AOFF button enters BASE_SET overlay. CONFIG_EDIT is reachable
+  //    via the dedicated cfgEntryBtn header button (no long-tap fallback).
   if (t.wasHold()) {
-    if (currentMode != CONFIG_EDIT_MODE && hit(btStatusHitArea, x, y)) {
-      enterConfigEditMode();
-      return;
-    }
     if (currentMode != BASE_SET_MODE && hit(btnAllOff, x, y)) {
       enterBaseSetMode();
       return;
@@ -5436,12 +5311,12 @@ static void processMidiInput() {
 // =================================================================
 //  Dedicated MIDI I/O task (core 0)
 // =================================================================
-// Runs processMidiInput()/processPedal() on a separate FreeRTOS task pinned
-// to core 0 at high priority, so heavy UI redraws on the main loop (core 1
-// loopTask) — like the SRC piano-roll repaint — don't starve the MIDI input
-// drain. Without this, a 7–10 ms fillRect on the piano-roll panel could let
-// the Serial2 RX buffer accumulate enough bytes that a chord Note Off in
-// the middle of a burst gets cut off mid-message.
+// Runs processMidiInput() on a separate FreeRTOS task pinned to a dedicated
+// core at high priority, so heavy UI redraws on the main loop — like the SRC
+// piano-roll repaint — don't starve the MIDI input drain. Without this, a
+// 7–10 ms fillRect on the piano-roll panel could let the Serial2 RX buffer
+// accumulate enough bytes that a chord Note Off in the middle of a burst
+// gets cut off mid-message.
 //
 // The task wakes every 1 ms via vTaskDelay so it doesn't busy-spin. At
 // 31.25 kbaud, 1 ms covers ~3 incoming bytes — plenty of headroom.
@@ -5450,7 +5325,6 @@ static TaskHandle_t g_midiTaskHandle = nullptr;
 static void midi_io_task(void* /*pv*/) {
   for (;;) {
     processMidiInput();
-    processPedal();
     // 1 ms wake-up interval, expressed in tick-rate-agnostic units. With
     // arduino-esp32's default 1 kHz tick this is 1 tick; on builds with a
     // slower tick rate it floors to 0 and we yield without sleeping (still
@@ -5704,7 +5578,6 @@ static bool loadSequencesFromSD() {
 //   TransposeRange:       "0..11" | "-11..0" | "-5..6"
 //   MidiInputSource:      USB|MIDIIN|MIX        (Tab5 actually applies this)
 //   MajorUpperTranspose:  bool                  (KEY-mode behaviour)
-//   BTAutoReconnect:      bool                  (accepted; BLE host re-uses bonded peer)
 //   ShowSplash:           bool
 //
 // SD未挿入 / config.json なし / パース失敗 はすべて「default 動作と同じ」として
@@ -5720,7 +5593,6 @@ static void setDefaultConfig() {
   strncpy(g_config.transposeRange, "-5..6", sizeof(g_config.transposeRange));
   strncpy(g_config.midiInputSource, "MIX", sizeof(g_config.midiInputSource));
   g_config.majorUpperTranspose = false;
-  g_config.btAutoReconnect = true;
   g_config.showSplash = true;
   g_config.startupGSReset   = false;
   g_config.smfStartGSReset  = true;
@@ -5761,7 +5633,6 @@ static bool loadDeviceConfigFromSD() {
   if (doc["TransposeRange"].is<const char*>())       strncpy(g_config.transposeRange, doc["TransposeRange"], sizeof(g_config.transposeRange));
   if (doc["MidiInputSource"].is<const char*>())      strncpy(g_config.midiInputSource, doc["MidiInputSource"], sizeof(g_config.midiInputSource));
   if (doc["MajorUpperTranspose"].is<bool>())         g_config.majorUpperTranspose = doc["MajorUpperTranspose"];
-  if (doc["BTAutoReconnect"].is<bool>())             g_config.btAutoReconnect = doc["BTAutoReconnect"];
   if (doc["ShowSplash"].is<bool>())                  g_config.showSplash = doc["ShowSplash"];
   if (doc["StartupGSReset"].is<bool>())              g_config.startupGSReset = doc["StartupGSReset"];
   if (doc["SmfStartGSReset"].is<bool>())             g_config.smfStartGSReset = doc["SmfStartGSReset"];
@@ -5792,7 +5663,6 @@ static bool saveDeviceConfigToSD() {
   doc["TransposeRange"]        = g_config.transposeRange;
   doc["MidiInputSource"]       = g_config.midiInputSource;
   doc["MajorUpperTranspose"]   = g_config.majorUpperTranspose;
-  doc["BTAutoReconnect"]       = g_config.btAutoReconnect;
   doc["ShowSplash"]            = g_config.showSplash;
   doc["StartupGSReset"]        = g_config.startupGSReset;
   doc["SmfStartGSReset"]       = g_config.smfStartGSReset;
@@ -5856,7 +5726,7 @@ static void applyDeviceConfig() {
 }
 
 // =================================================================
-//  CONFIG_EDIT_MODE — long-tap on header BT label (or `MODE CONFIG`)
+//  CONFIG_EDIT_MODE — entered via header `CONF` button (or `MODE CONFIG`)
 // =================================================================
 // 12 fields × 3 pages of 4. Footer SAVE / CANCEL / APPLY work the same way as
 // the M5Core2 reference. UI is scaled for the 1280×720 Tab5 panel:
@@ -5867,9 +5737,9 @@ static AppMode      g_appBeforeOverlay  = APP_TRANSPOSE;
 static DisplayMode  g_modeBeforeOverlay = DIRECT_MODE;
 static PlayMode     g_playBeforeOverlay = PLAY_SRC;
 
-static const int CFG_ROWS = 18;
+static const int CFG_ROWS = 17;
 static const int CFG_ROWS_PER_PAGE = 4;
-static const int CFG_PAGES = 5;       // 18 fields / 4 per page = 5 (last page partially used)
+static const int CFG_PAGES = 5;       // 17 fields / 4 per page = 5 (last page partially used)
 static int g_configPage = 0;
 static const char* CFG_LABELS[CFG_ROWS] = {
   "DefaultApp",
@@ -5882,7 +5752,6 @@ static const char* CFG_LABELS[CFG_ROWS] = {
   "TransposeRange",
   "MidiInputSrc",
   "MajorUpperTr",
-  "BTAutoReconn",
   "ShowSplash",
   "StartupGSRst",
   "SmfStartGSRst",
@@ -5912,14 +5781,13 @@ static void cfgFormatValue(int row, char* out, size_t outSize) {
     case 7:  snprintf(out, outSize, "%s", g_config.transposeRange); break;
     case 8:  snprintf(out, outSize, "%s", g_config.midiInputSource); break;
     case 9:  snprintf(out, outSize, "%s", g_config.majorUpperTranspose ? "ON" : "OFF"); break;
-    case 10: snprintf(out, outSize, "%s", g_config.btAutoReconnect ? "ON" : "OFF"); break;
-    case 11: snprintf(out, outSize, "%s", g_config.showSplash ? "ON" : "OFF"); break;
-    case 12: snprintf(out, outSize, "%s", g_config.startupGSReset  ? "ON" : "OFF"); break;
-    case 13: snprintf(out, outSize, "%s", g_config.smfStartGSReset ? "ON" : "OFF"); break;
-    case 14: snprintf(out, outSize, "%u", (unsigned)g_config.srcInitChannel); break;
-    case 15: snprintf(out, outSize, "%u", (unsigned)g_config.srcInitProgram); break;
-    case 16: snprintf(out, outSize, "%u", (unsigned)g_config.srcInitVolume); break;
-    case 17: snprintf(out, outSize, "%s", g_config.srcAutoChannel  ? "ON" : "OFF"); break;
+    case 10: snprintf(out, outSize, "%s", g_config.showSplash ? "ON" : "OFF"); break;
+    case 11: snprintf(out, outSize, "%s", g_config.startupGSReset  ? "ON" : "OFF"); break;
+    case 12: snprintf(out, outSize, "%s", g_config.smfStartGSReset ? "ON" : "OFF"); break;
+    case 13: snprintf(out, outSize, "%u", (unsigned)g_config.srcInitChannel); break;
+    case 14: snprintf(out, outSize, "%u", (unsigned)g_config.srcInitProgram); break;
+    case 15: snprintf(out, outSize, "%u", (unsigned)g_config.srcInitVolume); break;
+    case 16: snprintf(out, outSize, "%s", g_config.srcAutoChannel  ? "ON" : "OFF"); break;
     default: out[0] = '\0';
   }
 }
@@ -5940,14 +5808,13 @@ static void cfgCycleValue(int row) {
     case 7:  cfgCycleString(g_config.transposeRange, sizeof(g_config.transposeRange), RANGES, 3); break;
     case 8:  cfgCycleString(g_config.midiInputSource, sizeof(g_config.midiInputSource), INPUTS, 3); break;
     case 9:  g_config.majorUpperTranspose = !g_config.majorUpperTranspose; break;
-    case 10: g_config.btAutoReconnect = !g_config.btAutoReconnect; break;
-    case 11: g_config.showSplash = !g_config.showSplash; break;
-    case 12: g_config.startupGSReset  = !g_config.startupGSReset; break;
-    case 13: g_config.smfStartGSReset = !g_config.smfStartGSReset; break;
-    case 14: g_config.srcInitChannel  = (g_config.srcInitChannel >= 16) ? 1 : (uint8_t)(g_config.srcInitChannel + 1); break;
-    case 15: g_config.srcInitProgram  = (g_config.srcInitProgram >= 127) ? 0 : (uint8_t)(g_config.srcInitProgram + 1); break;
-    case 16: g_config.srcInitVolume   = (g_config.srcInitVolume  >= 127) ? 0 : (uint8_t)(g_config.srcInitVolume  + 1); break;
-    case 17: g_config.srcAutoChannel  = !g_config.srcAutoChannel; break;
+    case 10: g_config.showSplash = !g_config.showSplash; break;
+    case 11: g_config.startupGSReset  = !g_config.startupGSReset; break;
+    case 12: g_config.smfStartGSReset = !g_config.smfStartGSReset; break;
+    case 13: g_config.srcInitChannel  = (g_config.srcInitChannel >= 16) ? 1 : (uint8_t)(g_config.srcInitChannel + 1); break;
+    case 14: g_config.srcInitProgram  = (g_config.srcInitProgram >= 127) ? 0 : (uint8_t)(g_config.srcInitProgram + 1); break;
+    case 15: g_config.srcInitVolume   = (g_config.srcInitVolume  >= 127) ? 0 : (uint8_t)(g_config.srcInitVolume  + 1); break;
+    case 16: g_config.srcAutoChannel  = !g_config.srcAutoChannel; break;
   }
 }
 
@@ -6269,16 +6136,6 @@ static const char* getAppLabel(AppMode app) {
   }
 }
 
-static const char* getBtStatusLabelTab(BT_STATUS s) {
-  switch (s) {
-    case BT_UNINITIALIZED: return "UNINITIALIZED";
-    case BT_DISCONNECTED:  return "DISCONNECTED";
-    case BT_CONNECTING:    return "CONNECTING";
-    case BT_CONNECTED:     return "CONNECTED";
-    default:               return "UNKNOWN";
-  }
-}
-
 static bool tokenEqualsIgnoreCase(const char* lhs, const char* rhs) {
   if (lhs == nullptr || rhs == nullptr) return false;
   while (*lhs && *rhs) {
@@ -6402,7 +6259,7 @@ static void printUsbSerialStatus() {
   const char* usbLabel        = g_usbMidiMounted ? "connected" : "disconnected";
   Serial.printf(
     "OK STATUS app=%s mode=%s input=%s transpose=%d range=%d filter_bypass=%d mapper_bypass=%d "
-    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu bt=%s usb_in=%s cables=%u usb_drop=%lu usb_resub_fail=%lu\n",
+    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu usb_in=%s cables=%u usb_drop=%lu usb_resub_fail=%lu\n",
     getAppLabel(currentApp),
     getDisplayModeLabel(currentMode),
     inputLabel,
@@ -6415,7 +6272,6 @@ static void printUsbSerialStatus() {
     pageLabel, mapperPageLabel,
     midiInCount, midiOutCount,
     midiInRealCount, midiOutRealCount,
-    getBtStatusLabelTab(g_lastBtStatus),
     usbLabel,
     (unsigned)g_usbMidiCableCount,
     (unsigned long)g_usbMidiRingDropCount,
@@ -6725,10 +6581,6 @@ void setup() {
   // initialised and the Serial2 TX mutex is created.
   startMidiIoTask();
 
-  // BLE HID pedal — initialise asynchronously so the UI stays responsive
-  // while the C6 radio comes up and NimBLE does its setup.
-  ble_hid_begin_async("M5Tab5-MIDITransposer", pedalReportCb);
-
 #ifdef M5TAB_DIAG
   Serial.printf("[boot] Tab5 MIDI Transposer ready  panel=%dx%d  reset_reason=%d\n",
                 M5.Display.width(), M5.Display.height(), (int)esp_reset_reason());
@@ -6784,10 +6636,9 @@ void loop() {
   diagMaybeReport(now);
   serviceUsbHost(now);
 
-  // MIDI input drain (processMidiInput) and pedal-event consumption
-  // (processPedal) now run on the dedicated midi_io_task (core 0). Heavy UI
-  // work in this loop no longer affects MIDI throughput. Only the
-  // mode-specific OUTPUT/PLAYBACK helpers stay on the main loop here.
+  // MIDI input drain (processMidiInput) runs on the dedicated midi_io_task
+  // (core 0). Heavy UI work in this loop no longer affects MIDI throughput.
+  // Only the mode-specific OUTPUT/PLAYBACK helpers stay on the main loop here.
   if (currentApp == APP_PLAY && currentPlay == PLAY_SMF) {
     processSmf();
   } else if (currentApp == APP_PLAY && currentPlay == PLAY_MP3) {
@@ -6806,17 +6657,9 @@ void loop() {
     lastUI = now;
     M5.update();
     handleTouch();
-    ble_hid_service();
     // Refresh MIDI activity stripes ~50 Hz so the flash is visible without
     // requiring a full header redraw.
     drawMidiActivityLines();
-
-    // Refresh the header whenever the BT status changes.
-    BT_STATUS bt = ble_hid_status();
-    if (bt != g_lastBtStatus) {
-      g_lastBtStatus = bt;
-      needPartialUpdate = true;
-    }
 
     if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF) && smfPlaying && now - lastSmfHeaderRefresh >= 200) {
       lastSmfHeaderRefresh = now;
