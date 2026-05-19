@@ -637,7 +637,9 @@ static void drawTriangleBtn(const Rect& r, uint16_t bg, uint16_t border,
   M5.Display.drawRoundRect(r.x, r.y, r.w, r.h, 10, border);
   int cx = r.x + r.w / 2;
   int cy = r.y + r.h / 2;
-  int s = (r.w < r.h ? r.w : r.h) / 3;
+  // Use ~40% of the shorter side so the triangle visually fills the button
+  // and reads as a tap target. The old 1/3 ratio left too much whitespace.
+  int s = (r.w < r.h ? r.w : r.h) * 2 / 5;
   if (up) {
     M5.Display.fillTriangle(cx, cy - s, cx - s, cy + s, cx + s, cy + s, triColor);
   } else {
@@ -645,29 +647,27 @@ static void drawTriangleBtn(const Rect& r, uint16_t bg, uint16_t border,
   }
 }
 
+// Two triangles side-by-side horizontally (was vertically stacked).
+// Designed for buttons noticeably wider than the single-arrow buttons so the
+// "fast" affordance is visually obvious. The triangles use h/3 so they read
+// at finger-distance.
 static void drawDoubleTriangleBtn(const Rect& r, uint16_t bg, uint16_t border,
                                   bool up, uint16_t triColor)
 {
   M5.Display.fillRoundRect(r.x, r.y, r.w, r.h, 10, bg);
   M5.Display.drawRoundRect(r.x, r.y, r.w, r.h, 10, border);
-  int cx = r.x + r.w / 2;
   int cy = r.y + r.h / 2;
-  int s = (r.w < r.h ? r.w : r.h) / 5;
-  int gap = 3;
+  int s = r.h / 3;                      // half-edge of each triangle
+  int innerGap = 10;                    // gap between the two triangles
+  int pairW = 4 * s + innerGap;         // (2*s)+gap+(2*s)
+  int leftCx  = r.x + (r.w - pairW) / 2 + s;
+  int rightCx = leftCx + 2 * s + innerGap;
   if (up) {
-    int y1 = cy - gap;          // base of upper triangle
-    int y0 = y1 - 2 * s;        // apex of upper triangle
-    M5.Display.fillTriangle(cx, y0, cx - s, y1, cx + s, y1, triColor);
-    int y2 = cy + gap;          // apex of lower triangle
-    int y3 = y2 + 2 * s;        // base of lower triangle
-    M5.Display.fillTriangle(cx, y2, cx - s, y3, cx + s, y3, triColor);
+    M5.Display.fillTriangle(leftCx,  cy - s, leftCx  - s, cy + s, leftCx  + s, cy + s, triColor);
+    M5.Display.fillTriangle(rightCx, cy - s, rightCx - s, cy + s, rightCx + s, cy + s, triColor);
   } else {
-    int y0 = cy - gap;          // apex (bottom) of upper triangle
-    int y1 = y0 - 2 * s;        // base (top) of upper triangle
-    M5.Display.fillTriangle(cx - s, y1, cx + s, y1, cx, y0, triColor);
-    int y2 = cy + gap;          // base (top) of lower triangle
-    int y3 = y2 + 2 * s;        // apex (bottom) of lower triangle
-    M5.Display.fillTriangle(cx - s, y2, cx + s, y2, cx, y3, triColor);
+    M5.Display.fillTriangle(leftCx  - s, cy - s, leftCx  + s, cy - s, leftCx,  cy + s, triColor);
+    M5.Display.fillTriangle(rightCx - s, cy - s, rightCx + s, cy - s, rightCx, cy + s, triColor);
   }
 }
 
@@ -823,13 +823,17 @@ static void computeLayout() {
   smfListArea  = { contentArea.x + margin, contentArea.y + margin,
                    contentArea.w - margin * 2, listBottom - (contentArea.y + margin) };
   {
-    const int btnW = 80, btnH = 56, btnGap = 8;
+    // Single arrows are 90 wide; the double-arrow (page-jump) buttons are
+    // 140 wide so they read as distinct, "fast" buttons. Heights are 64 to
+    // give a generous tap target.
+    const int singleW = 90, doubleW = 140, btnH = 64, btnGap = 8;
     int btnY = smfListArea.y + 8;
     int rightX = smfListArea.x + smfListArea.w - 12;
-    smfListPageDownBtn = { rightX - btnW,                          btnY, btnW, btnH };
-    smfListDownBtn     = { rightX - btnW * 2 - btnGap,             btnY, btnW, btnH };
-    smfListUpBtn       = { rightX - btnW * 3 - btnGap * 2,         btnY, btnW, btnH };
-    smfListPageUpBtn   = { rightX - btnW * 4 - btnGap * 3,         btnY, btnW, btnH };
+    // Right-anchored: [▲▲][▲][▼][▼▼]
+    smfListPageDownBtn = { rightX - doubleW,                                    btnY, doubleW, btnH };
+    smfListDownBtn     = { smfListPageDownBtn.x - btnGap - singleW,             btnY, singleW, btnH };
+    smfListUpBtn       = { smfListDownBtn.x     - btnGap - singleW,             btnY, singleW, btnH };
+    smfListPageUpBtn   = { smfListUpBtn.x       - btnGap - doubleW,             btnY, doubleW, btnH };
   }
   smfInfoArea  = { rightX, contentArea.y + margin, rightW, 140 };
   int smfKeyboardTop = smfInfoArea.y + smfInfoArea.h + 16;
@@ -840,13 +844,13 @@ static void computeLayout() {
   mp3ListArea   = { contentArea.x + margin, contentArea.y + margin,
                     listW, listBottom - (contentArea.y + margin) };
   {
-    const int btnW = 80, btnH = 56, btnGap = 8;
+    const int singleW = 90, doubleW = 140, btnH = 64, btnGap = 8;
     int btnY = mp3ListArea.y + 8;
     int rightX = mp3ListArea.x + mp3ListArea.w - 12;
-    mp3ListPageDownBtn = { rightX - btnW,                          btnY, btnW, btnH };
-    mp3ListDownBtn     = { rightX - btnW * 2 - btnGap,             btnY, btnW, btnH };
-    mp3ListUpBtn       = { rightX - btnW * 3 - btnGap * 2,         btnY, btnW, btnH };
-    mp3ListPageUpBtn   = { rightX - btnW * 4 - btnGap * 3,         btnY, btnW, btnH };
+    mp3ListPageDownBtn = { rightX - doubleW,                                    btnY, doubleW, btnH };
+    mp3ListDownBtn     = { mp3ListPageDownBtn.x - btnGap - singleW,             btnY, singleW, btnH };
+    mp3ListUpBtn       = { mp3ListDownBtn.x     - btnGap - singleW,             btnY, singleW, btnH };
+    mp3ListPageUpBtn   = { mp3ListUpBtn.x       - btnGap - doubleW,             btnY, doubleW, btnH };
   }
   mp3InfoArea   = { rightX, contentArea.y + margin, rightW, 118 };
   mp3VisualArea = { rightX, mp3InfoArea.y + mp3InfoArea.h + 12,
@@ -2681,12 +2685,20 @@ static void drawMp3Static() {
   drawDoubleTriangleBtn(mp3ListPageDownBtn, TFT_BLUE, COL_BTN_BDR, false, COL_BTN_TXT);
 
   int lineH = 44;
-  int top = mp3ListArea.y + 76;
+  int top = mp3ListArea.y + 84;
   int listRight = mp3ListArea.x + mp3ListArea.w - 12;
-  int visible = (mp3ListArea.h - 76) / lineH;
-  if (mp3CurrentTrack < mp3ListScroll) mp3ListScroll = mp3CurrentTrack;
-  if (mp3CurrentTrack >= mp3ListScroll + visible) mp3ListScroll = mp3CurrentTrack - visible + 1;
+  int visible = (mp3ListArea.h - 84) / lineH;
+  // Only auto-follow the current track when there *is* one. After folder
+  // navigation mp3CurrentTrack == -1 (no selection); applying the follow
+  // logic in that state would clamp mp3ListScroll back to 0 on every
+  // redraw and silently undo the user's page-jump taps.
+  if (mp3CurrentTrack >= 0) {
+    if (mp3CurrentTrack < mp3ListScroll) mp3ListScroll = mp3CurrentTrack;
+    if (mp3CurrentTrack >= mp3ListScroll + visible) mp3ListScroll = mp3CurrentTrack - visible + 1;
+  }
   if (mp3ListScroll < 0) mp3ListScroll = 0;
+  int mp3MaxScroll = max(0, mp3PlaylistCount - visible);
+  if (mp3ListScroll > mp3MaxScroll) mp3ListScroll = mp3MaxScroll;
   for (int row = 0; row < visible; ++row) {
     int idx = mp3ListScroll + row;
     if (idx >= mp3PlaylistCount) break;
@@ -3348,10 +3360,16 @@ static void drawSmf() {
   drawDoubleTriangleBtn(smfListPageDownBtn, TFT_BLUE, COL_BTN_BDR, false, COL_BTN_TXT);
 
   int lineH = 44;
-  int top = smfListArea.y + 76;
-  int visible = (smfListArea.h - 76) / lineH;
-  if (smfCurrentTrack < smfListScroll) smfListScroll = smfCurrentTrack;
-  if (smfCurrentTrack >= smfListScroll + visible) smfListScroll = smfCurrentTrack - visible + 1;
+  int top = smfListArea.y + 84;
+  int visible = (smfListArea.h - 84) / lineH;
+  // See drawMp3Static for the rationale: only auto-follow when a real
+  // track is selected (>=0). With -1 (post-folder-nav) the follow logic
+  // would yank smfListScroll back to 0 every redraw and eat the page-jump
+  // taps.
+  if (smfCurrentTrack >= 0) {
+    if (smfCurrentTrack < smfListScroll) smfListScroll = smfCurrentTrack;
+    if (smfCurrentTrack >= smfListScroll + visible) smfListScroll = smfCurrentTrack - visible + 1;
+  }
   if (smfListScroll < 0) smfListScroll = 0;
   int maxScroll = max(0, smfPlaylistCount - visible);
   if (smfListScroll > maxScroll) smfListScroll = maxScroll;
@@ -4775,7 +4793,7 @@ static void processMp3() {
 static void handleSmfTouch(int x, int y) {
   if (smfPlaying) return;
   const int lineH = 44;
-  int visible = (smfListArea.h - 76) / lineH;
+  int visible = (smfListArea.h - 84) / lineH;
   if (visible < 1) visible = 1;
   int pageStep = max(1, visible - 1);
   int maxScroll = max(0, smfPlaylistCount - visible);
@@ -4808,7 +4826,7 @@ static void handleSmfTouch(int x, int y) {
     return;
   }
   if (hit(smfListArea, x, y)) {
-    int top = smfListArea.y + 76;
+    int top = smfListArea.y + 84;
     int idx = smfListScroll + ((y - top) / lineH);
     if (y >= top && idx >= 0 && idx < smfPlaylistCount) {
       const char* path = smfPlaylist[idx];
@@ -4835,7 +4853,7 @@ static void handleSmfTouch(int x, int y) {
 
 static void handleMp3Touch(int x, int y) {
   const int lineH = 44;
-  int visible = (mp3ListArea.h - 76) / lineH;
+  int visible = (mp3ListArea.h - 84) / lineH;
   if (visible < 1) visible = 1;
   int pageStep = max(1, visible - 1);
   int maxScroll = max(0, mp3PlaylistCount - visible);
@@ -4872,7 +4890,7 @@ static void handleMp3Touch(int x, int y) {
     return;
   }
   if (hit(mp3ListArea, x, y)) {
-    int top = mp3ListArea.y + 76;
+    int top = mp3ListArea.y + 84;
     int idx = mp3ListScroll + ((y - top) / lineH);
     if (y >= top && idx >= 0 && idx < mp3PlaylistCount) {
       const char* path = mp3Playlist[idx];
