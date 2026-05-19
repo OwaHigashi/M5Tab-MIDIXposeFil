@@ -279,6 +279,11 @@ static char        smfPlaylist[SMF_MAX_FILES][PLAYLIST_PATH_MAX];
 static int         smfPlaylistCount = 0;
 static int smfCurrentTrack = 0;
 static int smfListScroll = 0;
+// Subfolder navigation. smfCurrentDir is the directory currently shown in the
+// list (e.g. "/smf" at the root, "/smf/album1" inside a subfolder). Files are
+// stored as full paths; directory entries carry a trailing "/"; the synthetic
+// parent entry is the literal string "..".
+static char smfCurrentDir[PLAYLIST_PATH_MAX] = "";
 static bool smfLoaded = false;
 static bool smfPlaying = false;
 static bool smfLoop = false;
@@ -299,6 +304,7 @@ static char      mp3Playlist[MP3_MAX_FILES][PLAYLIST_PATH_MAX];
 static int       mp3PlaylistCount = 0;
 static int mp3CurrentTrack = 0;
 static int mp3ListScroll = 0;
+static char mp3CurrentDir[PLAYLIST_PATH_MAX] = "";  // see smfCurrentDir comment
 static bool mp3Playing = false;
 static uint32_t mp3PlaybackStartMs = 0;
 static int mp3Volume = 220;  // M5.Speaker range is 0..255
@@ -398,9 +404,9 @@ static Rect     instantZero;
 static SeqSlot  seqSteps[SEQ_STEP_COUNT];
 static Rect     seqPatLeft, seqPatRight, seqSave;
 static Rect     smfListArea, smfInfoArea, smfPianoArea;
-static Rect     smfListUpBtn, smfListDownBtn;
+static Rect     smfListPageUpBtn, smfListUpBtn, smfListDownBtn, smfListPageDownBtn;
 static Rect     mp3ListArea, mp3InfoArea, mp3VisualArea;
-static Rect     mp3ListUpBtn, mp3ListDownBtn;
+static Rect     mp3ListPageUpBtn, mp3ListUpBtn, mp3ListDownBtn, mp3ListPageDownBtn;
 
 // SRC layout rectangles (computed in computeLayout()).
 static Rect srcChannelRow;       // strip showing CH 01..16 cells
@@ -636,6 +642,32 @@ static void drawTriangleBtn(const Rect& r, uint16_t bg, uint16_t border,
   }
 }
 
+static void drawDoubleTriangleBtn(const Rect& r, uint16_t bg, uint16_t border,
+                                  bool up, uint16_t triColor)
+{
+  M5.Display.fillRoundRect(r.x, r.y, r.w, r.h, 10, bg);
+  M5.Display.drawRoundRect(r.x, r.y, r.w, r.h, 10, border);
+  int cx = r.x + r.w / 2;
+  int cy = r.y + r.h / 2;
+  int s = (r.w < r.h ? r.w : r.h) / 5;
+  int gap = 3;
+  if (up) {
+    int y1 = cy - gap;          // base of upper triangle
+    int y0 = y1 - 2 * s;        // apex of upper triangle
+    M5.Display.fillTriangle(cx, y0, cx - s, y1, cx + s, y1, triColor);
+    int y2 = cy + gap;          // apex of lower triangle
+    int y3 = y2 + 2 * s;        // base of lower triangle
+    M5.Display.fillTriangle(cx, y2, cx - s, y3, cx + s, y3, triColor);
+  } else {
+    int y0 = cy - gap;          // apex (bottom) of upper triangle
+    int y1 = y0 - 2 * s;        // base (top) of upper triangle
+    M5.Display.fillTriangle(cx - s, y1, cx + s, y1, cx, y0, triColor);
+    int y2 = cy + gap;          // base (top) of lower triangle
+    int y3 = y2 + 2 * s;        // apex (bottom) of lower triangle
+    M5.Display.fillTriangle(cx - s, y2, cx + s, y2, cx, y3, triColor);
+  }
+}
+
 static void drawTextFit(const Rect& r, const char* text, const lgfx::IFont* font,
                         uint16_t txt, uint16_t bg, int padX = 8)
 {
@@ -787,8 +819,15 @@ static void computeLayout() {
   int listBottom = navArea.y + navArea.h - margin;
   smfListArea  = { contentArea.x + margin, contentArea.y + margin,
                    contentArea.w - margin * 2, listBottom - (contentArea.y + margin) };
-  smfListUpBtn   = { smfListArea.x + smfListArea.w - 102, smfListArea.y + 8, 44, 44 };
-  smfListDownBtn = { smfListArea.x + smfListArea.w - 52,  smfListArea.y + 8, 44, 44 };
+  {
+    const int btnW = 80, btnH = 56, btnGap = 8;
+    int btnY = smfListArea.y + 8;
+    int rightX = smfListArea.x + smfListArea.w - 12;
+    smfListPageDownBtn = { rightX - btnW,                          btnY, btnW, btnH };
+    smfListDownBtn     = { rightX - btnW * 2 - btnGap,             btnY, btnW, btnH };
+    smfListUpBtn       = { rightX - btnW * 3 - btnGap * 2,         btnY, btnW, btnH };
+    smfListPageUpBtn   = { rightX - btnW * 4 - btnGap * 3,         btnY, btnW, btnH };
+  }
   smfInfoArea  = { rightX, contentArea.y + margin, rightW, 140 };
   int smfKeyboardTop = smfInfoArea.y + smfInfoArea.h + 16;
   int smfKeyboardBottom = navArea.y + navArea.h - margin;
@@ -797,8 +836,15 @@ static void computeLayout() {
 
   mp3ListArea   = { contentArea.x + margin, contentArea.y + margin,
                     listW, listBottom - (contentArea.y + margin) };
-  mp3ListUpBtn   = { mp3ListArea.x + mp3ListArea.w - 102, mp3ListArea.y + 8, 44, 44 };
-  mp3ListDownBtn = { mp3ListArea.x + mp3ListArea.w - 52,  mp3ListArea.y + 8, 44, 44 };
+  {
+    const int btnW = 80, btnH = 56, btnGap = 8;
+    int btnY = mp3ListArea.y + 8;
+    int rightX = mp3ListArea.x + mp3ListArea.w - 12;
+    mp3ListPageDownBtn = { rightX - btnW,                          btnY, btnW, btnH };
+    mp3ListDownBtn     = { rightX - btnW * 2 - btnGap,             btnY, btnW, btnH };
+    mp3ListUpBtn       = { rightX - btnW * 3 - btnGap * 2,         btnY, btnW, btnH };
+    mp3ListPageUpBtn   = { rightX - btnW * 4 - btnGap * 3,         btnY, btnW, btnH };
+  }
   mp3InfoArea   = { rightX, contentArea.y + margin, rightW, 118 };
   mp3VisualArea = { rightX, mp3InfoArea.y + mp3InfoArea.h + 12,
                     rightW, listBottom - (mp3InfoArea.y + mp3InfoArea.h + 12) };
@@ -2625,14 +2671,16 @@ static void drawMp3Static() {
   M5.Display.setFont(FONT_SMALL);
   M5.Display.setTextColor(COL_TITLE, COL_PANEL);
   M5.Display.setTextDatum(top_left);
-  M5.Display.drawString("MP3 Playlist", mp3ListArea.x + 12, mp3ListArea.y + 10);
-  drawTriangleBtn(mp3ListUpBtn,   TFT_BLUE, COL_BTN_BDR, true,  COL_BTN_TXT);
-  drawTriangleBtn(mp3ListDownBtn, TFT_BLUE, COL_BTN_BDR, false, COL_BTN_TXT);
+  M5.Display.drawString("MP3 Playlist", mp3ListArea.x + 12, mp3ListArea.y + 14);
+  drawDoubleTriangleBtn(mp3ListPageUpBtn,   TFT_BLUE, COL_BTN_BDR, true,  COL_BTN_TXT);
+  drawTriangleBtn(mp3ListUpBtn,             TFT_BLUE, COL_BTN_BDR, true,  COL_BTN_TXT);
+  drawTriangleBtn(mp3ListDownBtn,           TFT_BLUE, COL_BTN_BDR, false, COL_BTN_TXT);
+  drawDoubleTriangleBtn(mp3ListPageDownBtn, TFT_BLUE, COL_BTN_BDR, false, COL_BTN_TXT);
 
-  int lineH = 34;
-  int top = mp3ListArea.y + 58;
+  int lineH = 44;
+  int top = mp3ListArea.y + 76;
   int listRight = mp3ListArea.x + mp3ListArea.w - 12;
-  int visible = (mp3ListArea.h - 56) / lineH;
+  int visible = (mp3ListArea.h - 76) / lineH;
   if (mp3CurrentTrack < mp3ListScroll) mp3ListScroll = mp3CurrentTrack;
   if (mp3CurrentTrack >= mp3ListScroll + visible) mp3ListScroll = mp3CurrentTrack - visible + 1;
   if (mp3ListScroll < 0) mp3ListScroll = 0;
@@ -2643,10 +2691,11 @@ static void drawMp3Static() {
     rr.w = listRight - rr.x;
     bool on = (idx == mp3CurrentTrack);
     M5.Display.fillRoundRect(rr.x, rr.y, rr.w, rr.h, 6, on ? COL_BTN_HI2 : COL_PANEL);
-    const char* slash = strrchr(mp3Playlist[idx], '/');
-    const char* name  = slash ? slash + 1 : mp3Playlist[idx];
-    drawTextFit(rr, name, FONT_TINY, on ? COL_BTN_TXT_HI : COL_BTN_TXT,
-                on ? COL_BTN_HI2 : COL_PANEL);
+    char labelBuf[PLAYLIST_PATH_MAX + 4];
+    const char* name = formatPlaylistLabel(mp3Playlist[idx], labelBuf, sizeof(labelBuf));
+    bool isNav = !entryIsFile(mp3Playlist[idx]);
+    uint16_t txt = on ? COL_BTN_TXT_HI : (isNav ? COL_ACCENT : COL_BTN_TXT);
+    drawTextFit(rr, name, FONT_SMALL, txt, on ? COL_BTN_HI2 : COL_PANEL);
   }
 
   M5.Display.fillRoundRect(mp3InfoArea.x, mp3InfoArea.y, mp3InfoArea.w, mp3InfoArea.h, 12, COL_PANEL);
@@ -3289,13 +3338,15 @@ static void drawSmf() {
   M5.Display.setFont(FONT_SMALL);
   M5.Display.setTextColor(COL_TITLE, COL_PANEL);
   M5.Display.setTextDatum(top_left);
-  M5.Display.drawString("SMF Playlist", smfListArea.x + 12, smfListArea.y + 10);
-  drawTriangleBtn(smfListUpBtn,   TFT_BLUE, COL_BTN_BDR, true,  COL_BTN_TXT);
-  drawTriangleBtn(smfListDownBtn, TFT_BLUE, COL_BTN_BDR, false, COL_BTN_TXT);
+  M5.Display.drawString("SMF Playlist", smfListArea.x + 12, smfListArea.y + 14);
+  drawDoubleTriangleBtn(smfListPageUpBtn,   TFT_BLUE, COL_BTN_BDR, true,  COL_BTN_TXT);
+  drawTriangleBtn(smfListUpBtn,             TFT_BLUE, COL_BTN_BDR, true,  COL_BTN_TXT);
+  drawTriangleBtn(smfListDownBtn,           TFT_BLUE, COL_BTN_BDR, false, COL_BTN_TXT);
+  drawDoubleTriangleBtn(smfListPageDownBtn, TFT_BLUE, COL_BTN_BDR, false, COL_BTN_TXT);
 
-  int lineH = 30;
-  int top = smfListArea.y + 58;
-  int visible = (smfListArea.h - 60) / lineH;
+  int lineH = 44;
+  int top = smfListArea.y + 76;
+  int visible = (smfListArea.h - 76) / lineH;
   if (smfCurrentTrack < smfListScroll) smfListScroll = smfCurrentTrack;
   if (smfCurrentTrack >= smfListScroll + visible) smfListScroll = smfCurrentTrack - visible + 1;
   if (smfListScroll < 0) smfListScroll = 0;
@@ -3307,10 +3358,12 @@ static void drawSmf() {
     Rect rr = { smfListArea.x + 10, top + row * lineH, smfListArea.w - 20, lineH - 2 };
     bool on = (idx == smfCurrentTrack);
     M5.Display.fillRoundRect(rr.x, rr.y, rr.w, rr.h, 6, on ? COL_BTN_HI2 : COL_PANEL);
-    const char* slash = strrchr(smfPlaylist[idx], '/');
-    const char* name  = slash ? slash + 1 : smfPlaylist[idx];
-    M5.Display.setFont(FONT_TINY);
-    M5.Display.setTextColor(on ? COL_BTN_TXT_HI : COL_BTN_TXT, on ? COL_BTN_HI2 : COL_PANEL);
+    char labelBuf[PLAYLIST_PATH_MAX + 4];
+    const char* name = formatPlaylistLabel(smfPlaylist[idx], labelBuf, sizeof(labelBuf));
+    bool isNav = !entryIsFile(smfPlaylist[idx]);
+    uint16_t txt = on ? COL_BTN_TXT_HI : (isNav ? COL_ACCENT : COL_BTN_TXT);
+    M5.Display.setFont(FONT_SMALL);
+    M5.Display.setTextColor(txt, on ? COL_BTN_HI2 : COL_PANEL);
     M5.Display.setTextDatum(middle_left);
     M5.Display.drawString(name, rr.x + 8, rr.y + rr.h / 2);
   }
@@ -3835,14 +3888,22 @@ static void handleToolbarTouch(int x, int y) {
 
   if ((currentApp == APP_PLAY && currentPlay == PLAY_SMF)) {
     if (hit(smfBtnPrev, x, y) && smfPlaylistCount > 0) {
-      loadSmfTrack((smfCurrentTrack > 0) ? smfCurrentTrack - 1 : smfPlaylistCount - 1);
+      int i = (smfCurrentTrack >= 0) ? smfCurrentTrack : 0;
+      for (int n = 0; n < smfPlaylistCount; n++) {
+        i = (i - 1 + smfPlaylistCount) % smfPlaylistCount;
+        if (entryIsFile(smfPlaylist[i])) { loadSmfTrack(i); break; }
+      }
       needFullRedraw = true;
     } else if (hit(smfBtnPlay, x, y)) {
       if (smfPlaying) stopSmf();
       else playSmf();
       needFullRedraw = true;
     } else if (hit(smfBtnNext, x, y) && smfPlaylistCount > 0) {
-      loadSmfTrack((smfCurrentTrack + 1) % smfPlaylistCount);
+      int i = (smfCurrentTrack >= 0) ? smfCurrentTrack : -1;
+      for (int n = 0; n < smfPlaylistCount; n++) {
+        i = (i + 1) % smfPlaylistCount;
+        if (entryIsFile(smfPlaylist[i])) { loadSmfTrack(i); break; }
+      }
       needFullRedraw = true;
     } else if (hit(smfBtnLoop, x, y)) {
       smfLoop = !smfLoop;
@@ -3854,14 +3915,25 @@ static void handleToolbarTouch(int x, int y) {
 
   if ((currentApp == APP_PLAY && currentPlay == PLAY_MP3)) {
     if (hit(mp3BtnPrev, x, y) && mp3PlaylistCount > 0) {
-      startMp3Track((mp3CurrentTrack > 0) ? mp3CurrentTrack - 1 : mp3PlaylistCount - 1);
+      int i = (mp3CurrentTrack >= 0) ? mp3CurrentTrack : 0;
+      for (int n = 0; n < mp3PlaylistCount; n++) {
+        i = (i - 1 + mp3PlaylistCount) % mp3PlaylistCount;
+        if (entryIsFile(mp3Playlist[i])) { startMp3Track(i); break; }
+      }
       needFullRedraw = true;
     } else if (hit(mp3BtnPlay, x, y)) {
       if (mp3Playing) stopMp3();
-      else startMp3Track(mp3CurrentTrack);
+      else if (mp3CurrentTrack >= 0 && mp3CurrentTrack < mp3PlaylistCount &&
+               entryIsFile(mp3Playlist[mp3CurrentTrack])) {
+        startMp3Track(mp3CurrentTrack);
+      }
       needFullRedraw = true;
     } else if (hit(mp3BtnNext, x, y) && mp3PlaylistCount > 0) {
-      startMp3Track((mp3CurrentTrack + 1) % mp3PlaylistCount);
+      int i = (mp3CurrentTrack >= 0) ? mp3CurrentTrack : -1;
+      for (int n = 0; n < mp3PlaylistCount; n++) {
+        i = (i + 1) % mp3PlaylistCount;
+        if (entryIsFile(mp3Playlist[i])) { startMp3Track(i); break; }
+      }
       needFullRedraw = true;
     } else if (hit(mp3BtnVolDown, x, y)) {
       mp3Volume = max(0, mp3Volume - 16);
@@ -4134,28 +4206,157 @@ static bool nameHasExt(const char* name, const char* ext) {
   return true;
 }
 
+// Case-insensitive natural compare: digit runs compare numerically so
+// "2_foo" sorts before "10_foo". Used to keep playlists in human order;
+// the SD library returns entries in FAT directory-insertion order, which
+// rarely matches the "0_, 1_, 2_, ..." prefix users expect.
+static int playlistNaturalCmp(const char* a, const char* b) {
+  while (*a && *b) {
+    if (isdigit((unsigned char)*a) && isdigit((unsigned char)*b)) {
+      while (*a == '0') a++;
+      while (*b == '0') b++;
+      const char* aDigits = a;
+      const char* bDigits = b;
+      while (isdigit((unsigned char)*a)) a++;
+      while (isdigit((unsigned char)*b)) b++;
+      size_t aLen = a - aDigits;
+      size_t bLen = b - bDigits;
+      if (aLen != bLen) return (aLen < bLen) ? -1 : 1;
+      int c = strncmp(aDigits, bDigits, aLen);
+      if (c) return c;
+    } else {
+      int ca = tolower((unsigned char)*a);
+      int cb = tolower((unsigned char)*b);
+      if (ca != cb) return (ca < cb) ? -1 : 1;
+      a++; b++;
+    }
+  }
+  if (*a) return 1;
+  if (*b) return -1;
+  return 0;
+}
+
+// Entry kind helpers. Paths in the playlist arrays encode kind via their
+// trailing character: ".." literal == parent (up), trailing '/' == dir,
+// otherwise file.
+static inline bool entryIsParent(const char* p) { return strcmp(p, "..") == 0; }
+static inline bool entryIsDir(const char* p) {
+  size_t n = strlen(p);
+  return n > 0 && p[n - 1] == '/';
+}
+static inline bool entryIsFile(const char* p) {
+  return !entryIsParent(p) && !entryIsDir(p);
+}
+
+// Sort key: parent first, then directories, then files. Within each group
+// entries are natural-sorted by basename.
+static int playlistEntryCmp(const void* pa, const void* pb) {
+  const char* a = (const char*)pa;
+  const char* b = (const char*)pb;
+  int ka = entryIsParent(a) ? 0 : (entryIsDir(a) ? 1 : 2);
+  int kb = entryIsParent(b) ? 0 : (entryIsDir(b) ? 1 : 2);
+  if (ka != kb) return ka - kb;
+  // For dirs, strip the trailing slash before locating the basename so
+  // "/smf/album1/" compares as "album1".
+  char abuf[PLAYLIST_PATH_MAX], bbuf[PLAYLIST_PATH_MAX];
+  const char* aRef = a;
+  const char* bRef = b;
+  if (entryIsDir(a)) {
+    strlcpy(abuf, a, sizeof(abuf));
+    size_t n = strlen(abuf);
+    if (n > 0 && abuf[n - 1] == '/') abuf[n - 1] = '\0';
+    aRef = abuf;
+  }
+  if (entryIsDir(b)) {
+    strlcpy(bbuf, b, sizeof(bbuf));
+    size_t n = strlen(bbuf);
+    if (n > 0 && bbuf[n - 1] == '/') bbuf[n - 1] = '\0';
+    bRef = bbuf;
+  }
+  const char* aName = strrchr(aRef, '/'); aName = aName ? aName + 1 : aRef;
+  const char* bName = strrchr(bRef, '/'); bName = bName ? bName + 1 : bRef;
+  return playlistNaturalCmp(aName, bName);
+}
+
+// Format an entry for the song list. Files render as their basename; dirs as
+// "[name]"; the parent entry as "[..]". `out` must be at least
+// PLAYLIST_PATH_MAX + 4 bytes.
+static const char* formatPlaylistLabel(const char* path, char* out, size_t outSize) {
+  if (entryIsParent(path)) {
+    strlcpy(out, "[..]", outSize);
+    return out;
+  }
+  if (entryIsDir(path)) {
+    char tmp[PLAYLIST_PATH_MAX];
+    strlcpy(tmp, path, sizeof(tmp));
+    size_t n = strlen(tmp);
+    if (n > 0 && tmp[n - 1] == '/') tmp[n - 1] = '\0';
+    const char* slash = strrchr(tmp, '/');
+    const char* base = slash ? slash + 1 : tmp;
+    snprintf(out, outSize, "[%s]", base);
+    return out;
+  }
+  const char* slash = strrchr(path, '/');
+  return slash ? slash + 1 : path;
+}
+
+// Strip the last "/segment" off dir, capped at root. Used to ascend on "..".
+static void playlistGoUp(char* dir, const char* root) {
+  size_t rootLen = strlen(root);
+  size_t n = strlen(dir);
+  if (n <= rootLen) { strlcpy(dir, root, PLAYLIST_PATH_MAX); return; }
+  while (n > 0 && dir[n - 1] == '/') dir[--n] = '\0';
+  char* slash = strrchr(dir, '/');
+  if (!slash || (size_t)(slash - dir) < rootLen) {
+    strlcpy(dir, root, PLAYLIST_PATH_MAX);
+  } else {
+    *slash = '\0';
+  }
+}
+
 static void scanSmfFiles() {
   smfPlaylistCount = 0;
   smfListScroll = 0;
   if (!ensureStorage()) return;
 
-  File root = SD.open(SMF_FOLDER);
+  if (smfCurrentDir[0] == '\0') strlcpy(smfCurrentDir, SMF_FOLDER, sizeof(smfCurrentDir));
+
+  File root = SD.open(smfCurrentDir);
   if (!root || !root.isDirectory()) {
     if (root) root.close();
-    return;
+    // currentDir went stale (deleted?). Fall back to SMF_FOLDER and retry.
+    if (strcmp(smfCurrentDir, SMF_FOLDER) != 0) {
+      strlcpy(smfCurrentDir, SMF_FOLDER, sizeof(smfCurrentDir));
+      root = SD.open(smfCurrentDir);
+      if (!root || !root.isDirectory()) {
+        if (root) root.close();
+        return;
+      }
+    } else {
+      return;
+    }
+  }
+
+  // Synthetic parent entry when inside a subfolder.
+  if (strcmp(smfCurrentDir, SMF_FOLDER) != 0 && smfPlaylistCount < SMF_MAX_FILES) {
+    strlcpy(smfPlaylist[smfPlaylistCount], "..", PLAYLIST_PATH_MAX);
+    smfPlaylistCount++;
   }
 
   while (smfPlaylistCount < SMF_MAX_FILES) {
     File entry = root.openNextFile();
     if (!entry) break;
-    if (!entry.isDirectory()) {
-      const char* name = entry.name();
-      if (name && (nameHasExt(name, ".mid") || nameHasExt(name, ".smf"))) {
-        // snprintf into a fixed-size cell — no heap allocation, no temporary
-        // strings. If the path is too long it gets truncated rather than
-        // overflowing.
+    const char* name = entry.name();
+    if (name && name[0] != '.') {
+      if (entry.isDirectory()) {
+        // Trailing slash marks the entry as a directory for the touch /
+        // sort / draw paths.
         snprintf(smfPlaylist[smfPlaylistCount], PLAYLIST_PATH_MAX,
-                 "%s/%s", SMF_FOLDER, name);
+                 "%s/%s/", smfCurrentDir, name);
+        smfPlaylistCount++;
+      } else if (nameHasExt(name, ".mid") || nameHasExt(name, ".smf")) {
+        snprintf(smfPlaylist[smfPlaylistCount], PLAYLIST_PATH_MAX,
+                 "%s/%s", smfCurrentDir, name);
         smfPlaylistCount++;
       }
     }
@@ -4163,10 +4364,17 @@ static void scanSmfFiles() {
   }
   root.close();
 
-  if (smfPlaylistCount > 0) {
-    int target = smfCurrentTrack;
-    if (target >= smfPlaylistCount) target = smfPlaylistCount - 1;
-    loadSmfTrack(target);
+  if (smfPlaylistCount > 1) {
+    qsort(smfPlaylist, smfPlaylistCount, PLAYLIST_PATH_MAX, playlistEntryCmp);
+  }
+
+  // Auto-load only if the previously selected slot still points to a file.
+  // After folder navigation smfCurrentTrack is reset to -1, so we won't
+  // accidentally try to "play" a directory entry.
+  if (smfPlaylistCount > 0 && smfCurrentTrack >= 0 &&
+      smfCurrentTrack < smfPlaylistCount &&
+      entryIsFile(smfPlaylist[smfCurrentTrack])) {
+    loadSmfTrack(smfCurrentTrack);
   }
 }
 
@@ -4373,20 +4581,40 @@ static void scanMp3Files() {
   mp3ListScroll = 0;
   if (!ensureStorage()) return;
 
-  File root = SD.open(MP3_FOLDER);
+  if (mp3CurrentDir[0] == '\0') strlcpy(mp3CurrentDir, MP3_FOLDER, sizeof(mp3CurrentDir));
+
+  File root = SD.open(mp3CurrentDir);
   if (!root || !root.isDirectory()) {
     if (root) root.close();
-    return;
+    if (strcmp(mp3CurrentDir, MP3_FOLDER) != 0) {
+      strlcpy(mp3CurrentDir, MP3_FOLDER, sizeof(mp3CurrentDir));
+      root = SD.open(mp3CurrentDir);
+      if (!root || !root.isDirectory()) {
+        if (root) root.close();
+        return;
+      }
+    } else {
+      return;
+    }
+  }
+
+  if (strcmp(mp3CurrentDir, MP3_FOLDER) != 0 && mp3PlaylistCount < MP3_MAX_FILES) {
+    strlcpy(mp3Playlist[mp3PlaylistCount], "..", PLAYLIST_PATH_MAX);
+    mp3PlaylistCount++;
   }
 
   while (mp3PlaylistCount < MP3_MAX_FILES) {
     File entry = root.openNextFile();
     if (!entry) break;
-    if (!entry.isDirectory()) {
-      const char* name = entry.name();
-      if (name && nameHasExt(name, ".mp3")) {
+    const char* name = entry.name();
+    if (name && name[0] != '.') {
+      if (entry.isDirectory()) {
         snprintf(mp3Playlist[mp3PlaylistCount], PLAYLIST_PATH_MAX,
-                 "%s/%s", MP3_FOLDER, name);
+                 "%s/%s/", mp3CurrentDir, name);
+        mp3PlaylistCount++;
+      } else if (nameHasExt(name, ".mp3")) {
+        snprintf(mp3Playlist[mp3PlaylistCount], PLAYLIST_PATH_MAX,
+                 "%s/%s", mp3CurrentDir, name);
         mp3PlaylistCount++;
       }
     }
@@ -4394,14 +4622,20 @@ static void scanMp3Files() {
   }
   root.close();
 
-  if (mp3PlaylistCount > 0) {
-    int idx = mp3CurrentTrack;
-    if (idx >= mp3PlaylistCount) idx = mp3PlaylistCount - 1;
-    const char* path = mp3Playlist[idx];
+  if (mp3PlaylistCount > 1) {
+    qsort(mp3Playlist, mp3PlaylistCount, PLAYLIST_PATH_MAX, playlistEntryCmp);
+  }
+
+  if (mp3PlaylistCount > 0 && mp3CurrentTrack >= 0 &&
+      mp3CurrentTrack < mp3PlaylistCount &&
+      entryIsFile(mp3Playlist[mp3CurrentTrack])) {
+    const char* path = mp3Playlist[mp3CurrentTrack];
     const char* slash = strrchr(path, '/');
     const char* name = slash ? slash + 1 : path;
     strncpy(mp3CurrentName, name, sizeof(mp3CurrentName) - 1);
     mp3CurrentName[sizeof(mp3CurrentName) - 1] = '\0';
+  } else {
+    mp3CurrentName[0] = '\0';
   }
 }
 
@@ -4510,6 +4744,18 @@ static void processMp3() {
 
 static void handleSmfTouch(int x, int y) {
   if (smfPlaying) return;
+  const int lineH = 44;
+  int visible = (smfListArea.h - 76) / lineH;
+  if (visible < 1) visible = 1;
+  int pageStep = max(1, visible - 1);
+  int maxScroll = max(0, smfPlaylistCount - visible);
+  if (hit(smfListPageUpBtn, x, y)) {
+    if (smfListScroll > 0) {
+      smfListScroll = max(0, smfListScroll - pageStep);
+      needFullRedraw = true;
+    }
+    return;
+  }
   if (hit(smfListUpBtn, x, y)) {
     if (smfListScroll > 0) {
       smfListScroll--;
@@ -4518,27 +4764,59 @@ static void handleSmfTouch(int x, int y) {
     return;
   }
   if (hit(smfListDownBtn, x, y)) {
-    int lineH = 30;
-    int visible = (smfListArea.h - 60) / lineH;
-    int maxScroll = max(0, smfPlaylistCount - visible);
     if (smfListScroll < maxScroll) {
       smfListScroll++;
       needFullRedraw = true;
     }
     return;
   }
+  if (hit(smfListPageDownBtn, x, y)) {
+    if (smfListScroll < maxScroll) {
+      smfListScroll = min(maxScroll, smfListScroll + pageStep);
+      needFullRedraw = true;
+    }
+    return;
+  }
   if (hit(smfListArea, x, y)) {
-    int top = smfListArea.y + 58;
-    int lineH = 30;
+    int top = smfListArea.y + 76;
     int idx = smfListScroll + ((y - top) / lineH);
     if (y >= top && idx >= 0 && idx < smfPlaylistCount) {
-      loadSmfTrack(idx);
-      needFullRedraw = true;
+      const char* path = smfPlaylist[idx];
+      if (entryIsParent(path)) {
+        playlistGoUp(smfCurrentDir, SMF_FOLDER);
+        smfCurrentTrack = -1;
+        scanSmfFiles();
+        needFullRedraw = true;
+      } else if (entryIsDir(path)) {
+        // Drop the trailing slash so the value matches what SD.open() expects.
+        strlcpy(smfCurrentDir, path, sizeof(smfCurrentDir));
+        size_t n = strlen(smfCurrentDir);
+        if (n > 0 && smfCurrentDir[n - 1] == '/') smfCurrentDir[n - 1] = '\0';
+        smfCurrentTrack = -1;
+        scanSmfFiles();
+        needFullRedraw = true;
+      } else {
+        loadSmfTrack(idx);
+        needFullRedraw = true;
+      }
     }
   }
 }
 
 static void handleMp3Touch(int x, int y) {
+  const int lineH = 44;
+  int visible = (mp3ListArea.h - 76) / lineH;
+  if (visible < 1) visible = 1;
+  int pageStep = max(1, visible - 1);
+  int maxScroll = max(0, mp3PlaylistCount - visible);
+  if (hit(mp3ListPageUpBtn, x, y)) {
+    if (mp3ListScroll > 0) {
+      mp3ListScroll = max(0, mp3ListScroll - pageStep);
+      mp3StaticDirty = true;
+      needPartialUpdate = true;
+    }
+    return;
+  }
   if (hit(mp3ListUpBtn, x, y)) {
     if (mp3ListScroll > 0) {
       mp3ListScroll--;
@@ -4548,9 +4826,6 @@ static void handleMp3Touch(int x, int y) {
     return;
   }
   if (hit(mp3ListDownBtn, x, y)) {
-    int lineH = 34;
-    int visible = (mp3ListArea.h - 56) / lineH;
-    int maxScroll = max(0, mp3PlaylistCount - visible);
     if (mp3ListScroll < maxScroll) {
       mp3ListScroll++;
       mp3StaticDirty = true;
@@ -4558,13 +4833,35 @@ static void handleMp3Touch(int x, int y) {
     }
     return;
   }
+  if (hit(mp3ListPageDownBtn, x, y)) {
+    if (mp3ListScroll < maxScroll) {
+      mp3ListScroll = min(maxScroll, mp3ListScroll + pageStep);
+      mp3StaticDirty = true;
+      needPartialUpdate = true;
+    }
+    return;
+  }
   if (hit(mp3ListArea, x, y)) {
-    int top = mp3ListArea.y + 58;
-    int lineH = 34;
+    int top = mp3ListArea.y + 76;
     int idx = mp3ListScroll + ((y - top) / lineH);
     if (y >= top && idx >= 0 && idx < mp3PlaylistCount) {
-      startMp3Track(idx);
-      needFullRedraw = true;
+      const char* path = mp3Playlist[idx];
+      if (entryIsParent(path)) {
+        playlistGoUp(mp3CurrentDir, MP3_FOLDER);
+        mp3CurrentTrack = -1;
+        scanMp3Files();
+        needFullRedraw = true;
+      } else if (entryIsDir(path)) {
+        strlcpy(mp3CurrentDir, path, sizeof(mp3CurrentDir));
+        size_t n = strlen(mp3CurrentDir);
+        if (n > 0 && mp3CurrentDir[n - 1] == '/') mp3CurrentDir[n - 1] = '\0';
+        mp3CurrentTrack = -1;
+        scanMp3Files();
+        needFullRedraw = true;
+      } else {
+        startMp3Track(idx);
+        needFullRedraw = true;
+      }
     }
   }
 }
