@@ -272,10 +272,13 @@ static constexpr const char* SMF_FOLDER = "/smf";
 // blocks and allocated new ones at fresh addresses, eventually leaving only
 // holes too small for a contiguous allocation, which manifested as a crash
 // hours into a session.
-static const int   SMF_MAX_FILES     = 256;
+static const int   SMF_MAX_FILES     = 1024;
 static const int   PLAYLIST_PATH_MAX = 128;  // "/smf/" + filename + NUL
 static MD_MIDIFile smf;
-static char        smfPlaylist[SMF_MAX_FILES][PLAYLIST_PATH_MAX];
+// Allocated lazily in PSRAM on the first scan (1024 × 128 = 128 KB per
+// playlist would not fit in internal DRAM). Holds only the currently
+// browsed directory; re-filled on every folder navigation.
+static char        (*smfPlaylist)[PLAYLIST_PATH_MAX] = nullptr;
 static int         smfPlaylistCount = 0;
 static int smfCurrentTrack = 0;
 static int smfListScroll = 0;
@@ -299,8 +302,8 @@ static char smfCurrentName[128] = {};
 
 // ==== MP3 Player ====
 static constexpr const char* MP3_FOLDER = "/mp3";
-static const int MP3_MAX_FILES = 256;
-static char      mp3Playlist[MP3_MAX_FILES][PLAYLIST_PATH_MAX];
+static const int MP3_MAX_FILES = 1024;
+static char      (*mp3Playlist)[PLAYLIST_PATH_MAX] = nullptr;  // PSRAM, see smfPlaylist
 static int       mp3PlaylistCount = 0;
 static int mp3CurrentTrack = 0;
 static int mp3ListScroll = 0;
@@ -4314,10 +4317,36 @@ static void playlistGoUp(char* dir, const char* root) {
   }
 }
 
+// Reserve the playlist buffer in PSRAM on first use. Returns false if PSRAM
+// allocation fails — callers must skip scanning in that case rather than
+// dereferencing a null pointer.
+static bool ensureSmfPlaylistBuffer() {
+  if (smfPlaylist) return true;
+  size_t bytes = (size_t)SMF_MAX_FILES * PLAYLIST_PATH_MAX;
+  smfPlaylist = (char(*)[PLAYLIST_PATH_MAX])heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+  if (!smfPlaylist) {
+    Serial.printf("[mem] SMF playlist PSRAM alloc failed (%u bytes)\n", (unsigned)bytes);
+    return false;
+  }
+  return true;
+}
+
+static bool ensureMp3PlaylistBuffer() {
+  if (mp3Playlist) return true;
+  size_t bytes = (size_t)MP3_MAX_FILES * PLAYLIST_PATH_MAX;
+  mp3Playlist = (char(*)[PLAYLIST_PATH_MAX])heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+  if (!mp3Playlist) {
+    Serial.printf("[mem] MP3 playlist PSRAM alloc failed (%u bytes)\n", (unsigned)bytes);
+    return false;
+  }
+  return true;
+}
+
 static void scanSmfFiles() {
   smfPlaylistCount = 0;
   smfListScroll = 0;
   if (!ensureStorage()) return;
+  if (!ensureSmfPlaylistBuffer()) return;
 
   if (smfCurrentDir[0] == '\0') strlcpy(smfCurrentDir, SMF_FOLDER, sizeof(smfCurrentDir));
 
@@ -4580,6 +4609,7 @@ static void scanMp3Files() {
   mp3PlaylistCount = 0;
   mp3ListScroll = 0;
   if (!ensureStorage()) return;
+  if (!ensureMp3PlaylistBuffer()) return;
 
   if (mp3CurrentDir[0] == '\0') strlcpy(mp3CurrentDir, MP3_FOLDER, sizeof(mp3CurrentDir));
 
