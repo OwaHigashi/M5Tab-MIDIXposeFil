@@ -422,7 +422,14 @@ http://www.stephenhobley.com/blog/2011/03/14/the-last-darned-midi-interface-ill-
  16 tracks is the maximum available to any MIDI device. Fewer tracks may not allow many MIDI
  files to be played, while a minority of SMF may require more tracks.
  */
-#define MIDI_MAX_TRACKS 16
+// 16 -> 32: format 1 の SMF は 16 トラックを超えるものがある（例:
+// Just_the_two_of_us.mid = format1/17 トラックで E_TRACKS により再生不可
+// だった）。MD_MFTrack はファイルを都度読む方式で 1 トラック約 30 バイト
+// しか持たないため、32 にしても増分は約 0.5KB で ESP32 の RAM に対し無視
+// できる。この値はヘッダで定義し全 translation unit で一致させる必要がある
+// （.ino 側の #define では _track[] 配列サイズがライブラリ .cpp とずれて
+// クラスレイアウトが不一致になる）。
+#define MIDI_MAX_TRACKS 32
 #endif
 
 #ifndef TRACK_PRIORITY
