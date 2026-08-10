@@ -316,7 +316,34 @@ static uint32_t mp3LastAnimMs = 0;
 static bool mp3StaticDirty = true;
 static bool mp3VisualDirty = true;
 static AudioOutputM5Speaker mp3Out(&M5.Speaker, 0);
-static AudioGeneratorMP3 mp3Decoder;
+// Statically preallocate libmad's working buffers so AudioGeneratorMP3::begin()
+// never touches the heap. Without this, each track change malloc()s and free()s
+// four sizeable blocks (input buffer + mad_stream/frame/synth, the last a few
+// KB) inside the library — a slow internal-DRAM fragmentation trap over a long
+// auto-advancing playlist, the same failure mode we already fixed for playlists.
+// The 8-arg constructor casts each buffer directly, so they must be aligned for
+// structs that hold pointers / fixed-point words; alignas(8) is safe.
+alignas(8) static uint8_t mp3MadBuff [AudioGeneratorMP3::preAllocBuffSize()];
+alignas(8) static uint8_t mp3MadStream[AudioGeneratorMP3::preAllocStreamSize()];
+alignas(8) static uint8_t mp3MadFrame [AudioGeneratorMP3::preAllocFrameSize()];
+alignas(8) static uint8_t mp3MadSynth [AudioGeneratorMP3::preAllocSynthSize()];
+static AudioGeneratorMP3 mp3Decoder(
+    mp3MadBuff,   sizeof(mp3MadBuff),
+    mp3MadStream, sizeof(mp3MadStream),
+    mp3MadFrame,  sizeof(mp3MadFrame),
+    mp3MadSynth,  sizeof(mp3MadSynth));
+// Reusable static backing for the MP3 source objects so a track change never
+// touches the heap either. AudioFileSourceFS holds only an FS pointer + fs::File
+// and is re-armed per track with open()/close(). AudioFileSourceID3 rescans ID3
+// tags ONLY when freshly constructed (its `checked` flag resets in the ctor,
+// never in close()), so a plain reused instance would lose title/artist on every
+// track after the first — instead we placement-new it into static storage each
+// track to re-arm metadata parsing with zero allocation. Its destructor is empty
+// and it owns nothing, so nulling the pointer is a sufficient teardown.
+// mp3File / mp3Id3 stay pointers (nullptr when idle) so every downstream
+// null-check keeps working unchanged.
+static AudioFileSourceFS mp3FileStorage(SD);
+alignas(AudioFileSourceID3) static uint8_t mp3Id3Storage[sizeof(AudioFileSourceID3)];
 static AudioFileSourceFS* mp3File = nullptr;
 static AudioFileSourceID3* mp3Id3 = nullptr;
 static char mp3Title[128] = {};
@@ -4715,19 +4742,14 @@ static bool startMp3Track(int index) {
   mp3Title[0] = '\0';
   mp3Artist[0] = '\0';
 
-  mp3File = new (std::nothrow) AudioFileSourceFS(SD, path);
-  if (mp3File == nullptr) {
-    Serial.println("[MP3] AudioFileSourceFS alloc failed");
+  if (!mp3FileStorage.open(path)) {
+    Serial.printf("[MP3] open failed for %s\n", path);
     return false;
   }
-  mp3Id3 = new (std::nothrow) AudioFileSourceID3(mp3File);
-  if (mp3Id3 == nullptr) {
-    Serial.println("[MP3] AudioFileSourceID3 alloc failed");
-    mp3File->close();
-    delete mp3File;
-    mp3File = nullptr;
-    return false;
-  }
+  mp3File = &mp3FileStorage;
+  // Placement-new into static storage: no heap, but re-runs the ctor so this
+  // track's ID3 tag scan is re-armed. Cannot fail (buffer is sized/aligned).
+  mp3Id3 = new (mp3Id3Storage) AudioFileSourceID3(mp3File);
   mp3Id3->RegisterMetadataCB(mp3MetadataCallback, nullptr);
   M5.Speaker.setVolume(mp3Volume);
   mp3Playing = mp3Decoder.begin(mp3Id3, &mp3Out);
@@ -4736,10 +4758,8 @@ static bool startMp3Track(int index) {
     // Mirror stopMp3()'s cleanup path so we don't leave dangling pointers
     // attached to a half-initialised decoder.
     mp3Id3->close();
-    delete mp3Id3;
     mp3Id3 = nullptr;
     mp3File->close();
-    delete mp3File;
     mp3File = nullptr;
     mp3PlaybackStartMs = 0;
     mp3StaticDirty = true;
@@ -4761,12 +4781,10 @@ static void stopMp3() {
   }
   if (mp3Id3 != nullptr) {
     mp3Id3->close();
-    delete mp3Id3;
     mp3Id3 = nullptr;
   }
   if (mp3File != nullptr) {
     mp3File->close();
-    delete mp3File;
     mp3File = nullptr;
   }
   mp3Playing = false;
