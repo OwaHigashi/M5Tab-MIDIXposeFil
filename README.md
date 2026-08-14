@@ -63,8 +63,10 @@ MIDI IN → FILTER → MAPPER → Transpose → MIDI OUT
 条件にマッチした MIDI メッセージを破棄する。1 ルールあたり次を指定する:
 
 - `EN/DIS` (個別有効化)
-- `Type` (NoteOff / NoteOn / KeyPrs / PrgChg / CtrlChg / ChPrs / Bend / SysEx / MTC / SongPos / SongSel / TuneReq / Clock / Start / Cont / Stop / ActSn / Reset)
+- `Type` (NoteOff / NoteOn / KeyPrs / PrgChg / CtrlChg / ChPrs / Bend / SysEx / MTC / SongPos / SongSel / TuneReq / Clock / Start / Cont / Stop / ActSn / Reset / AnyMsg)
 - `Ch` (`ALL` / `Ch1..Ch16`)
+
+`Type = AnyMsg` は全チャンネルメッセージ (NoteOn/Off, CC, PrgChg, Bend, Pressure) にマッチする疑似 Type。`Ch` と組み合わせると「そのチャンネルを丸ごと遮断」できる。
 
 #### MAPPER
 
@@ -72,10 +74,19 @@ MIDI IN → FILTER → MAPPER → Transpose → MIDI OUT
 
 | 項目 | 意味 |
 |---|---|
-| `Type`        | メッセージ種別 |
+| `Type`        | メッセージ種別 (SOURCE 側は `AnyMsg` = 全チャンネルメッセージも選択可) |
 | `Ch`          | チャンネル (送信側は `KEEP` で「元のまま」) |
-| `Data1`       | 1 バイト目の値 (`ANY`/`KEEP` で「条件不問」「元のまま」) |
-| `Min` / `Max` | 値レンジ。`Min/Max` を別レンジにすればスケーリング |
+| `Data1`       | 1 バイト目の値 (`ANY`/`KEEP` で「条件不問」「元のまま」)。Type が CtrlChg のときは代表的な CC に縮約名を併記 (`64 Damper` / `66 Sost` / `67 Soft` / `7 Vol` / `11 Expr` など)。キーパッド直接入力中も入力値に対応する CC 名がライブ表示される |
+| `Min` / `Max` | 値レンジ。`Min/Max` を別レンジにすればスケーリング。**DESTINATION 側は `Min > Max` の逆転レンジも可** (値の反転) |
+
+#### MAPPER の定番レシピ
+
+- **ペダル極性の反転** — サスティン (ダンパー) ペダル等の Up/Down が逆になっているキーボード対策。
+  `SOURCE: CtrlChg / Ch ALL / Data1 64 / Min 0 / Max 127` → `DESTINATION: CtrlChg / Ch KEEP / Data1 KEEP / Min 127 / Max 0`。
+  DESTINATION の `Min > Max` 逆転レンジで値が `v → 127 − v` に反転される。Data1 を変えれば Soft (67) / Sostenuto (66) など他のペダル CC にも同様に使える。
+- **チャンネル振り替え** — あるチャンネルに届く信号を丸ごと別チャンネルへ回す。
+  `SOURCE: Type AnyMsg / Ch <元 Ch>` → `DESTINATION: Ch <先 Ch>`。
+  `AnyMsg` を選ぶと DESTINATION は `Ch` 以外が `KEEP` 固定になり、メッセージ内容 (Note / CC / PrgChg / Bend …) はそのまま、チャンネルニブルだけが書き換わる。`SOURCE Ch = ALL` なら全チャンネルを 1 チャンネルへ集約。
 
 ### 3. PLAY — 再生 / 音源切替
 

@@ -155,6 +155,11 @@ enum MidiMessageKind {
   MIDI_KIND_STOP,
   MIDI_KIND_ACTIVE_SENSE,
   MIDI_KIND_SYSTEM_RESET,
+  // 疑似 Type: 全チャンネルメッセージ (0x8n..0xEn) にマッチ。FILTER では
+  // 「チャンネル丸ごと遮断」、MAPPER の Source では「チャンネル振り替え
+  // (内容はそのまま、Ch だけ書換)」ルールになる。実メッセージの kind が
+  // この値になることはない (getMidiKindFromStatus は返さない)。
+  MIDI_KIND_ANY,
   MIDI_KIND_COUNT
 };
 struct MidiFilterRule {
@@ -1962,6 +1967,16 @@ static bool prepareMidiKeypad(CyclerKind k) {
   }
 }
 
+// キーパッドで編集中の Data1 が属するメッセージ種別 (Data1 以外は COUNT)。
+// CtrlChg の Data1 入力中に CC 名をライブ表示するために使う。
+static MidiMessageKind getMidiKeypadDataKind(void) {
+  if (midiManagePage != MIDI_PAGE_MAPPER) return MIDI_KIND_COUNT;
+  const MidiMapperRule& r = midiMapperRules[midiSelectedMapperRule];
+  if (g_midiKeypadTarget == CY_M_SRC_DATA1) return r.srcKind;
+  if (g_midiKeypadTarget == CY_M_DST_DATA1) return r.dstKind;
+  return MIDI_KIND_COUNT;
+}
+
 static void openMidiKeypad(CyclerKind k) {
   if (!prepareMidiKeypad(k)) return;
   g_midiKeypadActive = true;
@@ -2000,8 +2015,9 @@ static void applyMidiKeypadValue(void) {
     case CY_M_DST_DATA1: r.dstData1   = g_midiKeypadUseSpecial ? -1 : (int16_t)rawValue; break;
     case CY_M_SRC_MIN:   r.srcMin     = (int16_t)rawValue; if (r.srcMax < r.srcMin) r.srcMax = r.srcMin; break;
     case CY_M_SRC_MAX:   r.srcMax     = (int16_t)rawValue; if (r.srcMin > r.srcMax) r.srcMin = r.srcMax; break;
-    case CY_M_DST_MIN:   r.dstMin     = (int16_t)rawValue; if (r.dstMax < r.dstMin) r.dstMax = r.dstMin; break;
-    case CY_M_DST_MAX:   r.dstMax     = (int16_t)rawValue; if (r.dstMin > r.dstMax) r.dstMin = r.dstMax; break;
+    // dst は Min > Max (逆転レンジ = 値反転) を許可するので相互クランプしない。
+    case CY_M_DST_MIN:   r.dstMin     = (int16_t)rawValue; break;
+    case CY_M_DST_MAX:   r.dstMax     = (int16_t)rawValue; break;
     default: break;
   }
   closeMidiKeypad();
@@ -2075,6 +2091,19 @@ static void drawMidiKeypadOverlay(void) {
   M5.Display.setTextColor(COL_VALUE, COL_BG);
   M5.Display.drawString(displayText, g_midiKeypadDisplay.x + g_midiKeypadDisplay.w - 18,
                         g_midiKeypadDisplay.y + g_midiKeypadDisplay.h / 2);
+
+  // CtrlChg の Data1 編集中は、入力中の番号に対応する縮約 CC 名を
+  // 表示ボックス左側にライブ表示する (64 → Damper 等)。
+  if (!g_midiKeypadUseSpecial && getMidiKeypadDataKind() == MIDI_KIND_CONTROL_CHANGE) {
+    const char* ccName = getCcShortName(parseMidiKeypadDigits());
+    if (ccName) {
+      M5.Display.setTextDatum(middle_left);
+      M5.Display.setFont(FONT_SMALL);
+      M5.Display.setTextColor(COL_ACCENT, COL_BG);
+      M5.Display.drawString(ccName, g_midiKeypadDisplay.x + 18,
+                            g_midiKeypadDisplay.y + g_midiKeypadDisplay.h / 2);
+    }
+  }
 
   M5.Display.setTextDatum(top_left);
   M5.Display.setFont(FONT_TINY);
@@ -2249,6 +2278,9 @@ static void drawMidiManage() {
     Rect colSrc = { sideX + 14,           colY, colW, colH };
     Rect colDst = { sideX + 14 + colW + 28, colY, colW, colH };
 
+    // srcKind == AnyMsg のルールはチャンネル振り替え専用: DEST 側は Ch 以外
+    // 編集不可 (Type は KEEP 固定、Data1/Min/Max は意味を持たない)。
+    const bool channelOnly = (r.srcKind == MIDI_KIND_ANY);
     auto drawCol = [&](const Rect& col, const char* head, MidiMessageKind kind,
                        int8_t channel, int16_t data1, int16_t minV, int16_t maxV,
                        CyclerKind cyType, CyclerKind cyCh, CyclerKind cyD1, CyclerKind cyMn, CyclerKind cyMx,
@@ -2263,7 +2295,15 @@ static void drawMidiManage() {
       M5.Display.drawString(head, col.x + 10, col.y + 8);
       M5.Display.setFont(FONT_TINY);
       M5.Display.setTextColor(COL_MUTED);
-      M5.Display.drawString(isDst ? "rewrite before MIDI out" : "match incoming MIDI", col.x + 10, col.y + 26);
+      const char* subCaption;
+      if (isDst) {
+        if (channelOnly)         subCaption = "channel redirect only";
+        else if (minV > maxV)    subCaption = "Min > Max: value inverted";
+        else                     subCaption = "rewrite before MIDI out";
+      } else {
+        subCaption = channelOnly ? "any channel message" : "match incoming MIDI";
+      }
+      M5.Display.drawString(subCaption, col.x + 10, col.y + 26);
 
       const int rowGap = 14;
       const int innerPad = 12;
@@ -2280,16 +2320,19 @@ static void drawMidiManage() {
       Rect minR  = { col.x + innerPad, chR.y + pairH + rowGap, pairW, pairH };
       Rect maxR  = { minR.x + pairW + pairGap, minR.y, pairW, pairH };
 
-      drawCycler(cyType, typeR, "Type",  getMidiKindLabel(kind), true);
+      bool typeEditable = !(isDst && channelOnly);
+      drawCycler(cyType, typeR, "Type",
+                 (isDst && channelOnly) ? "KEEP" : getMidiKindLabel(kind), typeEditable);
       bool chEditable = midiKindHasChannel(kind);
       drawCycler(cyCh,   chR,   "Ch",    getChannelLabel(channel, isDst), chEditable);
-      bool d1Editable = midiKindSupportsData1(kind);
-      drawCycler(cyD1,   d1R,   "Data1", getData1Label(data1, isDst), d1Editable);
+      bool d1Editable = midiKindSupportsData1(kind) && !channelOnly;
+      drawCycler(cyD1,   d1R,   "Data1", getData1LabelForKind(kind, data1, isDst), d1Editable);
       char mn[8], mx[8];
       snprintf(mn, sizeof(mn), "%d", minV);
       snprintf(mx, sizeof(mx), "%d", maxV);
-      drawCycler(cyMn,   minR,  "Min",   mn, true);
-      drawCycler(cyMx,   maxR,  "Max",   mx, true);
+      bool rangeEditable = !channelOnly;
+      drawCycler(cyMn,   minR,  "Min",   mn, rangeEditable);
+      drawCycler(cyMx,   maxR,  "Max",   mx, rangeEditable);
     };
     drawCol(colSrc, "FROM (Source)", r.srcKind, r.srcChannel, r.srcData1, r.srcMin, r.srcMax,
             CY_M_SRC_TYPE, CY_M_SRC_CH, CY_M_SRC_DATA1, CY_M_SRC_MIN, CY_M_SRC_MAX, false);
@@ -2441,6 +2484,10 @@ static void processMidiManageTouch(const m5::Touch_Class::touch_detail_t& td) {
                              if (!midiKindHasChannel(r.srcKind)) r.srcChannel = -1;
                              if (!midiKindSupportsData1(r.srcKind)) r.srcData1 = -1;
                              r.srcMax = std::min((int)r.srcMax, getMidiValueMax(r.srcKind));
+                             // AnyMsg (チャンネル振り替え) は dst を KEEP に固定。
+                             // 離れたら dst も追従させて ANY が残らないようにする。
+                             if (r.srcKind == MIDI_KIND_ANY)      r.dstKind = MIDI_KIND_ANY;
+                             else if (r.dstKind == MIDI_KIND_ANY) r.dstKind = r.srcKind;
                              break;
         case CY_M_SRC_CH:    cycleChannelValue(r.srcChannel, delta); break;
         case CY_M_SRC_DATA1: cycleData1Value(r.srcData1, delta); break;
@@ -2451,18 +2498,17 @@ static void processMidiManageTouch(const m5::Touch_Class::touch_detail_t& td) {
                              if (r.srcMin > r.srcMax) r.srcMin = r.srcMax;
                              break;
         case CY_M_DST_TYPE:  cycleMidiKind(r.dstKind, delta);
+                             // AnyMsg は Source 専用の疑似 Type なので読み飛ばす。
+                             if (r.dstKind == MIDI_KIND_ANY) cycleMidiKind(r.dstKind, delta);
                              if (!midiKindHasChannel(r.dstKind)) r.dstChannel = -1;
                              if (!midiKindSupportsData1(r.dstKind)) r.dstData1 = -1;
                              r.dstMax = std::min((int)r.dstMax, getMidiValueMax(r.dstKind));
                              break;
         case CY_M_DST_CH:    cycleChannelValue(r.dstChannel, delta); break;
         case CY_M_DST_DATA1: cycleData1Value(r.dstData1, delta); break;
-        case CY_M_DST_MIN:   cycleClampedValue(r.dstMin, delta, maxD);
-                             if (r.dstMax < r.dstMin) r.dstMax = r.dstMin;
-                             break;
-        case CY_M_DST_MAX:   cycleClampedValue(r.dstMax, delta, maxD);
-                             if (r.dstMin > r.dstMax) r.dstMin = r.dstMax;
-                             break;
+        // dst は Min > Max (逆転レンジ = 値反転) を許可するので相互クランプしない。
+        case CY_M_DST_MIN:   cycleClampedValue(r.dstMin, delta, maxD); break;
+        case CY_M_DST_MAX:   cycleClampedValue(r.dstMax, delta, maxD); break;
         default: break;
       }
     }
@@ -5108,14 +5154,14 @@ static const char* getMidiKindLabel(MidiMessageKind kind) {
   static const char* labels[MIDI_KIND_COUNT] = {
     "NoteOff","NoteOn","KeyPrs","PrgChg","CtrlChg","ChPrs","Bend",
     "SysEx","MTC","SongPos","SongSel","TuneReq",
-    "Clock","Start","Cont","Stop","ActSn","Reset"
+    "Clock","Start","Cont","Stop","ActSn","Reset","AnyMsg"
   };
   if (kind < 0 || kind >= MIDI_KIND_COUNT) return "Unknown";
   return labels[kind];
 }
 
 static bool midiKindHasChannel(MidiMessageKind kind) {
-  return kind <= MIDI_KIND_PITCH_BEND;
+  return kind <= MIDI_KIND_PITCH_BEND || kind == MIDI_KIND_ANY;
 }
 
 static uint8_t getMidiStatusForKind(MidiMessageKind kind, uint8_t channel) {
@@ -5224,7 +5270,8 @@ static int mapMidiValueRange(int value, int srcMin, int srcMax, int dstMin, int 
   dstMin = clampInt(dstMin, 0, 16383);
   dstMax = clampInt(dstMax, 0, 16383);
   if (srcMax < srcMin) srcMax = srcMin;
-  if (dstMax < dstMin) dstMax = dstMin;
+  // dstMax < dstMin は許可: 出力レンジを逆向きに適用して値を反転させる。
+  // サスティンペダル等の極性反転ルール (0..127 -> 127..0) がこれで書ける。
   value = clampInt(value, srcMin, srcMax);
   if (srcMax == srcMin) return dstMin;
   long num = (long)(value - srcMin) * (dstMax - dstMin);
@@ -5246,9 +5293,76 @@ static const char* getData1Label(int16_t data1, bool keepLabel) {
   return label;
 }
 
+// 縮約 CC 名。CtrlChg の Data1 表示に番号と併記して、64=ダンパー等を
+// 数字を覚えていなくても識別できるようにする。代表的な CC のみ。
+static const char* getCcShortName(int cc) {
+  switch (cc) {
+    case 0:   return "BankH";
+    case 1:   return "Mod";
+    case 2:   return "Breath";
+    case 4:   return "Foot";
+    case 5:   return "PortaT";
+    case 6:   return "DataH";
+    case 7:   return "Vol";
+    case 8:   return "Balnc";
+    case 10:  return "Pan";
+    case 11:  return "Expr";
+    case 32:  return "BankL";
+    case 38:  return "DataL";
+    case 64:  return "Damper";   // Sustain / Damper pedal
+    case 65:  return "Porta";
+    case 66:  return "Sost";     // Sostenuto pedal
+    case 67:  return "Soft";     // Soft pedal
+    case 68:  return "Legato";
+    case 69:  return "Hold2";
+    case 71:  return "Reso";
+    case 72:  return "RelT";
+    case 73:  return "AtkT";
+    case 74:  return "Cutoff";
+    case 84:  return "PortaC";
+    case 91:  return "Rev";
+    case 92:  return "Trem";
+    case 93:  return "Chorus";
+    case 94:  return "Detune";
+    case 95:  return "Phaser";
+    case 96:  return "DataInc";
+    case 97:  return "DataDec";
+    case 98:  return "NRPN-L";
+    case 99:  return "NRPN-H";
+    case 100: return "RPN-L";
+    case 101: return "RPN-H";
+    case 120: return "SndOff";
+    case 121: return "CtlRst";
+    case 122: return "Local";
+    case 123: return "NotsOff";
+    case 124: return "OmniOff";
+    case 125: return "OmniOn";
+    case 126: return "Mono";
+    case 127: return "Poly";
+    default:  return nullptr;
+  }
+}
+
+// kind を見て CC なら「64 Damper」のように縮約名を併記する Data1 ラベル。
+static const char* getData1LabelForKind(MidiMessageKind kind, int16_t data1, bool keepLabel) {
+  static char label[16];
+  if (data1 < 0) return keepLabel ? "KEEP" : "ANY";
+  if (kind == MIDI_KIND_CONTROL_CHANGE) {
+    const char* name = getCcShortName(data1);
+    if (name) {
+      snprintf(label, sizeof(label), "%d %s", data1, name);
+      return label;
+    }
+  }
+  snprintf(label, sizeof(label), "%d", data1);
+  return label;
+}
+
 static bool midiFilterRuleMatches(const MidiFilterRule& rule, const MidiMessage& msg) {
   if (!rule.enabled) return false;
-  if (rule.kind != msg.kind) return false;
+  if (rule.kind == MIDI_KIND_ANY) {
+    if (!msg.hasChannel) return false;   // ANY は全チャンネルメッセージにマッチ
+  } else if (rule.kind != msg.kind) return false;
   if (rule.channel >= 0) {
     if (!msg.hasChannel) return false;
     if (rule.channel != msg.channel) return false;
@@ -5266,6 +5380,12 @@ static bool shouldAllowMidiMessage(const MidiMessage& msg) {
 
 static bool midiMapperRuleMatches(const MidiMapperRule& rule, const MidiMessage& msg) {
   if (!rule.enabled) return false;
+  if (rule.srcKind == MIDI_KIND_ANY) {
+    // チャンネル振り替えルール: kind/Data1/値レンジ条件は持たない。
+    if (!msg.hasChannel) return false;
+    if (rule.srcChannel >= 0 && rule.srcChannel != msg.channel) return false;
+    return true;
+  }
   if (rule.srcKind != msg.kind) return false;
   if (rule.srcChannel >= 0) {
     if (!msg.hasChannel) return false;
@@ -5278,6 +5398,17 @@ static bool midiMapperRuleMatches(const MidiMapperRule& rule, const MidiMessage&
 }
 
 static MidiMessage buildMappedMidiMessage(const MidiMapperRule& rule, const MidiMessage& srcMsg) {
+  // ANY (チャンネル振り替え) ルール: メッセージ内容はそのまま、ステータス
+  // バイトのチャンネルニブルだけを書き換える。kind ごとの再構築を通さない
+  // ので、どの種類のメッセージもバイト列そのままで振り替えられる。
+  if (rule.srcKind == MIDI_KIND_ANY || rule.dstKind == MIDI_KIND_ANY) {
+    MidiMessage redirected = srcMsg;
+    if (srcMsg.hasChannel && rule.dstChannel >= 0) {
+      redirected.channel  = rule.dstChannel;
+      redirected.bytes[0] = (uint8_t)((srcMsg.bytes[0] & 0xF0) | (rule.dstChannel & 0x0F));
+    }
+    return redirected;
+  }
   MidiMessage dstMsg = srcMsg;
   dstMsg.kind = rule.dstKind;
   dstMsg.hasChannel = midiKindHasChannel(rule.dstKind);
@@ -5401,14 +5532,20 @@ static void formatMidiFilterRuleSummary(const MidiFilterRule& rule, int index, c
 }
 
 static void formatMidiMapperRuleSummary(const MidiMapperRule& rule, int index, char* out, size_t outSize) {
-  char data1[8];
-  if (rule.srcData1 < 0) snprintf(data1, sizeof(data1), "ANY");
-  else snprintf(data1, sizeof(data1), "%d", rule.srcData1);
+  char data1[16];
+  snprintf(data1, sizeof(data1), "%s",
+           getData1LabelForKind(rule.srcKind, rule.srcData1, false));
+  // getChannelLabel() は静的バッファを返すので、同一 snprintf の引数として
+  // 2 回呼ぶと両方が後勝ちの値になる。呼ぶたびにローカルへ退避する。
+  char srcCh[8], dstCh[8];
+  snprintf(srcCh, sizeof(srcCh), "%s", getChannelLabel(rule.srcChannel, false));
+  snprintf(dstCh, sizeof(dstCh), "%s", getChannelLabel(rule.dstChannel, true));
+  const bool chanOnly = (rule.srcKind == MIDI_KIND_ANY || rule.dstKind == MIDI_KIND_ANY);
   snprintf(out, outSize, "%d - %s %s %s>%s %s",
            index + 1,
-           getMidiKindLabel(rule.srcKind), getChannelLabel(rule.srcChannel, false),
+           getMidiKindLabel(rule.srcKind), srcCh,
            data1,
-           getMidiKindLabel(rule.dstKind), getChannelLabel(rule.dstChannel, true));
+           chanOnly ? "KEEP" : getMidiKindLabel(rule.dstKind), dstCh);
 }
 
 // MIDI 出力 (FILTER → MAPPER → Transpose の最終出口で呼ばれる)
