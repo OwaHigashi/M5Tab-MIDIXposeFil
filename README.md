@@ -44,7 +44,7 @@ M5Stack Tab5 (ESP32-P4) を母艦にした MIDI ライブパフォーマンス�
 | サブモード | 用途 |
 |---|---|
 | **DIR.** (DIRECT)  | 12 ボタンの直接選択。-5..+6 / 0..+11 / -11..0 のレンジ切替 |
-| **KEY**            | メジャー / マイナー鍵盤からキー指定で転調値を決定 |
+| **KEY**            | メジャー / マイナー鍵盤からキー指定で転調値を決定。ツールバーの方向ボタンで `NORM` (長調は下=to C、短調は上=to Am) → `UP` (両方上へ) → `DOWN` (両方下へ) を巡回 |
 | **INST.** (INSTANT)| 0 / ±1 / ±2 / ±3 / ±5 をワンタップで呼び出す |
 | **SEQ.** (SEQUENCE)| 16 パターン × 6 ステップの転調列を切替再生 (SD 保存) |
 
@@ -76,7 +76,7 @@ MIDI IN → FILTER → MAPPER → Transpose → MIDI OUT
 |---|---|
 | `Type`        | メッセージ種別 (SOURCE 側は `AnyMsg` = 全チャンネルメッセージも選択可) |
 | `Ch`          | チャンネル (送信側は `KEEP` で「元のまま」) |
-| `Data1`       | 1 バイト目の値 (`ANY`/`KEEP` で「条件不問」「元のまま」)。Type が CtrlChg のときは代表的な CC に縮約名を併記 (`64 Damper` / `66 Sost` / `67 Soft` / `7 Vol` / `11 Expr` など)。キーパッド直接入力中も入力値に対応する CC 名がライブ表示される |
+| `Data1`       | 1 バイト目の値 (`ANY`/`KEEP` で「条件不問」「元のまま」)。番号に対応する名前を自動表示: CtrlChg → 縮約 CC 名 (`64 Damper` / `66 Sost` / `67 Soft` / `7 Vol` など、cycler の 2 行目に表示)、NoteOn/NoteOff/KeyPrs → 音名 (`60` → `C4`)、PrgChg → GM 音色名を列キャプションにフル表示 (`Prg 24: Acoustic Guitar Nylon`、Ch が Ch10 固定ならドラムキット名)。キーパッド直接入力中も入力値に対応する名前がライブ表示される |
 | `Min` / `Max` | 値レンジ。`Min/Max` を別レンジにすればスケーリング。**DESTINATION 側は `Min > Max` の逆転レンジも可** (値の反転) |
 
 #### MAPPER の定番レシピ

@@ -1340,6 +1340,27 @@ static void drawMidiInputSourceBtn() {
   drawRectBtn(midiInputSourceBtn, bg, COL_BTN_BDR, getMidiInputSourceLabel(), txt, FONT_MED);
 }
 
+// KEY モードの転調方向 3 状態。フラグ 2 個の組合せで表現する:
+//   NORM = (false,false) 長調は下へ (to C)、短調は上へ (to Am) — 従来の NORMAL
+//   UP   = (true, false) 長調・短調とも上へ
+//   DOWN = (false,true ) 長調・短調とも下へ
+// 従来の "KEY: UPPER" (true,true = 長調上・短調下) は廃止。config の
+// MajorUpperTranspose=ON からの起動は (true,false) なので UP 扱いになる。
+static const char* getKeyDirectionLabel() {
+  if (majorUpperTranspose) return "UP";
+  if (minorUpperTranspose) return "DOWN";
+  return "NORM";
+}
+static void cycleKeyDirection() {
+  if (!majorUpperTranspose && !minorUpperTranspose) {        // NORM → UP
+    majorUpperTranspose = true;  minorUpperTranspose = false;
+  } else if (majorUpperTranspose) {                          // UP → DOWN
+    majorUpperTranspose = false; minorUpperTranspose = true;
+  } else {                                                   // DOWN → NORM
+    majorUpperTranspose = false; minorUpperTranspose = false;
+  }
+}
+
 static void drawToolbar() {
   M5.Display.fillRect(toolbarArea.x, toolbarArea.y, toolbarArea.w, toolbarArea.h, COL_BG);
 
@@ -1358,7 +1379,7 @@ static void drawToolbar() {
     else if (transposeRange == RANGE_MINUS12_TO_0) rangeLabel = "-11 .. 0";
     else                                            rangeLabel = "-5 .. +6";
   } else if (currentMode == KEY_MODE) {
-    rangeLabel = majorUpperTranspose ? "KEY: UPPER" : "KEY: NORMAL";
+    rangeLabel = getKeyDirectionLabel();
   } else {
     rangeLabel = "--";
   }
@@ -1967,14 +1988,23 @@ static bool prepareMidiKeypad(CyclerKind k) {
   }
 }
 
-// キーパッドで編集中の Data1 が属するメッセージ種別 (Data1 以外は COUNT)。
-// CtrlChg の Data1 入力中に CC 名をライブ表示するために使う。
-static MidiMessageKind getMidiKeypadDataKind(void) {
-  if (midiManagePage != MIDI_PAGE_MAPPER) return MIDI_KIND_COUNT;
+// Data1 のキーパッド入力中、いま打ち込まれている番号に対応する名前を返す
+// (該当なしは nullptr)。CtrlChg → CC 名、Note 系 → 音名、PrgChg → GM 音色名
+// (ルールの Ch が Ch10 固定ならドラムキット名)。
+static const char* getMidiKeypadDataName(void) {
+  if (g_midiKeypadUseSpecial) return nullptr;
+  if (midiManagePage != MIDI_PAGE_MAPPER) return nullptr;
   const MidiMapperRule& r = midiMapperRules[midiSelectedMapperRule];
-  if (g_midiKeypadTarget == CY_M_SRC_DATA1) return r.srcKind;
-  if (g_midiKeypadTarget == CY_M_DST_DATA1) return r.dstKind;
-  return MIDI_KIND_COUNT;
+  MidiMessageKind kind;
+  int8_t ch;
+  if      (g_midiKeypadTarget == CY_M_SRC_DATA1) { kind = r.srcKind; ch = r.srcChannel; }
+  else if (g_midiKeypadTarget == CY_M_DST_DATA1) { kind = r.dstKind; ch = r.dstChannel; }
+  else return nullptr;
+  int v = parseMidiKeypadDigits();
+  if (v < 0 || v > 127) return nullptr;
+  if (kind == MIDI_KIND_PROGRAM_CHANGE)
+    return (ch == 9) ? gmDrumKitName((uint8_t)v) : gmInstrumentName((uint8_t)v);
+  return getData1ShortName(kind, (int16_t)v);
 }
 
 static void openMidiKeypad(CyclerKind k) {
@@ -2023,7 +2053,8 @@ static void applyMidiKeypadValue(void) {
   closeMidiKeypad();
 }
 
-static void drawCycler(int idx, const Rect& area, const char* label, const char* value, bool enabled) {
+static void drawCycler(int idx, const Rect& area, const char* label, const char* value, bool enabled,
+                       const char* subValue = nullptr) {
   const int btnW = 48;
   Rect lbtn = { area.x,                area.y, btnW, area.h };
   Rect mid  = { area.x + btnW,         area.y, area.w - btnW * 2, area.h };
@@ -2053,6 +2084,15 @@ static void drawCycler(int idx, const Rect& area, const char* label, const char*
   M5.Display.setFont(FONT_TINY);
   M5.Display.setTextColor(COL_MUTED);
   M5.Display.drawString(label, mid.x + 10, mid.y + 6);
+
+  // 縮約名 (CC 名 / 音名) の 2 行目。label と value の間の帯に出す。
+  // 背景の高い Data1 系 cycler (h ≈ 89) からしか渡されない前提。
+  if (subValue && subValue[0]) {
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setFont(FONT_TINY);
+    M5.Display.setTextColor(enabled ? COL_ACCENT : COL_MUTED);
+    M5.Display.drawString(subValue, mid.x + mid.w / 2, mid.y + 38);
+  }
 
   const lgfx::IFont* valueFont = FONT_SMALL;
   M5.Display.setFont(valueFont);
@@ -2092,15 +2132,15 @@ static void drawMidiKeypadOverlay(void) {
   M5.Display.drawString(displayText, g_midiKeypadDisplay.x + g_midiKeypadDisplay.w - 18,
                         g_midiKeypadDisplay.y + g_midiKeypadDisplay.h / 2);
 
-  // CtrlChg の Data1 編集中は、入力中の番号に対応する縮約 CC 名を
-  // 表示ボックス左側にライブ表示する (64 → Damper 等)。
-  if (!g_midiKeypadUseSpecial && getMidiKeypadDataKind() == MIDI_KIND_CONTROL_CHANGE) {
-    const char* ccName = getCcShortName(parseMidiKeypadDigits());
-    if (ccName) {
+  // Data1 編集中は、入力中の番号に対応する名前 (CC 名 / 音名 / GM 音色名)
+  // を表示ボックス左側にライブ表示する (64 → Damper、60 → C4 等)。
+  {
+    const char* dataName = getMidiKeypadDataName();
+    if (dataName && dataName[0]) {
       M5.Display.setTextDatum(middle_left);
       M5.Display.setFont(FONT_SMALL);
       M5.Display.setTextColor(COL_ACCENT, COL_BG);
-      M5.Display.drawString(ccName, g_midiKeypadDisplay.x + 18,
+      M5.Display.drawString(dataName, g_midiKeypadDisplay.x + 18,
                             g_midiKeypadDisplay.y + g_midiKeypadDisplay.h / 2);
     }
   }
@@ -2295,13 +2335,25 @@ static void drawMidiManage() {
       M5.Display.drawString(head, col.x + 10, col.y + 8);
       M5.Display.setFont(FONT_TINY);
       M5.Display.setTextColor(COL_MUTED);
+      // PrgChg の GM 音色名は cycler に収まらないので、キャプション行に
+      // フル名を出す (Ch10 固定ならドラムキット名)。
+      char prgName[48];
+      prgName[0] = '\0';
+      if (kind == MIDI_KIND_PROGRAM_CHANGE && data1 >= 0 && data1 <= 127 && !channelOnly) {
+        snprintf(prgName, sizeof(prgName), "Prg %d: %s", (int)data1,
+                 (channel == 9) ? gmDrumKitName((uint8_t)data1)
+                                : gmInstrumentName((uint8_t)data1));
+      }
       const char* subCaption;
       if (isDst) {
         if (channelOnly)         subCaption = "channel redirect only";
         else if (minV > maxV)    subCaption = "Min > Max: value inverted";
+        else if (prgName[0])     subCaption = prgName;
         else                     subCaption = "rewrite before MIDI out";
       } else {
-        subCaption = channelOnly ? "any channel message" : "match incoming MIDI";
+        if (channelOnly)         subCaption = "any channel message";
+        else if (prgName[0])     subCaption = prgName;
+        else                     subCaption = "match incoming MIDI";
       }
       M5.Display.drawString(subCaption, col.x + 10, col.y + 26);
 
@@ -2326,7 +2378,9 @@ static void drawMidiManage() {
       bool chEditable = midiKindHasChannel(kind);
       drawCycler(cyCh,   chR,   "Ch",    getChannelLabel(channel, isDst), chEditable);
       bool d1Editable = midiKindSupportsData1(kind) && !channelOnly;
-      drawCycler(cyD1,   d1R,   "Data1", getData1LabelForKind(kind, data1, isDst), d1Editable);
+      // 値スロットは番号のみ (幅 57 px)。CC 名 / 音名は 2 行目に縮約表示。
+      drawCycler(cyD1,   d1R,   "Data1", getData1Label(data1, isDst), d1Editable,
+                 d1Editable ? getData1ShortName(kind, data1) : nullptr);
       char mn[8], mx[8];
       snprintf(mn, sizeof(mn), "%d", minV);
       snprintf(mx, sizeof(mx), "%d", maxV);
@@ -4067,8 +4121,7 @@ static void handleToolbarTouch(int x, int y) {
       setCurrentTransposeButton();
       needFullRedraw = true;
     } else if (currentMode == KEY_MODE) {
-      majorUpperTranspose = !majorUpperTranspose;
-      minorUpperTranspose = !minorUpperTranspose;
+      cycleKeyDirection();
       selectedMajorKey = -1;
       selectedMinorKey = -1;
       needFullRedraw = true;
@@ -5295,6 +5348,7 @@ static const char* getData1Label(int16_t data1, bool keepLabel) {
 
 // 縮約 CC 名。CtrlChg の Data1 表示に番号と併記して、64=ダンパー等を
 // 数字を覚えていなくても識別できるようにする。代表的な CC のみ。
+// cycler 内 2 行目 (幅 57 px, FreeSans9pt) に収めるため全て 6 文字以内。
 static const char* getCcShortName(int cc) {
   switch (cc) {
     case 0:   return "BankH";
@@ -5325,17 +5379,17 @@ static const char* getCcShortName(int cc) {
     case 93:  return "Chorus";
     case 94:  return "Detune";
     case 95:  return "Phaser";
-    case 96:  return "DataInc";
-    case 97:  return "DataDec";
-    case 98:  return "NRPN-L";
-    case 99:  return "NRPN-H";
-    case 100: return "RPN-L";
-    case 101: return "RPN-H";
+    case 96:  return "DataUp";
+    case 97:  return "DataDn";
+    case 98:  return "NrpnL";
+    case 99:  return "NrpnH";
+    case 100: return "RpnL";
+    case 101: return "RpnH";
     case 120: return "SndOff";
     case 121: return "CtlRst";
     case 122: return "Local";
-    case 123: return "NotsOff";
-    case 124: return "OmniOff";
+    case 123: return "NotOff";
+    case 124: return "OmnOff";
     case 125: return "OmniOn";
     case 126: return "Mono";
     case 127: return "Poly";
@@ -5343,16 +5397,35 @@ static const char* getCcShortName(int cc) {
   }
 }
 
-// kind を見て CC なら「64 Damper」のように縮約名を併記する Data1 ラベル。
+// ノート番号 → 音名 (60 = C4 表記)。
+static const char* getNoteNameLabel(int note) {
+  static const char* kNames[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
+  static char label[8];
+  if (note < 0 || note > 127) return "";
+  snprintf(label, sizeof(label), "%s%d", kNames[note % 12], note / 12 - 1);
+  return label;
+}
+
+// Data1 の縮約名 (無い kind は nullptr)。CtrlChg は CC 名、Note 系は音名。
+// PrgChg の GM 音色名は長すぎて cycler に入らないので対象外 — 列キャプション
+// (drawCol) とキーパッドにフル名を出す。
+static const char* getData1ShortName(MidiMessageKind kind, int16_t data1) {
+  if (data1 < 0) return nullptr;
+  if (kind == MIDI_KIND_CONTROL_CHANGE) return getCcShortName(data1);
+  if (kind == MIDI_KIND_NOTE_ON || kind == MIDI_KIND_NOTE_OFF || kind == MIDI_KIND_KEY_PRESSURE)
+    return getNoteNameLabel(data1);
+  return nullptr;
+}
+
+// kind を見て「64 Damper」「60 C4」のように縮約名を併記する Data1 ラベル
+// (ルール一覧サマリー用。cycler は番号 + 2 行目縮約名の 2 段表示)。
 static const char* getData1LabelForKind(MidiMessageKind kind, int16_t data1, bool keepLabel) {
   static char label[16];
   if (data1 < 0) return keepLabel ? "KEEP" : "ANY";
-  if (kind == MIDI_KIND_CONTROL_CHANGE) {
-    const char* name = getCcShortName(data1);
-    if (name) {
-      snprintf(label, sizeof(label), "%d %s", data1, name);
-      return label;
-    }
+  const char* name = getData1ShortName(kind, data1);
+  if (name && name[0]) {
+    snprintf(label, sizeof(label), "%d %s", data1, name);
+    return label;
   }
   snprintf(label, sizeof(label), "%d", data1);
   return label;
@@ -6716,8 +6789,7 @@ static void handleButtonBAction() {
     transposeRange = (TransposeRange)(((int)transposeRange + 1) % 3);
     needFullRedraw = true;
   } else if (currentMode == KEY_MODE) {
-    majorUpperTranspose = !majorUpperTranspose;
-    minorUpperTranspose = !minorUpperTranspose;
+    cycleKeyDirection();
     selectedMajorKey = -1; selectedMinorKey = -1;
     needFullRedraw = true;
   } else if (currentApp == APP_MIDI) {
