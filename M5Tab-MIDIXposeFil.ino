@@ -389,6 +389,15 @@ struct DeviceConfig {
   uint8_t srcInitProgram;    // 0..127 (GM program number for melodic chs)
   uint8_t srcInitVolume;     // 0..127 (CC #7)
   bool    srcAutoChannel;    // follow incoming MIDI channel automatically
+  // Pedal relay: a Core2 running M5Core2-MIDIXposeFilBT holds the Bluetooth
+  // Classic pedal (Tab5's C6 radio is BLE-only) and forwards each press as a
+  // Control Change on its MIDI OUT. Tab5 consumes that CC here — before
+  // FILTER / MAPPER, never forwarded to the synth — and steps the transpose
+  // value exactly like the on-screen PREV / NEXT buttons.
+  bool    pedalRelay;        // listen for the relay CCs
+  uint8_t pedalRelayChannel; // 1..16
+  uint8_t pedalPrevCC;       // CC number = PREV (default 80, General Purpose 5)
+  uint8_t pedalNextCC;       // CC number = NEXT (default 81, General Purpose 6)
 };
 static DeviceConfig g_config;
 
@@ -535,6 +544,10 @@ static SemaphoreHandle_t g_mp3Mux = nullptr;
 // stopped. Keeps SD re-open, All-Notes-Off and redraw work on the UI thread.
 static volatile bool g_smfEofPending   = false;
 static volatile bool g_mp3EndedPending = false;
+// Pedal-relay presses decoded on the MIDI task, applied on the UI thread
+// (stepping the transpose value repaints widgets). Signed accumulator:
+// +1 per NEXT press, -1 per PREV press.
+static volatile int  g_pedalStepPending = 0;
 
 class SmfLock {
   bool taken;
@@ -4475,6 +4488,12 @@ static int buildValueList(int8_t* out) {
 }
 
 static void shiftTransposeBy(int dir) {
+  // The pedal relay can step the value while another app (MSG / PLAY) or an
+  // overlay is on screen. State always updates; widgets are only painted
+  // when the XPOSE content is what the panel is showing.
+  const bool xposeVisible = (currentApp == APP_TRANSPOSE)
+                         && (currentMode <= SEQUENCE_MODE)
+                         && !g_srcPickerOpen;
   if (currentMode == SEQUENCE_MODE) {
     int oldStep = seqCurrentStep;
     if (dir < 0)
@@ -4482,8 +4501,10 @@ static void shiftTransposeBy(int dir) {
     else
       seqCurrentStep = (seqCurrentStep < SEQ_STEP_COUNT - 1) ? seqCurrentStep + 1 : 0;
     handleTransposeChange(seqPatterns[seqCurrentPattern][seqCurrentStep]);
-    drawSeqSlot(oldStep);
-    drawSeqSlot(seqCurrentStep);
+    if (xposeVisible) {
+      drawSeqSlot(oldStep);
+      drawSeqSlot(seqCurrentStep);
+    }
     return;
   }
 
@@ -4503,17 +4524,31 @@ static void shiftTransposeBy(int dir) {
     for (int j = 0; j < 12; j++) if (transposeButtonsOn[j]) { oldLit = j; break; }
     for (int j = 0; j < 12; j++) transposeButtonsOn[j] = false;
     transposeButtonsOn[newIdx] = true;
-    if (oldLit >= 0 && oldLit != newIdx) drawDirectBtn(oldLit);
-    drawDirectBtn(newIdx);
+    if (xposeVisible) {
+      if (oldLit >= 0 && oldLit != newIdx) drawDirectBtn(oldLit);
+      drawDirectBtn(newIdx);
+    }
   } else if (currentMode == KEY_MODE) {
     selectedMajorKey = -1;
     selectedMinorKey = -1;
-    needContentRedraw = true;
+    if (xposeVisible) needContentRedraw = true;
   } else if (currentMode == INSTANT_MODE) {
-    drawInstantBtnsForValues(oldValue, transposeValue);
-  } else {
+    if (xposeVisible) drawInstantBtnsForValues(oldValue, transposeValue);
+  } else if (xposeVisible) {
     needContentRedraw = true;
   }
+}
+
+// Apply pedal-relay presses queued by the MIDI task. One transpose step per
+// press, in arrival order (the accumulator collapses PREV+NEXT pairs, which
+// is the same end state).
+static void processPedalRelay() {
+  int steps = g_pedalStepPending;
+  if (steps == 0) return;
+  g_pedalStepPending = g_pedalStepPending - steps;
+  int dir = (steps < 0) ? -1 : +1;
+  int n = (steps < 0) ? -steps : steps;
+  for (int i = 0; i < n; ++i) shiftTransposeBy(dir);
 }
 
 static void handleNavTouch(int x, int y) {
@@ -6063,7 +6098,24 @@ static void formatMidiMapperRuleSummary(const MidiMapperRule& rule, int index, c
 static void outputMidiMessage(const MidiMessage& msg);
 
 // パース済み 1 メッセージを FILTER / MAPPER に通して出力
+// True when msg is a pedal-relay CC from the Core2 bridge. Consumed here so
+// it never reaches FILTER / MAPPER / the synth. Only the press edge (value
+// >= 64) acts; the release (value 0) is swallowed.
+static bool consumePedalRelay(const MidiMessage& msg) {
+  if (!g_config.pedalRelay) return false;
+  if (msg.kind != MIDI_KIND_CONTROL_CHANGE || msg.length < 3) return false;
+  if (msg.channel != (int8_t)(g_config.pedalRelayChannel - 1)) return false;
+  uint8_t cc = msg.bytes[1];
+  int dir = 0;
+  if      (cc == g_config.pedalPrevCC) dir = -1;
+  else if (cc == g_config.pedalNextCC) dir = +1;
+  else return false;
+  if (msg.bytes[2] >= 64) g_pedalStepPending = g_pedalStepPending + dir;
+  return true;
+}
+
 static void handleParsedMidiMessage(const MidiMessage& inMsg) {
+  if (consumePedalRelay(inMsg)) return;                // Core2 ペダル中継 CC
   if (!shouldAllowMidiMessage(inMsg)) return;          // FILTER で破棄
   MidiMessage mapped = applyMidiMapper(inMsg);          // MAPPER で書換
   // Auto-follow incoming MIDI channel for the SRC mode. We sample after the
@@ -6606,6 +6658,10 @@ static void setDefaultConfig() {
   g_config.srcInitProgram   = 0;
   g_config.srcInitVolume    = 100;
   g_config.srcAutoChannel   = true;
+  g_config.pedalRelay        = true;
+  g_config.pedalRelayChannel = 16;
+  g_config.pedalPrevCC       = 80;
+  g_config.pedalNextCC       = 81;
 }
 
 static bool loadDeviceConfigFromSD() {
@@ -6646,6 +6702,10 @@ static bool loadDeviceConfigFromSD() {
   if (doc["SrcInitProgram"].is<int>())               g_config.srcInitProgram = (uint8_t)constrain((int)doc["SrcInitProgram"], 0, 127);
   if (doc["SrcInitVolume"].is<int>())                g_config.srcInitVolume  = (uint8_t)constrain((int)doc["SrcInitVolume"], 0, 127);
   if (doc["SrcAutoChannel"].is<bool>())              g_config.srcAutoChannel = doc["SrcAutoChannel"];
+  if (doc["PedalRelay"].is<bool>())                  g_config.pedalRelay = doc["PedalRelay"];
+  if (doc["PedalRelayChannel"].is<int>())            g_config.pedalRelayChannel = (uint8_t)constrain((int)doc["PedalRelayChannel"], 1, 16);
+  if (doc["PedalPrevCC"].is<int>())                  g_config.pedalPrevCC = (uint8_t)constrain((int)doc["PedalPrevCC"], 0, 127);
+  if (doc["PedalNextCC"].is<int>())                  g_config.pedalNextCC = (uint8_t)constrain((int)doc["PedalNextCC"], 0, 127);
   Serial.printf("[CFG] loaded: app=%s base=%d input=%s splash=%d gsBoot=%d srcCh=%d\n",
                 g_config.defaultApp, g_config.transposeBase,
                 g_config.midiInputSource, g_config.showSplash ? 1 : 0,
@@ -6676,6 +6736,10 @@ static bool saveDeviceConfigToSD() {
   doc["SrcInitProgram"]        = g_config.srcInitProgram;
   doc["SrcInitVolume"]         = g_config.srcInitVolume;
   doc["SrcAutoChannel"]        = g_config.srcAutoChannel;
+  doc["PedalRelay"]            = g_config.pedalRelay;
+  doc["PedalRelayChannel"]     = g_config.pedalRelayChannel;
+  doc["PedalPrevCC"]           = g_config.pedalPrevCC;
+  doc["PedalNextCC"]           = g_config.pedalNextCC;
   // The SMF sequencer task reads the card through SdFat on the other core;
   // hold its lock for the duration of this SD.h write so the two filesystem
   // layers never interleave on the shared SPI bus (brief playback pause).
@@ -6747,9 +6811,9 @@ static AppMode      g_appBeforeOverlay  = APP_TRANSPOSE;
 static DisplayMode  g_modeBeforeOverlay = DIRECT_MODE;
 static PlayMode     g_playBeforeOverlay = PLAY_SRC;
 
-static const int CFG_ROWS = 17;
+static const int CFG_ROWS = 21;
 static const int CFG_ROWS_PER_PAGE = 4;
-static const int CFG_PAGES = 5;       // 17 fields / 4 per page = 5 (last page partially used)
+static const int CFG_PAGES = 6;       // 21 fields / 4 per page = 6 (last page partially used)
 static int g_configPage = 0;
 static const char* CFG_LABELS[CFG_ROWS] = {
   "DefaultApp",
@@ -6769,6 +6833,10 @@ static const char* CFG_LABELS[CFG_ROWS] = {
   "SrcInitPrg",
   "SrcInitVol",
   "SrcAutoCh",
+  "PedalRelay",
+  "PedalRelayCh",
+  "PedalPrevCC",
+  "PedalNextCC",
 };
 
 static void cfgCycleString(char* dst, size_t cap, const char* const* options, int n) {
@@ -6798,6 +6866,10 @@ static void cfgFormatValue(int row, char* out, size_t outSize) {
     case 14: snprintf(out, outSize, "%u", (unsigned)g_config.srcInitProgram); break;
     case 15: snprintf(out, outSize, "%u", (unsigned)g_config.srcInitVolume); break;
     case 16: snprintf(out, outSize, "%s", g_config.srcAutoChannel  ? "ON" : "OFF"); break;
+    case 17: snprintf(out, outSize, "%s", g_config.pedalRelay      ? "ON" : "OFF"); break;
+    case 18: snprintf(out, outSize, "%u", (unsigned)g_config.pedalRelayChannel); break;
+    case 19: snprintf(out, outSize, "%u", (unsigned)g_config.pedalPrevCC); break;
+    case 20: snprintf(out, outSize, "%u", (unsigned)g_config.pedalNextCC); break;
     default: out[0] = '\0';
   }
 }
@@ -6825,6 +6897,10 @@ static void cfgCycleValue(int row) {
     case 14: g_config.srcInitProgram  = (g_config.srcInitProgram >= 127) ? 0 : (uint8_t)(g_config.srcInitProgram + 1); break;
     case 15: g_config.srcInitVolume   = (g_config.srcInitVolume  >= 127) ? 0 : (uint8_t)(g_config.srcInitVolume  + 1); break;
     case 16: g_config.srcAutoChannel  = !g_config.srcAutoChannel; break;
+    case 17: g_config.pedalRelay        = !g_config.pedalRelay; break;
+    case 18: g_config.pedalRelayChannel = (g_config.pedalRelayChannel >= 16) ? 1 : (uint8_t)(g_config.pedalRelayChannel + 1); break;
+    case 19: g_config.pedalPrevCC       = (g_config.pedalPrevCC >= 127) ? 0 : (uint8_t)(g_config.pedalPrevCC + 1); break;
+    case 20: g_config.pedalNextCC       = (g_config.pedalNextCC >= 127) ? 0 : (uint8_t)(g_config.pedalNextCC + 1); break;
   }
 }
 
@@ -7270,7 +7346,7 @@ static void printUsbSerialStatus() {
   const char* usbLabel        = g_usbMidiMounted ? "connected" : "disconnected";
   Serial.printf(
     "OK STATUS app=%s mode=%s input=%s transpose=%d range=%d filter_bypass=%d mapper_bypass=%d "
-    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu usb_in=%s cables=%u usb_drop=%lu usb_resub_fail=%lu\n",
+    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu usb_in=%s cables=%u usb_drop=%lu usb_resub_fail=%lu pedal_relay=%d ch=%u prev_cc=%u next_cc=%u\n",
     getAppLabel(currentApp),
     getDisplayModeLabel(currentMode),
     inputLabel,
@@ -7286,7 +7362,11 @@ static void printUsbSerialStatus() {
     usbLabel,
     (unsigned)g_usbMidiCableCount,
     (unsigned long)g_usbMidiRingDropCount,
-    (unsigned long)g_usbInResubmitFails
+    (unsigned long)g_usbInResubmitFails,
+    g_config.pedalRelay ? 1 : 0,
+    (unsigned)g_config.pedalRelayChannel,
+    (unsigned)g_config.pedalPrevCC,
+    (unsigned)g_config.pedalNextCC
   );
 }
 
@@ -7667,6 +7747,7 @@ void loop() {
     processSmfEof();
   }
   processMp3Ui();
+  processPedalRelay();
 
   processUsbSerialCommands();
 

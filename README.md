@@ -178,7 +178,24 @@ PRG 名バナーをタップで開く。レイアウト:
 | MIDI I/O | PortA を UART に転用 (RX = G54, TX = G53, 31250 bps) |
 | ストレージ | microSD (SPI: SCK=43, MOSI=44, MISO=39, CS=42) |
 
-フットペダルには非対応 (Tab5 は BT Classic を持たず、BLE HID 経路は安定性問題で削除)。転調の prev/next は画面下端の PREV / NEXT ボタンで操作する。
+Tab5 単体では Bluetooth フットペダルに接続できない (無線は ESP32-C6 で **BLE 専用**、Classic HID のペダルとはペアリング不能。BLE HID 経路は安定性問題で削除済み)。転調の prev/next は画面下端の PREV / NEXT ボタンか、下記の **Core2 経由ペダル中継** で操作する。
+
+### Core2 ペダルブリッジ経由のフットペダル (2026-10-11)
+
+専用スケッチ [`../M5Core2-PedalBridge`](../M5Core2-PedalBridge/) (M5Stack Core2 + necobit M5 MIDI Module2) が Bluetooth Classic ペダルを掴み、踏み込みを DIN MIDI OUT から Control Change として送る。Tab5 がそれを受けて転調値を PREV / NEXT と同じように 1 段動かす。ブリッジは MIDI IN → OUT のソフト THRU も持つので、DIN 鍵盤を直列に挟める。
+
+```
+[BT ペダル] ~~BT~~ [Core2 PedalBridge] --DIN--> [Tab5 Unit MIDI IN] → 音源
+                      ↑ MIDI IN (任意)              ↑
+               [DIN 鍵盤] ─ソフト THRU─┘   [USB 鍵盤] ─USB-MIDI─┘ (入力ソース MIX)
+```
+
+- 中継メッセージ: **Ch16 / CC#80 = PREV、CC#81 = NEXT** (値 127 = 踏み込み、0 = 離し)。Tab5 は FILTER / MAPPER より前でこの CC を消費し、音源へは流さない。踏み込み (値 ≥ 64) だけに反応する。
+- Tab5 側設定 (`/config.json` / CONFIG エディタ 6 ページ目): `PedalRelay` (ON/OFF、default ON) / `PedalRelayChannel` (1..16、default 16) / `PedalPrevCC` (default 80) / `PedalNextCC` (default 81)。`STATUS` 応答に `pedal_relay= ch= prev_cc= next_cc=` が出る。
+- Tab5 の入力ソースは `MIDIIN` または `MIX` にしておくこと (`USBIN` 単独だと DIN から来る中継 CC を読まない)。
+- 踏み込みは MIDI タスクで検出し、転調の適用と画面更新は UI スレッドで行う。XPOSE 以外の画面 (MSG / PLAY) を表示中でも転調値は動く (画面は戻ったときに反映)。
+- ペダル無しの疎通確認はブリッジの `C` ボタン (短押し NEXT / 長押し PREV) か USB シリアル `PEDAL NEXT|PREV`。Tab5 側では `STATUS` の `midi_in_real` が 1 押しあたり 6 (踏 3 + 離 3) 増える。
+- `M5Core2-MIDIXposeFilBT` (転調機としての Core2) 側には変更を入れていない。
 
 ---
 
@@ -224,6 +241,9 @@ SD ルートに `/config.json` (ArduinoJson 形式) があると起動時に読�
 | `SrcInitProgram` | 0..127 — SRC 起動時のプログラム番号 (default `0`) |
 | `SrcInitVolume` | 0..127 — SRC 起動時の CC#7 Volume (default `100`) |
 | `SrcAutoChannel` | bool — 受信 MIDI の Ch を自動追従 (default `true`) |
+| `PedalRelay` | bool — Core2 からのペダル中継 CC を受け付ける (default `true`) |
+| `PedalRelayChannel` | 1..16 — 中継 CC のチャンネル (default `16`) |
+| `PedalPrevCC` / `PedalNextCC` | 0..127 — PREV / NEXT に割り当てる CC 番号 (default `80` / `81`) |
 
 設定は本体の **CONFIG エディタ** から編集 → SAVE / APPLY できる。
 
@@ -231,7 +251,7 @@ SD ルートに `/config.json` (ArduinoJson 形式) があると起動時に読�
 
 ### 画面トリガ
 
-- ヘッダ右の **CONF** ボタン (新, アプリタブの右隣 2 つめ) → `CONFIG_EDIT_MODE` を直接開く。フィールドをタップで巡回、**4 件 × 5 ページ** (合計 18 項目) + footer の SAVE / CANCEL / APPLY。`PAGE-` / `PAGE+` でページ間を往復。
+- ヘッダ右の **CONF** ボタン (新, アプリタブの右隣 2 つめ) → `CONFIG_EDIT_MODE` を直接開く。フィールドをタップで巡回、**4 件 × 6 ページ** (合計 21 項目) + footer の SAVE / CANCEL / APPLY。`PAGE-` / `PAGE+` でページ間を往復。
 - ヘッダ右の **BASE** ボタン (新, アプリタブの右隣 1 つめ) → `BASE_SET_MODE` (3 ページの転調基準ピッカー: -12..-1 / -5..+6 / +1..+12)。数字は `XPOSE/DIRECT` と同じ大きさ (FONT_HUGE) で **黄色**で表示し、選択中の値は緑バックの黒文字。`+6` → R / `-5` → L / `+1` → M / `-1` → M / `PAGE` で巡回 / `EXIT` で戻る。
 - 旧来の長押しジェスチャ (BT ステータスラベル長押し → CONF、AOFF 長押し → BASE) も引き続き動作するフォールバック。
 - いずれのオーバーレイ表示中も、ヘッダのアプリタブ / `MIX` / `AOFF` / `BASE` / `CONF` をタップすると一旦オーバーレイをキャンセルしてから当該操作を実行するので、ナビゲーションが詰まらない。
