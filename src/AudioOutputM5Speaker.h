@@ -17,6 +17,12 @@ class AudioOutputM5Speaker : public AudioOutput {
       _buffers[_activeBuffer][_bufferIndex++] = sample[1];
       return true;
     }
+    // Buffer full. M5.Speaker queues at most two chunks per channel and
+    // playRaw() blocks (sleeping) until a slot frees up. Don't hand it a
+    // third one: report "not consumed" so the decoder returns to its task,
+    // which sleeps a tick and retries. Keeps the decoder mutex from being
+    // held while blocked and lets the UI's stop/start get in promptly.
+    if (_speaker && _speaker->isPlaying(_virtualChannel) >= 2) return false;
     flush();
     return false;
   }

@@ -191,6 +191,12 @@ static const int MAX_FILTER_RULES = 8;
 static const int MAX_MAPPER_RULES = 8;
 
 struct Rect { int x, y, w, h; };
+// Incomplete-type forward declarations so the Arduino preprocessor's
+// auto-generated prototypes (inserted before the first function definition)
+// can name these types; they are defined further down with their users.
+enum CyclerKind : uint8_t;
+struct RollBar;
+struct RollRect;
 struct ValueBtn { Rect r; int8_t value; char label[5]; };
 struct KeyBtn   { Rect r; int8_t keyValue; const char* keyName; bool isBlackKey; };
 struct SeqSlot  { Rect up, slot, down; };
@@ -476,10 +482,10 @@ static const int  SRC_KEY_HI = 108;  // C8
 // SRC_ROLL_T_MS milliseconds of wall time, with the present moment at the
 // bottom edge and older events scrolling upward off the top.
 static const uint32_t SRC_ROLL_T_MS = 3000;   // 3 s window (faster scroll)
-static const int      SRC_ROLL_HISTORY = 96;  // ring buffer size for finished notes
+static const int      SRC_ROLL_HISTORY = 256; // ring buffer size for finished notes
 struct SrcRollEvent { uint8_t note; uint8_t vel; uint8_t channel; uint32_t startMs; uint32_t endMs; };
 static SrcRollEvent srcRollHist[SRC_ROLL_HISTORY];
-static int srcRollHistCount = 0;     // total writes (mod SRC_ROLL_HISTORY for ring)
+static volatile uint32_t srcRollHistCount = 0;  // total writes (mod SRC_ROLL_HISTORY for ring)
 static uint32_t srcNoteStartMs[16][128];  // 0 = note not currently held
 
 // SRC fullscreen instrument picker overlay state. Opens when the user taps
@@ -496,10 +502,68 @@ static Rect srcPickerPrevBtn, srcPickerNextBtn, srcPickerCloseBtn;
 // Touch input uses M5Unified's edge-triggered wasPressed(), so no manual latch.
 
 // ==== Redraw flags ====
-static bool needFullRedraw    = true;
-static bool needPartialUpdate = false;
+// Granularity, coarsest first. Most taps only need one of the finer flags;
+// a full repaint of the 1280×720 panel (fillRect + ~40 anti-aliased labels)
+// costs tens of milliseconds, so the touch handlers below repaint just the
+// widgets that changed and raise the smallest flag that covers the rest.
+static bool needFullRedraw    = true;   // header + toolbar + nav + content
+static bool needToolbarRedraw = false;  // toolbar strip only (drawToolbarApp)
+static bool needContentRedraw = false;  // content (+nav for apps that use it)
+static bool needPartialUpdate = false;  // header right-hand status text only
 static bool midiManageDirty   = false;
 static uint32_t g_lastMidiInputAt = 0;
+
+// ==== Core split ====
+//   core 0 — real-time / streaming: usb host task (prio 5), SMF sequencer
+//            task (prio 6), MP3 decoder task (prio 4).
+//   core 1 — UI (loopTask, prio 1) and the MIDI I/O drain task (prio 10,
+//            preempts the UI whenever bytes arrive).
+// The MIDI task is woken by a task notification from the UART RX event
+// task and from the USB IN-transfer callback, with a 1 ms timeout as a
+// fallback, so a byte never waits for a polling interval.
+static TaskHandle_t g_midiTaskHandle = nullptr;
+static TaskHandle_t g_smfTaskHandle  = nullptr;
+static TaskHandle_t g_mp3TaskHandle  = nullptr;
+// Recursive mutexes guarding the SMF parser object and the MP3 decoder
+// object respectively. The UI thread takes them around load/play/stop; the
+// streaming task takes them around each getNextEvent()/loop() step. Both
+// are always acquired BEFORE g_serial2TxMux (the SMF event handler writes
+// MIDI while holding g_smfMux), never the other way round.
+static SemaphoreHandle_t g_smfMux = nullptr;
+static SemaphoreHandle_t g_mp3Mux = nullptr;
+// Set by the streaming tasks, consumed by loop(): end-of-file / decoder
+// stopped. Keeps SD re-open, All-Notes-Off and redraw work on the UI thread.
+static volatile bool g_smfEofPending   = false;
+static volatile bool g_mp3EndedPending = false;
+
+class SmfLock {
+  bool taken;
+ public:
+  SmfLock() {
+    taken = (g_smfMux != nullptr) &&
+            (xSemaphoreTakeRecursive(g_smfMux, portMAX_DELAY) == pdTRUE);
+  }
+  ~SmfLock() { if (taken && g_smfMux) xSemaphoreGiveRecursive(g_smfMux); }
+  SmfLock(const SmfLock&) = delete;
+  SmfLock& operator=(const SmfLock&) = delete;
+};
+class Mp3Lock {
+  bool taken;
+ public:
+  Mp3Lock() {
+    taken = (g_mp3Mux != nullptr) &&
+            (xSemaphoreTakeRecursive(g_mp3Mux, portMAX_DELAY) == pdTRUE);
+  }
+  ~Mp3Lock() { if (taken && g_mp3Mux) xSemaphoreGiveRecursive(g_mp3Mux); }
+  Mp3Lock(const Mp3Lock&) = delete;
+  Mp3Lock& operator=(const Mp3Lock&) = delete;
+};
+
+// Wake the MIDI drain task immediately (task context only — the UART event
+// task and the USB host task both call this from ordinary task context).
+static inline void wakeMidiTask() {
+  if (g_midiTaskHandle) xTaskNotifyGive(g_midiTaskHandle);
+}
 // ESP-IDF USB-host based MIDI input. Uses the same libusb.a that ships with
 // arduino-esp32 3.3.x for ESP32-P4. The PHY is brought up automatically by
 // usb_host_install(). See USB MIDI handling below.
@@ -539,8 +603,6 @@ static volatile uint32_t g_usbMidiRingTail = 0;  // read by loop
 static volatile uint32_t g_usbMidiRingDropCount = 0;  // bytes dropped on full-ring
 static portMUX_TYPE g_usbMidiRingMux = portMUX_INITIALIZER_UNLOCKED;
 
-enum CyclerKind : uint8_t;
-
 // ==== Forward decls ====
 static void computeLayout();
 static void initDirect();
@@ -549,6 +611,25 @@ static void initInstant();
 static void initSequence();
 static void initPianoKeys(const Rect& area);
 static void drawInterface();
+static void drawContentApp();
+static void drawDirectBtn(int i);
+static void drawInstantBtn(int i);
+static void drawInstantBtnsForValues(int8_t a, int8_t b);
+static void drawSeqSlot(int i);
+static void drawSeqSaveBtn();
+static void drawRangeBtn();
+static void drawAllOffBtn();
+static void srcDrawProgramHeader();
+static void srcDrawVolLabel();
+static void srcDrawPbLabel();
+static void srcDrawSusBtn();
+static void srcDrawAutoBtn();
+static bool isSeqScreenVisible();
+static void srcDrawRoll();
+static void srcFlushKeyboardDirty();
+static void startSmfTask();
+static void startMp3Task();
+static void startMidiIoTask();
 static void drawSplash();
 static void drawHeader();
 static void drawAppTabs();
@@ -587,7 +668,6 @@ static bool loadSmfTrack(int index);
 static void playSmf(bool sendReset = true);
 static void stopSmf();
 static void closeSmf();
-static void processSmf();
 static void resetSmfKeyboard();
 static void smfMidiEventHandler(midi_event* pev);
 static void smfSysexEventHandler(sysex_event* pev);
@@ -601,7 +681,6 @@ static size_t getMidiInputAvailable();
 static void scanMp3Files();
 static bool startMp3Track(int index);
 static void stopMp3();
-static void processMp3();
 static void mp3MetadataCallback(void* cbData, const char* type, bool isUnicode, const char* str);
 static void drawPianoKeyboard(const Rect& area, const uint8_t* velocityMap,
                               const char* title, const char* subtitle);
@@ -1372,7 +1451,13 @@ static void drawToolbar() {
     drawRectBtn(modeTab[i], bg, COL_BTN_BDR, modeName[i], txt, FONT_MED);
   }
 
-  // Range button — label depends on mode.
+  drawRangeBtn();
+  drawAllOffBtn();
+}
+
+// Range button — label depends on mode. Split out so a RANGE tap can repaint
+// just this button instead of the whole toolbar.
+static void drawRangeBtn() {
   const char* rangeLabel = "RANGE";
   if (currentMode == DIRECT_MODE) {
     if      (transposeRange == RANGE_0_TO_12)      rangeLabel = "0 .. +11";
@@ -1390,14 +1475,6 @@ static void drawToolbar() {
               rangeLabel,
               rangeEnabled ? COL_BTN_TXT : COL_MUTED,
               FONT_MED);
-
-  // All-notes-off toggle.
-  drawRectBtn(btnAllOff,
-              allNotesOffEnabled ? COL_BTN_HI : COL_DANGER,
-              COL_BTN_BDR,
-              "AOFF",
-              allNotesOffEnabled ? COL_BTN_TXT_HI : COL_BTN_TXT,
-              FONT_MED);
 }
 
 static void drawNav() {
@@ -1407,7 +1484,10 @@ static void drawNav() {
 }
 
 static void drawHeaderStatusApp() {
-  if (currentApp == APP_TRANSPOSE) {
+  // XPOSE and MSG both show the live transpose value: the transposer keeps
+  // running underneath the FILTER / MAPPER editor, so the performer should
+  // still be able to glance at "K +n" while editing rules.
+  if (currentApp == APP_TRANSPOSE || currentApp == APP_MIDI) {
     updateStatusArea();
     return;
   }
@@ -1611,9 +1691,7 @@ static void drawToolbarApp() {
     drawRectBtn(srcBtnGm,   TFT_BLUE,   COL_BTN_BDR, "GMRST", COL_BTN_TXT, FONT_MED);
     drawRectBtn(srcBtnGs,   TFT_BLUE,   COL_BTN_BDR, "GSRST", COL_BTN_TXT, FONT_MED);
     drawRectBtn(srcBtnInit, COL_DANGER, COL_BTN_BDR, "INIT",  COL_BTN_TXT, FONT_MED);
-    drawRectBtn(srcBtnAuto,
-                srcAutoFollow ? COL_BTN_HI : COL_BTN, COL_BTN_BDR, "AUTO",
-                srcAutoFollow ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
+    srcDrawAutoBtn();
   } else if (currentPlay == PLAY_SMF) {
     drawRectBtn(smfBtnPrev, TFT_BLUE, COL_BTN_BDR, "PREV", COL_BTN_TXT, FONT_MED);
     drawRectBtn(smfBtnPlay, smfPlaying ? COL_DANGER : COL_BTN_HI, COL_BTN_BDR,
@@ -1642,14 +1720,17 @@ static void drawNavApp() {
   M5.Display.fillRect(navArea.x, navArea.y, navArea.w, navArea.h, COL_BG);
 }
 
+static void drawDirectBtn(int i) {
+  if (i < 0 || i >= 12) return;
+  bool on = transposeButtonsOn[i];
+  uint16_t bg  = on ? COL_BTN_HI : COL_BTN;
+  uint16_t txt = on ? COL_BTN_TXT_HI : COL_BTN_TXT;
+  drawRectBtn(directBtns[i].r, bg, COL_BTN_BDR, directBtns[i].label, txt, FONT_HUGE);
+}
+
 static void drawDirect() {
   M5.Display.fillRect(contentArea.x, contentArea.y, contentArea.w, contentArea.h, COL_BG);
-  for (int i = 0; i < 12; i++) {
-    bool on = transposeButtonsOn[i];
-    uint16_t bg  = on ? COL_BTN_HI : COL_BTN;
-    uint16_t txt = on ? COL_BTN_TXT_HI : COL_BTN_TXT;
-    drawRectBtn(directBtns[i].r, bg, COL_BTN_BDR, directBtns[i].label, txt, FONT_HUGE);
-  }
+  for (int i = 0; i < 12; i++) drawDirectBtn(i);
 }
 
 static void drawKey() {
@@ -1713,19 +1794,33 @@ static void drawInstant() {
   M5.Display.drawString("Instant: tap to jump to that value",
                         30, contentArea.y + 6);
 
-  // 0 button (wide).
-  bool zeroOn = (transposeValue == 0);
-  drawRectBtn(instantZero,
-              zeroOn ? COL_BTN_HI : COL_BTN,
-              COL_BTN_BDR, "0",
-              zeroOn ? COL_BTN_TXT_HI : COL_BTN_TXT,
-              FONT_HUGE);
+  for (int i = -1; i < 8; i++) drawInstantBtn(i);
+}
 
+// i == -1 is the wide "0" button, 0..7 the ± buttons.
+static void drawInstantBtn(int i) {
+  if (i < 0) {
+    bool zeroOn = (transposeValue == 0);
+    drawRectBtn(instantZero,
+                zeroOn ? COL_BTN_HI : COL_BTN,
+                COL_BTN_BDR, "0",
+                zeroOn ? COL_BTN_TXT_HI : COL_BTN_TXT,
+                FONT_HUGE);
+    return;
+  }
+  if (i >= 8) return;
+  bool on = (instantBtns[i].value == transposeValue);
+  uint16_t bg  = on ? COL_BTN_HI : COL_BTN;
+  uint16_t txt = on ? COL_BTN_TXT_HI : COL_BTN_TXT;
+  drawRectBtn(instantBtns[i].r, bg, COL_BTN_BDR, instantBtns[i].label, txt, FONT_HUGE);
+}
+
+// Repaint only the INSTANT buttons whose highlight could have changed when
+// the transpose value moved from a to b (the buttons labelled a and b).
+static void drawInstantBtnsForValues(int8_t a, int8_t b) {
+  if (a == 0 || b == 0) drawInstantBtn(-1);
   for (int i = 0; i < 8; i++) {
-    bool on = (instantBtns[i].value == transposeValue);
-    uint16_t bg  = on ? COL_BTN_HI : COL_BTN;
-    uint16_t txt = on ? COL_BTN_TXT_HI : COL_BTN_TXT;
-    drawRectBtn(instantBtns[i].r, bg, COL_BTN_BDR, instantBtns[i].label, txt, FONT_HUGE);
+    if (instantBtns[i].value == a || instantBtns[i].value == b) drawInstantBtn(i);
   }
 }
 
@@ -1753,7 +1848,51 @@ static void drawSequence() {
   M5.Display.setTextDatum(middle_center);
   M5.Display.drawString(patStr, patLabel.x + patLabel.w / 2, patLabel.y + patLabel.h / 2);
 
-  // SAVE button.
+  drawSeqSaveBtn();
+
+  // Step slots.
+  for (int i = 0; i < SEQ_STEP_COUNT; i++) {
+    // UP button with a triangle.
+    drawRectBtn(seqSteps[i].up, COL_BTN, COL_BTN_BDR, nullptr, COL_BTN_TXT, FONT_MED);
+    {
+      int cx = seqSteps[i].up.x + seqSteps[i].up.w / 2;
+      int cy = seqSteps[i].up.y + seqSteps[i].up.h / 2;
+      int tri = 18;
+      M5.Display.fillTriangle(cx, cy - tri, cx - tri, cy + tri, cx + tri, cy + tri, COL_BTN_TXT);
+    }
+
+    drawSeqSlot(i);
+
+    // DOWN button with a triangle.
+    drawRectBtn(seqSteps[i].down, COL_BTN, COL_BTN_BDR, nullptr, COL_BTN_TXT, FONT_MED);
+    {
+      int cx = seqSteps[i].down.x + seqSteps[i].down.w / 2;
+      int cy = seqSteps[i].down.y + seqSteps[i].down.h / 2;
+      int tri = 18;
+      M5.Display.fillTriangle(cx, cy + tri, cx - tri, cy - tri, cx + tri, cy - tri, COL_BTN_TXT);
+    }
+  }
+}
+
+// Value slot of one SEQUENCE step (the UP / DOWN arrows above and below it
+// never change, so a step tap only has to repaint the old and new slot).
+static void drawSeqSlot(int i) {
+  if (i < 0 || i >= SEQ_STEP_COUNT) return;
+  int8_t value = seqPatterns[seqCurrentPattern][i];
+  bool isCurrent = (i == seqCurrentStep);
+  char vstr[6];
+  if (value > 0) snprintf(vstr, sizeof(vstr), "+%d", value);
+  else           snprintf(vstr, sizeof(vstr), "%d",  value);
+  drawRectBtn(seqSteps[i].slot,
+              isCurrent ? COL_BTN_HI : COL_BTN,
+              COL_BTN_BDR, vstr,
+              isCurrent ? COL_BTN_TXT_HI : COL_BTN_TXT,
+              FONT_HUGE);
+}
+
+// SAVE / QUEUED / SAVED / SD ERR button. Its state machine runs from
+// processDeferredStorageTasks(), which repaints just this button.
+static void drawSeqSaveBtn() {
   const char* saveLabel = "SAVE";
   uint16_t saveBg = TFT_RED;
   uint16_t saveTxt = COL_BTN_TXT;
@@ -1770,41 +1909,10 @@ static void drawSequence() {
     saveTxt = TFT_BLACK;
   }
   drawRectBtn(seqSave, saveBg, COL_BTN_BDR, saveLabel, saveTxt, FONT_HUGE);
+}
 
-  // Step slots.
-  for (int i = 0; i < SEQ_STEP_COUNT; i++) {
-    int8_t value = seqPatterns[seqCurrentPattern][i];
-    bool isCurrent = (i == seqCurrentStep);
-
-    // UP button with a triangle.
-    drawRectBtn(seqSteps[i].up, COL_BTN, COL_BTN_BDR, nullptr, COL_BTN_TXT, FONT_MED);
-    {
-      int cx = seqSteps[i].up.x + seqSteps[i].up.w / 2;
-      int cy = seqSteps[i].up.y + seqSteps[i].up.h / 2;
-      int tri = 18;
-      M5.Display.fillTriangle(cx, cy - tri, cx - tri, cy + tri, cx + tri, cy + tri, COL_BTN_TXT);
-    }
-
-    // Value slot.
-    char vstr[6];
-    if (value > 0) snprintf(vstr, sizeof(vstr), "+%d", value);
-    else           snprintf(vstr, sizeof(vstr), "%d",  value);
-    drawRectBtn(seqSteps[i].slot,
-                isCurrent ? COL_BTN_HI : COL_BTN,
-                COL_BTN_BDR, vstr,
-                isCurrent ? COL_BTN_TXT_HI : COL_BTN_TXT,
-                FONT_HUGE);
-
-    // DOWN button with a triangle.
-    drawRectBtn(seqSteps[i].down, COL_BTN, COL_BTN_BDR, nullptr, COL_BTN_TXT, FONT_MED);
-    {
-      int cx = seqSteps[i].down.x + seqSteps[i].down.w / 2;
-      int cy = seqSteps[i].down.y + seqSteps[i].down.h / 2;
-      int tri = 18;
-      M5.Display.fillTriangle(cx, cy + tri, cx - tri, cy - tri, cx + tri, cy - tri, COL_BTN_TXT);
-    }
-  }
-
+static bool isSeqScreenVisible() {
+  return currentApp == APP_TRANSPOSE && currentMode == SEQUENCE_MODE && !g_srcPickerOpen;
 }
 
 // ==== MIDI Manager (FILTER / MAPPER) UI ====
@@ -2771,23 +2879,26 @@ static void drawSmfMonitorKey(uint8_t channel, uint8_t note) {
 
 static void flushSmfMonitorDirty(const Rect& area) {
   if (!smfMonitorGeometryReady) initSmfMonitorGeometry(area);
+  // The dirty flags are set by the sequencer task on the other core. Clear a
+  // flag BEFORE painting the key so a Note On/Off that lands mid-paint sets
+  // it again and is picked up next tick instead of being lost.
   if (smfMonitorDirtyAll) {
+    smfMonitorDirtyAll = false;
     drawSmfMonitorBase(area);
     for (uint8_t ch = 0; ch < 16; ++ch) {
       for (uint8_t note = 0; note < 128; ++note) {
-        if (smfChannelVelocity[ch][note]) drawSmfMonitorKey(ch, note);
         smfMonitorKeyDirty[ch][note] = false;
+        if (smfChannelVelocity[ch][note]) drawSmfMonitorKey(ch, note);
       }
     }
-    smfMonitorDirtyAll = false;
     return;
   }
 
   for (uint8_t ch = 0; ch < 16; ++ch) {
     for (uint8_t note = 0; note < 128; ++note) {
       if (!smfMonitorKeyDirty[ch][note]) continue;
-      drawSmfMonitorKey(ch, note);
       smfMonitorKeyDirty[ch][note] = false;
+      drawSmfMonitorKey(ch, note);
     }
   }
 }
@@ -3056,9 +3167,11 @@ static void srcFlushKeyboardDirty() {
 
 // Append a finished note to the piano-roll history ring buffer.
 static void srcRollAppend(uint8_t note, uint8_t vel, uint8_t channel, uint32_t startMs, uint32_t endMs) {
-  int slot = srcRollHistCount % SRC_ROLL_HISTORY;
+  uint32_t slot = srcRollHistCount % SRC_ROLL_HISTORY;
   srcRollHist[slot] = { note, vel, channel, startMs, endMs };
-  ++srcRollHistCount;
+  // Publish the slot only after its fields are written so a UI-thread
+  // snapshot of the counter never sees a half-filled event.
+  __atomic_store_n(&srcRollHistCount, srcRollHistCount + 1, __ATOMIC_RELEASE);
 }
 
 // Update srcKeyVel from a parsed MIDI message. Called by handleParsedMidiMessage.
@@ -3085,15 +3198,55 @@ static void srcKeyboardOnNote(int channel, int note, int velocity, bool noteOn) 
   if (srcKeyVel[channel][note] == v) return;
   srcKeyVel[channel][note] = v;
   srcKeyDirty[channel][note] = true;
-  if (currentApp == APP_PLAY && currentPlay == PLAY_SRC && (uint8_t)channel == srcChannel) {
-    // The next UI tick's partial-redraw branch will flush keys for SRC mode.
-    needPartialUpdate = true;
-  }
+  // The UI tick flushes dirty keys and advances the piano roll on its own
+  // whenever the SRC screen is visible; no header repaint is needed here.
 }
 
-// Map a millisecond age (now - eventMs) to a Y coordinate inside the piano-
-// roll panel. Now is at the bottom; older events scroll upward and disappear
-// off the top once they age past SRC_ROLL_T_MS.
+// =================================================================
+//  Piano roll — delta renderer
+// =================================================================
+// The old renderer cleared the whole roll interior (~1240×190 px) and redrew
+// every bar 50 times a second. On Tab5 the framebuffer lives in PSRAM and is
+// scanned out continuously by the MIPI-DSI controller, so that ~0.5 MB/tick
+// of CPU writes competed with the DSI DMA for PSRAM bandwidth and the whole
+// panel flickered — not just the roll. Bars move upward at a constant rate,
+// so between two frames each bar only gains a thin strip at its top and
+// (finished notes) loses a thin strip at its bottom. This renderer computes
+// each bar's rectangle at the previous frame time and at the current time
+// from the same pure function and paints only the difference, then repairs
+// any neighbouring bar that overlapped a cleared strip (black-key columns
+// straddle the two adjacent white-key columns). Per-frame framebuffer
+// traffic drops from hundreds of KB to a few KB.
+static const int      SRC_ROLL_INSET = 4;       // keep clear of the rounded frame
+static uint32_t       g_rollPrevMs   = 0;       // time the on-screen frame was rendered for
+static bool           g_rollNeedFull = true;    // clear interior + redraw everything
+static uint32_t       g_rollOldestUsedIdx = 0;  // oldest ring index referenced last frame
+static bool           g_rollLastHadBars = false; // previous frame drew at least one bar
+// The MIDI task (same core, higher priority) appends to the ring and clears
+// the held-note stamp of a finished note back to back. Snapshotting both
+// inside a critical section makes the pair atomic from the UI's point of
+// view, so a note is never missing from (or doubled in) a frame.
+static portMUX_TYPE   g_rollSnapMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Packed to 16-bit coordinates: the scratch arrays below hold a few hundred
+// of these in internal DRAM, so field width matters.
+struct RollBar {
+  uint32_t startMs;
+  uint32_t endMs;      // 0 = still held
+  int16_t  x, w;
+  int16_t  y0a, y0b;   // rows [y0a, y0b) at g_rollPrevMs
+  int16_t  y1a, y1b;   // rows [y1a, y1b) at now
+  uint8_t  note;
+  bool     black;
+  bool     have0, have1;
+};
+struct RollRect { int16_t x, w, y0, y1; };
+static inline RollRect rollRect(int x, int w, int y0, int y1) {
+  RollRect r; r.x = (int16_t)x; r.w = (int16_t)w; r.y0 = (int16_t)y0; r.y1 = (int16_t)y1; return r;
+}
+
+// Age (ms since the event edge) → Y. Age 0 is the bottom edge of the panel;
+// SRC_ROLL_T_MS is the top edge.
 static int srcRollYForAge(uint32_t ageMs) {
   if (ageMs > SRC_ROLL_T_MS) ageMs = SRC_ROLL_T_MS;
   int h = srcRollArea.h - 4;
@@ -3101,87 +3254,194 @@ static int srcRollYForAge(uint32_t ageMs) {
   return yBottom - (int)((uint64_t)ageMs * h / SRC_ROLL_T_MS);
 }
 
-// Draw one note bar inside the roll. xCol is the centre x of the matching
-// keyboard column below; we use a narrow bar (whiteW or blackW) to align.
-static void srcRollDrawBar(uint8_t note, uint32_t startMs, uint32_t endMs, uint32_t now) {
-  if (note < SRC_KEY_LO || note > SRC_KEY_HI) return;
-  if (!srcKeyGeomReady) return;
-  if (endMs <= now - SRC_ROLL_T_MS) return;            // entirely off the top
-  if (startMs > now) startMs = now;                    // future-clamp (shouldn't happen)
-  uint32_t ageStart = (now > startMs) ? (now - startMs) : 0;
-  uint32_t ageEnd   = (now > endMs)   ? (now - endMs)   : 0;
-  int yStart = srcRollYForAge(ageEnd);                 // newer end → lower y → higher on screen
-  int yEnd   = srcRollYForAge(ageStart);               // older start → higher y? Actually
-  // age 0 → bottom, age SRC_ROLL_T_MS → top. The note's lifetime: youngest
-  // edge is endMs (smallest age), oldest edge is startMs (largest age). So
-  // yTop is at age=ageStart, yBottom is at age=ageEnd. Swap and clip:
-  if (yStart > yEnd) { int t = yStart; yStart = yEnd; yEnd = t; }
-  // Clip to the same interior region that the per-tick fillRect clears
-  // (inset 4 px from the panel edges) so leftover bar pixels at the very top
-  // and bottom of the panel can't survive between repaints.
-  const int inset = 4;
-  int areaTop = srcRollArea.y + inset;
-  int areaBot = srcRollArea.y + srcRollArea.h - inset;
-  if (yEnd   <= areaTop) return;
-  if (yStart >= areaBot) return;
-  if (yStart < areaTop) yStart = areaTop;
-  if (yEnd   > areaBot) yEnd   = areaBot;
-  if (yEnd <= yStart) yEnd = yStart + 1;
+// Rows [y0, y1) a note bar occupies when rendered for time atMs. endMs == 0
+// means the note is still held (bar extends to the bottom edge). Returns
+// false when nothing of the bar is visible at that time. Pure: the delta
+// renderer relies on calling it for the previous and the current frame time.
+static bool srcRollBarRows(uint32_t startMs, uint32_t endMs, uint32_t atMs, int16_t& y0, int16_t& y1) {
+  if ((int32_t)(atMs - startMs) < 0) return false;           // not started yet
+  uint32_t end = (endMs == 0 || (int32_t)(endMs - atMs) > 0) ? atMs : endMs;
+  uint32_t ageEnd = atMs - end;
+  if (ageEnd >= SRC_ROLL_T_MS) return false;                 // scrolled off the top
+  uint32_t ageStart = atMs - startMs;
+  int top = srcRollYForAge(ageStart);
+  int bot = srcRollYForAge(ageEnd);
+  if (bot <= top) bot = top + 1;
+  const int areaTop = srcRollArea.y + SRC_ROLL_INSET;
+  const int areaBot = srcRollArea.y + srcRollArea.h - SRC_ROLL_INSET;
+  if (top < areaTop) top = areaTop;
+  if (bot > areaBot) bot = areaBot;
+  if (bot <= top) return false;
+  y0 = (int16_t)top; y1 = (int16_t)bot;
+  return true;
+}
 
-  const Rect& kr = srcKeyGeom[note].r;
-  int colX = kr.x;
-  int colW = kr.w;
-  // Black-key roll bars are slightly inset so they don't smear over their
-  // neighbouring white-key bars.
-  if (srcKeyGeom[note].isBlack) { colX += 1; colW = max(2, colW - 2); }
+static void srcRollFill(int x, int w, int y0, int y1, uint16_t col) {
+  if (w <= 0 || y1 <= y0) return;
+  M5.Display.fillRect(x, y0, w, y1 - y0, col);
+}
 
-  // Same per-pitch-class colour as the lit key, so a held note's bar matches
-  // the key it's coming from below.
-  uint16_t fill = srcPitchColor(note);
-  M5.Display.fillRect(colX, yStart, colW, yEnd - yStart, fill);
+// Paint (bar's current rect) ∩ rect — repairs bars that a cleared strip or a
+// neighbouring repaint cut into.
+static void srcRollFillIntersect(const RollBar& b, const RollRect& r, uint16_t col) {
+  int ix = (b.x > r.x) ? b.x : r.x;
+  int ie = ((b.x + b.w) < (r.x + r.w)) ? (b.x + b.w) : (r.x + r.w);
+  int iy0 = (b.y1a > r.y0) ? b.y1a : r.y0;
+  int iy1 = (b.y1b < r.y1) ? b.y1b : r.y1;
+  if (ie > ix && iy1 > iy0) M5.Display.fillRect(ix, iy0, ie - ix, iy1 - iy0, col);
+}
+
+static void srcRollClearInterior() {
+  M5.Display.fillRect(srcRollArea.x + SRC_ROLL_INSET, srcRollArea.y + SRC_ROLL_INSET,
+                      srcRollArea.w - SRC_ROLL_INSET * 2, srcRollArea.h - SRC_ROLL_INSET * 2,
+                      0x10A2);
+}
+
+// Request a full interior repaint on the next tick. Call whenever bars can
+// vanish without passing through the history ring (All Notes Off clears the
+// held-note stamps) or the panel was repainted underneath.
+static void srcRollInvalidate() {
+  g_rollNeedFull = true;
 }
 
 // Draw the static panel border for the piano roll. Called once on full
-// redraw (drawSrc) — NOT on every tick. Per-tick scrolling only repaints
-// the interior so the rounded edge doesn't flicker.
+// redraw (drawSrc) — NOT on every tick.
 static void srcDrawRollFrame() {
   M5.Display.fillRoundRect(srcRollArea.x, srcRollArea.y,
                            srcRollArea.w, srcRollArea.h, 8, 0x10A2);
   M5.Display.drawRoundRect(srcRollArea.x, srcRollArea.y,
                            srcRollArea.w, srcRollArea.h, 8, COL_BTN_BDR);
+  g_rollNeedFull = true;
 }
 
-// Per-tick incremental repaint of the piano roll's interior. The panel border
-// drawn by srcDrawRollFrame() is left untouched so it stays put while the
-// notes inside scroll upward. Called every UI tick (~50 Hz).
+// Per-tick incremental repaint of the piano roll's interior. Called every UI
+// tick while the SRC screen is visible.
 static void srcDrawRoll() {
-  // Inset by 4 px from each edge so we never write over the rounded border.
-  const int inset = 4;
-  M5.Display.fillRect(srcRollArea.x + inset, srcRollArea.y + inset,
-                      srcRollArea.w - inset * 2, srcRollArea.h - inset * 2,
-                      0x10A2);
-
   if (!srcKeyGeomReady) return;
-  uint32_t now = millis();
-  uint32_t cutoff = (now > SRC_ROLL_T_MS) ? (now - SRC_ROLL_T_MS) : 0;
+  const uint32_t now = millis();
+  const uint16_t bg = 0x10A2;
 
-  // Finished notes from the ring buffer — active channel only.
-  int n = (srcRollHistCount < SRC_ROLL_HISTORY) ? srcRollHistCount : SRC_ROLL_HISTORY;
-  for (int i = 0; i < n; ++i) {
-    int slot = (srcRollHistCount < SRC_ROLL_HISTORY) ? i
-              : (srcRollHistCount + i) % SRC_ROLL_HISTORY;
-    const SrcRollEvent& e = srcRollHist[slot];
-    if (e.channel != srcChannel) continue;
-    if (e.endMs < cutoff) continue;
-    srcRollDrawBar(e.note, e.startMs, e.endMs, now);
+  // ---- Gather the bars of the active channel (finished + held) ----
+  static RollBar bars[SRC_ROLL_HISTORY + 128];
+  static uint32_t heldSnap[128];
+  int nb = 0;
+  const uint8_t ch = srcChannel;
+  uint32_t count;
+  portENTER_CRITICAL(&g_rollSnapMux);
+  count = srcRollHistCount;
+  memcpy(heldSnap, srcNoteStartMs[ch], sizeof(heldSnap));
+  portEXIT_CRITICAL(&g_rollSnapMux);
+  const uint32_t oldest = (count > (uint32_t)SRC_ROLL_HISTORY) ? count - SRC_ROLL_HISTORY : 0;
+  // If the ring overwrote an event we still referenced last frame, its old
+  // rectangle can no longer be reconstructed — fall back to a full repaint.
+  if (!g_rollNeedFull && oldest > g_rollOldestUsedIdx) g_rollNeedFull = true;
+  const bool full = g_rollNeedFull;
+  const uint32_t prevMs = full ? now : g_rollPrevMs;
+  uint32_t oldestUsed = count;
+
+  auto addBar = [&](uint8_t note, uint32_t s, uint32_t e) {
+    if (note < SRC_KEY_LO || note > SRC_KEY_HI) return;
+    if (nb >= (int)(sizeof(bars) / sizeof(bars[0]))) return;
+    RollBar& b = bars[nb];
+    b.note = note; b.startMs = s; b.endMs = e;
+    const Rect& kr = srcKeyGeom[note].r;
+    b.black = srcKeyGeom[note].isBlack;
+    if (b.black) { b.x = (int16_t)(kr.x + 1); b.w = (int16_t)max(2, kr.w - 2); }
+    else         { b.x = (int16_t)kr.x;       b.w = (int16_t)max(1, kr.w - 1); }   // drop the 1 px overlap between white keys
+    b.have1 = srcRollBarRows(s, e, now, b.y1a, b.y1b);
+    b.have0 = full ? false : srcRollBarRows(s, e, prevMs, b.y0a, b.y0b);
+    if (b.have0 || b.have1) ++nb;
+  };
+  for (uint32_t idx = oldest; idx < count; ++idx) {
+    const SrcRollEvent e = srcRollHist[idx % SRC_ROLL_HISTORY];
+    if (e.channel != ch) continue;
+    int before = nb;
+    addBar(e.note, e.startMs, e.endMs);
+    if (nb != before && idx < oldestUsed) oldestUsed = idx;
   }
-
-  // Currently-held notes on the active channel — extend bar to "now"
   for (int note = SRC_KEY_LO; note <= SRC_KEY_HI; ++note) {
-    uint32_t s = srcNoteStartMs[srcChannel][note];
-    if (s == 0) continue;
-    srcRollDrawBar((uint8_t)note, s, now, now);
+    uint32_t s = heldSnap[note];
+    if (s) addBar((uint8_t)note, s, 0);
   }
+  g_rollOldestUsedIdx = oldestUsed;
+  // Safety net: the moment the roll empties, do one full clear so any pixel a
+  // race could have left behind is wiped before the next phrase starts.
+  if (nb == 0 && g_rollLastHadBars && !full) { g_rollNeedFull = true; }
+  g_rollLastHadBars = (nb != 0);
+  if (nb == 0 && g_rollNeedFull) {
+    srcRollClearInterior();
+    g_rollNeedFull = false;
+    g_rollPrevMs = now;
+    return;
+  }
+
+  // ---- Full repaint (first frame, channel change, All Notes Off, overwrite) ----
+  if (full) {
+    srcRollClearInterior();
+    for (int pass = 0; pass < 2; ++pass) {           // white first, black on top
+      for (int i = 0; i < nb; ++i) {
+        const RollBar& b = bars[i];
+        if (b.black != (pass == 1) || !b.have1) continue;
+        srcRollFill(b.x, b.w, b.y1a, b.y1b, srcPitchColor(b.note));
+      }
+    }
+    g_rollNeedFull = false;
+    g_rollPrevMs = now;
+    return;
+  }
+  if (now == prevMs) return;                          // nothing moved yet
+
+  // ---- Delta repaint ----
+  // Phase 1: clear every row a bar vacated (its old rect minus its new rect;
+  // whole old rect if it scrolled away). Remember the cleared rects.
+  static RollRect cleared[SRC_ROLL_HISTORY + 128];
+  const int clearedCap = (int)(sizeof(cleared) / sizeof(cleared[0]));
+  int ncl = 0;
+  for (int i = 0; i < nb; ++i) {
+    const RollBar& b = bars[i];
+    if (!b.have0) continue;
+    // Bars only ever move up, so the vacated part is at the bottom …
+    int cy0 = b.have1 ? (int)max(b.y1b, b.y0a) : (int)b.y0a;
+    int cy1 = b.y0b;
+    if (cy1 > cy0) {
+      srcRollFill(b.x, b.w, cy0, cy1, bg);
+      if (ncl < clearedCap) cleared[ncl++] = rollRect(b.x, b.w, cy0, cy1);
+    }
+    // … but guard the top edge too in case clipping ever shrinks it.
+    if (b.have1 && b.y1a > b.y0a) {
+      int ty1 = (int)min(b.y1a, b.y0b);
+      srcRollFill(b.x, b.w, b.y0a, ty1, bg);
+      if (ncl < clearedCap) cleared[ncl++] = rollRect(b.x, b.w, b.y0a, ty1);
+    }
+  }
+  // Phase 2: white bars — paint the newly exposed strip at the top and repair
+  // any part of the body that a cleared strip cut into. Remember the strips.
+  static RollRect painted[128];
+  const int paintedCap = (int)(sizeof(painted) / sizeof(painted[0]));
+  int npt = 0;
+  for (int i = 0; i < nb; ++i) {
+    const RollBar& b = bars[i];
+    if (b.black || !b.have1) continue;
+    uint16_t col = srcPitchColor(b.note);
+    int sy1 = b.have0 ? (int)min(b.y0a, b.y1b) : (int)b.y1b;
+    if (sy1 > b.y1a) {
+      srcRollFill(b.x, b.w, b.y1a, sy1, col);
+      if (npt < paintedCap) painted[npt++] = rollRect(b.x, b.w, b.y1a, sy1);
+    }
+    for (int c = 0; c < ncl; ++c) srcRollFillIntersect(b, cleared[c], col);
+  }
+  // Phase 3: black bars on top — new strip, plus repair over every rect that
+  // phases 1 and 2 touched.
+  for (int i = 0; i < nb; ++i) {
+    const RollBar& b = bars[i];
+    if (!b.black || !b.have1) continue;
+    uint16_t col = srcPitchColor(b.note);
+    int sy1 = b.have0 ? (int)min(b.y0a, b.y1b) : (int)b.y1b;
+    if (sy1 > b.y1a) srcRollFill(b.x, b.w, b.y1a, sy1, col);
+    for (int c = 0; c < ncl; ++c) srcRollFillIntersect(b, cleared[c], col);
+    for (int c = 0; c < npt; ++c) srcRollFillIntersect(b, painted[c], col);
+  }
+  g_rollPrevMs = now;
 }
 
 static int srcCatalogCount() {
@@ -3233,6 +3493,32 @@ static void drawSrc() {
   // ---- Program header (PRG- | name | PRG+) ----
   drawRectBtn(srcPrgDownBtn, TFT_BLUE, COL_BTN_BDR, "PRG-", COL_BTN_TXT, FONT_MED);
   drawRectBtn(srcPrgUpBtn,   TFT_BLUE, COL_BTN_BDR, "PRG+", COL_BTN_TXT, FONT_MED);
+  srcDrawProgramHeader();
+
+  // ---- Piano roll + 88-key live monitor ----
+  // The "Ch nn live monitor" header is gone: the channel strip above already
+  // shows which channel is active, and the colour-coded roll/keys are
+  // self-explanatory.
+  // Frame is drawn ONCE here; per-tick scrolling refills only the interior so
+  // the rounded border doesn't flicker as bars move.
+  if (!srcKeyGeomReady) srcInitKeyboardGeometry();
+  srcDrawKeyboardFull();
+  srcDrawRollFrame();
+  srcDrawRoll();
+
+  // ---- VOL / PB / SUS bottom row ----
+  drawRectBtn(srcVolDownBtn, COL_BTN, COL_BTN_BDR, "VOL-", COL_BTN_TXT, FONT_MED);
+  drawRectBtn(srcVolUpBtn,   COL_BTN, COL_BTN_BDR, "VOL+", COL_BTN_TXT, FONT_MED);
+  srcDrawVolLabel();
+  drawRectBtn(srcPbDownBtn, COL_BTN, COL_BTN_BDR, "PB-",  COL_BTN_TXT, FONT_MED);
+  drawRectBtn(srcPbUpBtn,   COL_BTN, COL_BTN_BDR, "PB+",  COL_BTN_TXT, FONT_MED);
+  srcDrawPbLabel();
+  srcDrawSusBtn();
+}
+
+// ---- SRC widget-level repaints (used by handleSrcTouch so a VOL / PB / SUS /
+// PRG tap doesn't repaint the whole content area) ----
+static void srcDrawProgramHeader() {
   M5.Display.fillRoundRect(srcProgramHeader.x, srcProgramHeader.y,
                            srcProgramHeader.w, srcProgramHeader.h, 12, COL_PANEL);
   M5.Display.drawRoundRect(srcProgramHeader.x, srcProgramHeader.y,
@@ -3250,21 +3536,9 @@ static void drawSrc() {
   }
   M5.Display.drawString(prgBuf, srcProgramHeader.x + 16,
                         srcProgramHeader.y + srcProgramHeader.h / 2);
+}
 
-  // ---- Piano roll + 88-key live monitor ----
-  // The "Ch nn live monitor" header is gone: the channel strip above already
-  // shows which channel is active, and the colour-coded roll/keys are
-  // self-explanatory.
-  // Frame is drawn ONCE here; per-tick scrolling refills only the interior so
-  // the rounded border doesn't flicker as bars move.
-  if (!srcKeyGeomReady) srcInitKeyboardGeometry();
-  srcDrawKeyboardFull();
-  srcDrawRollFrame();
-  srcDrawRoll();
-
-  // ---- VOL / PB / SUS bottom row ----
-  drawRectBtn(srcVolDownBtn, COL_BTN, COL_BTN_BDR, "VOL-", COL_BTN_TXT, FONT_MED);
-  drawRectBtn(srcVolUpBtn,   COL_BTN, COL_BTN_BDR, "VOL+", COL_BTN_TXT, FONT_MED);
+static void srcDrawVolLabel() {
   M5.Display.fillRoundRect(srcVolLabel.x, srcVolLabel.y, srcVolLabel.w, srcVolLabel.h, 10, COL_PANEL);
   M5.Display.drawRoundRect(srcVolLabel.x, srcVolLabel.y, srcVolLabel.w, srcVolLabel.h, 10, COL_BTN_BDR);
   M5.Display.setFont(FONT_MED);
@@ -3273,21 +3547,32 @@ static void drawSrc() {
   char vbuf[16]; snprintf(vbuf, sizeof(vbuf), "VOL:%u", (unsigned)srcVolume[srcChannel]);
   M5.Display.drawString(vbuf, srcVolLabel.x + srcVolLabel.w / 2,
                         srcVolLabel.y + srcVolLabel.h / 2);
+}
 
-  drawRectBtn(srcPbDownBtn, COL_BTN, COL_BTN_BDR, "PB-",  COL_BTN_TXT, FONT_MED);
-  drawRectBtn(srcPbUpBtn,   COL_BTN, COL_BTN_BDR, "PB+",  COL_BTN_TXT, FONT_MED);
+static void srcDrawPbLabel() {
   M5.Display.fillRoundRect(srcPbLabel.x, srcPbLabel.y, srcPbLabel.w, srcPbLabel.h, 10, COL_PANEL);
   M5.Display.drawRoundRect(srcPbLabel.x, srcPbLabel.y, srcPbLabel.w, srcPbLabel.h, 10, COL_BTN_BDR);
+  M5.Display.setFont(FONT_MED);
+  M5.Display.setTextColor(COL_TITLE, COL_PANEL);
+  M5.Display.setTextDatum(middle_center);
   char pbuf[24];
   int pbDelta = (int)srcPitchBend[srcChannel] - 8192;
   snprintf(pbuf, sizeof(pbuf), "PB:%+d", pbDelta);
   M5.Display.drawString(pbuf, srcPbLabel.x + srcPbLabel.w / 2,
                         srcPbLabel.y + srcPbLabel.h / 2);
+}
 
+static void srcDrawSusBtn() {
   bool sus = srcSustain[srcChannel];
   drawRectBtn(srcSusBtn, sus ? COL_BTN_HI : COL_BTN, COL_BTN_BDR,
               sus ? "SUS ON" : "SUS OFF",
               sus ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
+}
+
+static void srcDrawAutoBtn() {
+  drawRectBtn(srcBtnAuto,
+              srcAutoFollow ? COL_BTN_HI : COL_BTN, COL_BTN_BDR, "AUTO",
+              srcAutoFollow ? COL_BTN_TXT_HI : COL_BTN_TXT, FONT_MED);
 }
 
 static void handleSrcTouch(int x, int y) {
@@ -3303,20 +3588,24 @@ static void handleSrcTouch(int x, int y) {
         srcSendCurrentProgram(srcChannel);
         sendUnitCC(srcChannel, 7, srcVolume[srcChannel]);
         srcKeyboardClearVisualState();
+        // Content repaint (strip highlight, program banner, keyboard, roll,
+        // VOL/PB/SUS) plus the CH:/PRG: header text. Header buttons and the
+        // toolbar are unaffected, so no full redraw.
         srcDirtyAll = true;
-        needFullRedraw = true;
+        needPartialUpdate = true;
       }
       return;
     }
   }
 
-  // Program header ± buttons
+  // Program header ± buttons — only the banner and the header readout change.
   if (hit(srcPrgDownBtn, x, y)) {
     int total = srcCatalogCount();
     int cur = srcCurrentCatalogIndex();
     int next = (cur - 1 + total) % total;
     srcSetProgram(srcChannel, (uint8_t)srcCatalogProgramAt(next));
-    needFullRedraw = true;
+    srcDrawProgramHeader();
+    needPartialUpdate = true;
     return;
   }
   if (hit(srcPrgUpBtn, x, y)) {
@@ -3324,7 +3613,8 @@ static void handleSrcTouch(int x, int y) {
     int cur = srcCurrentCatalogIndex();
     int next = (cur + 1) % total;
     srcSetProgram(srcChannel, (uint8_t)srcCatalogProgramAt(next));
-    needFullRedraw = true;
+    srcDrawProgramHeader();
+    needPartialUpdate = true;
     return;
   }
 
@@ -3334,26 +3624,26 @@ static void handleSrcTouch(int x, int y) {
     return;
   }
 
-  // VOL / PB / SUS buttons
+  // VOL / PB / SUS buttons — repaint just the widget that changed.
   if (hit(srcVolDownBtn, x, y)) {
     int v = (int)srcVolume[srcChannel] - 4; if (v < 0) v = 0;
-    srcSetVolume(srcChannel, (uint8_t)v); needPartialUpdate = true; needFullRedraw = true; return;
+    srcSetVolume(srcChannel, (uint8_t)v); srcDrawVolLabel(); return;
   }
   if (hit(srcVolUpBtn, x, y)) {
     int v = (int)srcVolume[srcChannel] + 4; if (v > 127) v = 127;
-    srcSetVolume(srcChannel, (uint8_t)v); needFullRedraw = true; return;
+    srcSetVolume(srcChannel, (uint8_t)v); srcDrawVolLabel(); return;
   }
   if (hit(srcPbDownBtn, x, y)) {
     int v = (int)srcPitchBend[srcChannel] - 512; if (v < 0) v = 0;
-    srcSetPitchBend(srcChannel, (uint16_t)v); needFullRedraw = true; return;
+    srcSetPitchBend(srcChannel, (uint16_t)v); srcDrawPbLabel(); return;
   }
   if (hit(srcPbUpBtn, x, y)) {
     int v = (int)srcPitchBend[srcChannel] + 512; if (v > 16383) v = 16383;
-    srcSetPitchBend(srcChannel, (uint16_t)v); needFullRedraw = true; return;
+    srcSetPitchBend(srcChannel, (uint16_t)v); srcDrawPbLabel(); return;
   }
   if (hit(srcSusBtn, x, y)) {
     srcSetSustain(srcChannel, !srcSustain[srcChannel]);
-    needFullRedraw = true;
+    srcDrawSusBtn();
     return;
   }
 }
@@ -3471,6 +3761,10 @@ static void drawSmf() {
       contentArea.w,
       contentArea.h + navArea.h
     };
+    // The band was just cleared, so the monitor base (16 keyboard rows)
+    // must be repainted in full — the incremental dirty-key path alone
+    // would leave a black area with only the changing keys visible.
+    invalidateSmfMonitorAll();
     drawSmfChannelKeyboard(fullArea);
     return;
   }
@@ -3522,19 +3816,12 @@ static void drawMp3() {
   if (mp3Playing || mp3VisualDirty) drawMp3Visual();
 }
 
-static void drawInterface() {
-  // SRC fullscreen instrument picker takes over the entire screen, including
-  // header/toolbar, so it draws first and short-circuits.
-  if (g_srcPickerOpen) {
-    drawSrcPicker();
-    return;
-  }
-  M5.Display.fillScreen(COL_BG);
-  drawHeader();
-  drawToolbarApp();
-  drawNavApp();
+// Content (+ nav, for the apps that use the bottom band) of whatever is
+// currently showing. Used by the full redraw and by needContentRedraw.
+// Every branch paints its own background, so no fillScreen is needed.
+static void drawContentApp() {
   // CONFIG_EDIT / BASE_SET overlay completely takes over the content + nav
-  // areas but leaves the header/toolbar visible (so BT/AOFF/MIDI in still
+  // areas but leaves the header/toolbar visible (so AOFF / MIDI input still
   // show through). Falls through to the per-app draw on normal modes.
   if (currentMode == CONFIG_EDIT_MODE) { drawConfigEditMode(); return; }
   if (currentMode == BASE_SET_MODE)    { drawBaseSetMode();    return; }
@@ -3550,11 +3837,37 @@ static void drawInterface() {
       break;
     case APP_MIDI: drawMidiManage(); break;
     case APP_PLAY:
-      if      (currentPlay == PLAY_SRC) drawSrc();
-      else if (currentPlay == PLAY_SMF) drawSmf();
-      else                              drawMp3();
+      if (currentPlay == PLAY_SRC) {
+        drawSrc();
+      } else if (currentPlay == PLAY_SMF) {
+        drawSmf();
+      } else {
+        // drawMp3() is incremental (dirty-flag driven). A content repaint
+        // has to force both layers, otherwise a full redraw taken while the
+        // flags are clear (AOFF / MIX tap during MP3) leaves the playlist
+        // and cassette panels blank.
+        mp3StaticDirty = true;
+        mp3VisualDirty = true;
+        drawMp3();
+      }
       break;
   }
+}
+
+static void drawInterface() {
+  // SRC fullscreen instrument picker takes over the entire screen, including
+  // header/toolbar, so it draws first and short-circuits.
+  if (g_srcPickerOpen) {
+    drawSrcPicker();
+    return;
+  }
+  // No fillScreen here: header / toolbar / nav / content each clear their own
+  // band, and the four bands tile the panel exactly. The old fillScreen was a
+  // redundant 1.8 MB framebuffer write on every full repaint.
+  drawHeader();
+  drawToolbarApp();
+  drawNavApp();
+  drawContentApp();
 }
 
 // =================================================================
@@ -3642,6 +3955,7 @@ static void usbMidiInDoneCb(usb_transfer_t* t) {
       if (n == 0) continue;
       usbMidiRingPush(p + 1, n);
     }
+    wakeMidiTask();   // drain immediately instead of waiting for the 1 ms poll
   }
   // Re-arm only when the transfer ended cleanly AND the device is still
   // mounted. Resubmitting after NO_DEVICE / CANCELED races the teardown and
@@ -3658,7 +3972,7 @@ static void usbMidiInDoneCb(usb_transfer_t* t) {
         e = usb_host_transfer_submit(t);
       }
       if (e != ESP_OK) {
-        ++g_usbInResubmitFails;
+        g_usbInResubmitFails = g_usbInResubmitFails + 1;
       }
     }
   }
@@ -3962,22 +4276,24 @@ static void handleToolbarTouch(int x, int y) {
       return;
     }
   }
-  // AOFF button is always visible.
+  // AOFF button is always visible. Only its own colour changes.
   if (hit(btnAllOff, x, y)) {
     allNotesOffEnabled = !allNotesOffEnabled;
     if (allNotesOffEnabled) sendAllNotesOff();
-    needFullRedraw = true;
+    drawAllOffBtn();
     return;
   }
 
   // MIDI app: FILTER / MAPPER / BYPASS|ACTIVE
   if (currentApp == APP_MIDI) {
+    // Page switch changes the header title too → full redraw.
     if (hit(midiAppTabFilter, x, y)) { midiManagePage = MIDI_PAGE_FILTER; needFullRedraw = true; return; }
     if (hit(midiAppTabMapper, x, y)) { midiManagePage = MIDI_PAGE_MAPPER; needFullRedraw = true; return; }
     if (hit(midiAppBypassBtn, x, y)) {
       if (midiManagePage == MIDI_PAGE_FILTER) midiFilterBypass = !midiFilterBypass;
       else                                     midiMapperBypass = !midiMapperBypass;
-      needFullRedraw = true;
+      needToolbarRedraw = true;        // BYPASS/ACTIVE button
+      requestMidiManageRefresh();      // summary card shows the state too
       return;
     }
     return;
@@ -4011,24 +4327,25 @@ static void handleToolbarTouch(int x, int y) {
   if ((currentApp == APP_PLAY && currentPlay == PLAY_SRC)) {
     if (hit(srcBtnGm, x, y)) {
       sendGMReset(); delay(30);
-      srcResetState(true);
-      needFullRedraw = true;
+      srcResetState(true);             // sets srcDirtyAll → content repaint
+      needPartialUpdate = true;        // CH:/PRG: header readout
       return;
     }
     if (hit(srcBtnGs, x, y)) {
       sendGSReset(); delay(30);
       srcResetState(true);
-      needFullRedraw = true;
+      needPartialUpdate = true;
       return;
     }
     if (hit(srcBtnInit, x, y)) {
       srcHardReset();
-      needFullRedraw = true;
+      needPartialUpdate = true;
       return;
     }
     if (hit(srcBtnAuto, x, y)) {
       srcAutoFollow = !srcAutoFollow;
-      needFullRedraw = true;
+      srcDrawAutoBtn();
+      needPartialUpdate = true;        // header readout colour tracks AUTO
       return;
     }
     return;  // toolbar y-range; content widgets are handled by handleSrcTouch.
@@ -4041,22 +4358,26 @@ static void handleToolbarTouch(int x, int y) {
         i = (i - 1 + smfPlaylistCount) % smfPlaylistCount;
         if (entryIsFile(smfPlaylist[i])) { loadSmfTrack(i); break; }
       }
-      needFullRedraw = true;
+      needContentRedraw = true;        // list highlight / monitor
+      needPartialUpdate = true;        // elapsed-time readout
     } else if (hit(smfBtnPlay, x, y)) {
       if (smfPlaying) stopSmf();
       else playSmf();
-      needFullRedraw = true;
+      needToolbarRedraw = true;        // PLAY ⇄ STOP
+      needContentRedraw = true;        // list ⇄ channel monitor
+      needPartialUpdate = true;
     } else if (hit(smfBtnNext, x, y) && smfPlaylistCount > 0) {
       int i = (smfCurrentTrack >= 0) ? smfCurrentTrack : -1;
       for (int n = 0; n < smfPlaylistCount; n++) {
         i = (i + 1) % smfPlaylistCount;
         if (entryIsFile(smfPlaylist[i])) { loadSmfTrack(i); break; }
       }
-      needFullRedraw = true;
+      needContentRedraw = true;
+      needPartialUpdate = true;
     } else if (hit(smfBtnLoop, x, y)) {
       smfLoop = !smfLoop;
-      smf.looping(smfLoop);
-      needFullRedraw = true;
+      { SmfLock lk; smf.looping(smfLoop); }
+      needToolbarRedraw = true;        // RPTON ⇄ RPTOFF only
     }
     return;
   }
@@ -4068,21 +4389,24 @@ static void handleToolbarTouch(int x, int y) {
         i = (i - 1 + mp3PlaylistCount) % mp3PlaylistCount;
         if (entryIsFile(mp3Playlist[i])) { startMp3Track(i); break; }
       }
-      needFullRedraw = true;
+      needToolbarRedraw = true;
+      needPartialUpdate = true;        // startMp3Track already set mp3StaticDirty
     } else if (hit(mp3BtnPlay, x, y)) {
       if (mp3Playing) stopMp3();
       else if (mp3CurrentTrack >= 0 && mp3CurrentTrack < mp3PlaylistCount &&
                entryIsFile(mp3Playlist[mp3CurrentTrack])) {
         startMp3Track(mp3CurrentTrack);
       }
-      needFullRedraw = true;
+      needToolbarRedraw = true;
+      needPartialUpdate = true;
     } else if (hit(mp3BtnNext, x, y) && mp3PlaylistCount > 0) {
       int i = (mp3CurrentTrack >= 0) ? mp3CurrentTrack : -1;
       for (int n = 0; n < mp3PlaylistCount; n++) {
         i = (i + 1) % mp3PlaylistCount;
         if (entryIsFile(mp3Playlist[i])) { startMp3Track(i); break; }
       }
-      needFullRedraw = true;
+      needToolbarRedraw = true;
+      needPartialUpdate = true;
     } else if (hit(mp3BtnVolDown, x, y)) {
       mp3Volume = max(0, mp3Volume - 16);
       M5.Speaker.setVolume(mp3Volume);
@@ -4097,7 +4421,8 @@ static void handleToolbarTouch(int x, int y) {
     return;
   }
 
-  // XPOSE mode tabs.
+  // XPOSE mode tabs. The header title is the same for all four sub-modes,
+  // so only the toolbar (tab highlight + RANGE label) and the content change.
   if (currentApp != APP_TRANSPOSE) return;
   for (int i = 0; i < 4; i++) {
     if (hit(modeTab[i], x, y)) {
@@ -4109,29 +4434,26 @@ static void handleToolbarTouch(int x, int y) {
       else if (currentMode == SEQUENCE_MODE) {
         handleTransposeChange(seqPatterns[seqCurrentPattern][seqCurrentStep]);
       }
-      needFullRedraw = true;
+      needToolbarRedraw = true;
+      needContentRedraw = true;
       return;
     }
   }
-  // Range button.
+  // Range button: its own label plus the content it parameterises.
   if (hit(btnRange, x, y)) {
     if (currentMode == DIRECT_MODE) {
       transposeRange = (TransposeRange)((transposeRange + 1) % 3);
       updateDirectButtonLabels();
       setCurrentTransposeButton();
-      needFullRedraw = true;
+      drawRangeBtn();
+      needContentRedraw = true;
     } else if (currentMode == KEY_MODE) {
       cycleKeyDirection();
       selectedMajorKey = -1;
       selectedMinorKey = -1;
-      needFullRedraw = true;
+      drawRangeBtn();
+      needContentRedraw = true;
     }
-    return;
-  }
-  // All-notes-off toggle.
-  if (hit(btnAllOff, x, y)) {
-    allNotesOffEnabled = !allNotesOffEnabled;
-    needFullRedraw = true;
     return;
   }
 }
@@ -4154,12 +4476,14 @@ static int buildValueList(int8_t* out) {
 
 static void shiftTransposeBy(int dir) {
   if (currentMode == SEQUENCE_MODE) {
+    int oldStep = seqCurrentStep;
     if (dir < 0)
       seqCurrentStep = (seqCurrentStep > 0) ? seqCurrentStep - 1 : SEQ_STEP_COUNT - 1;
     else
       seqCurrentStep = (seqCurrentStep < SEQ_STEP_COUNT - 1) ? seqCurrentStep + 1 : 0;
     handleTransposeChange(seqPatterns[seqCurrentPattern][seqCurrentStep]);
-    needFullRedraw = true;
+    drawSeqSlot(oldStep);
+    drawSeqSlot(seqCurrentStep);
     return;
   }
 
@@ -4170,16 +4494,26 @@ static void shiftTransposeBy(int dir) {
   if (idx < 0) idx = n / 2;
   int newIdx = (dir < 0) ? ((idx > 0) ? idx - 1 : n - 1)
                          : ((idx < n - 1) ? idx + 1 : 0);
+  int8_t oldValue = transposeValue;
   handleTransposeChange(values[newIdx]);
 
   if (currentMode == DIRECT_MODE) {
+    // Repaint only the button that lost the highlight and the one that got it.
+    int oldLit = -1;
+    for (int j = 0; j < 12; j++) if (transposeButtonsOn[j]) { oldLit = j; break; }
     for (int j = 0; j < 12; j++) transposeButtonsOn[j] = false;
     transposeButtonsOn[newIdx] = true;
+    if (oldLit >= 0 && oldLit != newIdx) drawDirectBtn(oldLit);
+    drawDirectBtn(newIdx);
   } else if (currentMode == KEY_MODE) {
     selectedMajorKey = -1;
     selectedMinorKey = -1;
+    needContentRedraw = true;
+  } else if (currentMode == INSTANT_MODE) {
+    drawInstantBtnsForValues(oldValue, transposeValue);
+  } else {
+    needContentRedraw = true;
   }
-  needFullRedraw = true;
 }
 
 static void handleNavTouch(int x, int y) {
@@ -4201,9 +4535,13 @@ static void handleDirectTouch(int x, int y) {
   for (int i = 0; i < 12; i++) {
     if (hit(directBtns[i].r, x, y)) {
       handleTransposeChange(directBtns[i].value);
+      int oldLit = -1;
+      for (int j = 0; j < 12; j++) if (transposeButtonsOn[j]) { oldLit = j; break; }
       for (int j = 0; j < 12; j++) transposeButtonsOn[j] = false;
       transposeButtonsOn[i] = true;
-      needFullRedraw = true;
+      // Two buttons and the header readout — not the whole screen.
+      if (oldLit >= 0 && oldLit != i) drawDirectBtn(oldLit);
+      drawDirectBtn(i);
       return;
     }
   }
@@ -4220,7 +4558,7 @@ static void handleKeyTouch(int x, int y) {
         selectedMinorKey = -1;
         int8_t nv = majorUpperTranspose ? (int8_t)(12 - i) : (int8_t)(-i);
         handleTransposeChange(nv);
-        needFullRedraw = true;
+        needContentRedraw = true;   // 24 keys; header/toolbar untouched
         return;
       }
     }
@@ -4231,7 +4569,7 @@ static void handleKeyTouch(int x, int y) {
         selectedMajorKey = -1;
         int8_t nv = minorUpperTranspose ? (int8_t)(-(9 - i)) : (int8_t)(9 - i);
         handleTransposeChange(nv);
-        needFullRedraw = true;
+        needContentRedraw = true;
         return;
       }
     }
@@ -4239,15 +4577,16 @@ static void handleKeyTouch(int x, int y) {
 }
 
 static void handleInstantTouch(int x, int y) {
+  int8_t oldValue = transposeValue;
   if (hit(instantZero, x, y)) {
     handleTransposeChange(0);
-    needFullRedraw = true;
+    drawInstantBtnsForValues(oldValue, transposeValue);
     return;
   }
   for (int i = 0; i < 8; i++) {
     if (hit(instantBtns[i].r, x, y)) {
       handleTransposeChange(instantBtns[i].value);
-      needFullRedraw = true;
+      drawInstantBtnsForValues(oldValue, transposeValue);
       return;
     }
   }
@@ -4258,42 +4597,46 @@ static void handleSequenceTouch(int x, int y) {
     seqCurrentPattern = (seqCurrentPattern > 0) ? seqCurrentPattern - 1 : SEQ_PATTERN_COUNT - 1;
     seqCurrentStep = 0;
     handleTransposeChange(seqPatterns[seqCurrentPattern][seqCurrentStep]);
-    needFullRedraw = true;
+    needContentRedraw = true;      // every slot value changes
     return;
   }
   if (hit(seqPatRight, x, y)) {
     seqCurrentPattern = (seqCurrentPattern < SEQ_PATTERN_COUNT - 1) ? seqCurrentPattern + 1 : 0;
     seqCurrentStep = 0;
     handleTransposeChange(seqPatterns[seqCurrentPattern][seqCurrentStep]);
-    needFullRedraw = true;
+    needContentRedraw = true;
     return;
   }
   if (hit(seqSave, x, y)) {
     g_seqSavePending = true;
     g_seqSaveUiState = SEQ_SAVE_UI_PENDING;
     g_seqSaveUiUntil = 0;
-    needFullRedraw = true;
+    drawSeqSaveBtn();
     return;
   }
   for (int i = 0; i < SEQ_STEP_COUNT; i++) {
+    int oldStep = seqCurrentStep;
     if (hit(seqSteps[i].up, x, y)) {
       seqPatterns[seqCurrentPattern][i] = clampTranspose(seqPatterns[seqCurrentPattern][i] + 1);
       seqCurrentStep = i;
       handleTransposeChange(seqPatterns[seqCurrentPattern][i]);
-      needFullRedraw = true;
+      if (oldStep != i) drawSeqSlot(oldStep);
+      drawSeqSlot(i);
       return;
     }
     if (hit(seqSteps[i].down, x, y)) {
       seqPatterns[seqCurrentPattern][i] = clampTranspose(seqPatterns[seqCurrentPattern][i] - 1);
       seqCurrentStep = i;
       handleTransposeChange(seqPatterns[seqCurrentPattern][i]);
-      needFullRedraw = true;
+      if (oldStep != i) drawSeqSlot(oldStep);
+      drawSeqSlot(i);
       return;
     }
     if (hit(seqSteps[i].slot, x, y)) {
       seqCurrentStep = i;
       handleTransposeChange(seqPatterns[seqCurrentPattern][i]);
-      needFullRedraw = true;
+      if (oldStep != i) drawSeqSlot(oldStep);
+      drawSeqSlot(i);
       return;
     }
   }
@@ -4578,6 +4921,7 @@ static void clearSmfChannelNotes(uint8_t channel) {
 }
 
 static void closeSmf() {
+  SmfLock lk;
   smf.pause(true);
   smf.close();
   smfLoaded = false;
@@ -4590,6 +4934,7 @@ static bool loadSmfTrack(int index) {
   if (!ensureStorage() || !midiFsReady || smfPlaylistCount == 0) return false;
   if (index < 0 || index >= smfPlaylistCount) return false;
 
+  SmfLock lk;   // keep the sequencer task off the parser while we swap files
   closeSmf();
   smf.begin(&midiSd);
   smf.setMidiHandler(smfMidiEventHandler);
@@ -4624,6 +4969,7 @@ static void playSmf(bool sendReset) {
   if (!smfLoaded) {
     if (!loadSmfTrack(smfCurrentTrack)) return;
   }
+  SmfLock lk;
   resetSmfKeyboard();
   sendAllNotesOff();
   if (sendReset && g_config.smfStartGSReset) {
@@ -4637,14 +4983,18 @@ static void playSmf(bool sendReset) {
   smfPausedElapsedMs = 0;
   smfPlaybackStartMs = millis();
   invalidateSmfMonitorAll();
-  needFullRedraw = true;
+  needToolbarRedraw = true;    // PLAY → STOP
+  needContentRedraw = true;    // playlist → channel monitor
   needPartialUpdate = true;
 }
 
 static void stopSmf() {
   if (!smfLoaded) return;
-  smf.pause(true);
-  smfPlaying = false;
+  {
+    SmfLock lk;
+    smf.pause(true);
+    smfPlaying = false;
+  }
   smfPausedElapsedMs = 0;
   sendAllNotesOff();
   resetSmfKeyboard();
@@ -4670,9 +5020,9 @@ static void smfMidiEventHandler(midi_event* pev) {
   }
   {
     Serial2TxLock lk;
+    Serial2.write(message, messageSize);   // one driver call per event
+    midiOutCount += messageSize;
     for (uint8_t i = 0; i < messageSize; ++i) {
-      Serial2.write(message[i]);
-      ++midiOutCount;
       if (!isHeartbeatByte(message[i])) ++midiOutRealCount;
     }
   }
@@ -4704,9 +5054,9 @@ static void smfSysexEventHandler(sysex_event* pev) {
   uint16_t n = pev->size;
   if (n > cap) n = cap;
   Serial2TxLock lk;
+  Serial2.write(pev->data, n);
+  midiOutCount += n;
   for (uint16_t i = 0; i < n; ++i) {
-    Serial2.write(pev->data[i]);
-    ++midiOutCount;
     if (!isHeartbeatByte(pev->data[i])) ++midiOutRealCount;
   }
 }
@@ -4715,38 +5065,77 @@ static void smfMetaEventHandler(const meta_event* mev) {
   (void)mev;
 }
 
-static void processSmf() {
-  if (!smfPlaying || !smfLoaded) return;
+// One sequencer step. Runs on the SMF task (core 0) under g_smfMux; the UI
+// thread never calls this. Returns true when the file reached its end so
+// the UI thread can stop / restart playback on its own schedule.
+static bool smfTaskStep() {
+  if (!smfPlaying || !smfLoaded) return false;
   uint32_t startUs = micros();
   bool advanced = false;
   // Process events in short bursts. Each MD_MIDIFile::getNextEvent advances
   // by at most a tick, so a single call is normally cheap, but if the file
   // has many simultaneous events (chord stacks etc.) it can take a while.
-  // Cap the time spent here per loop iteration so audio/UI/touch remain
-  // responsive and we never starve the IDLE task long enough to trip the
-  // 5-second task watchdog.
+  // Cap the time spent per step so the lock is released often enough for
+  // the UI thread's load/stop calls to get in.
   while ((micros() - startUs) < 4000UL) {
     // Serial2 (MIDI OUT) runs at 31.25 kbaud — only ~4 bytes drain per ms.
-    // The TX buffer is 512 bytes. If it is nearly full, the next
-    // Serial2.write() inside the event handler will block past our 4 ms
-    // cap and starve the IDLE task long enough to trip the watchdog.
-    // Hold off when there is not enough headroom for a worst-case event
-    // (a 50-byte SysEx). The next loop iteration will retry once the UART
-    // has drained.
+    // Hold off when the TX ring lacks headroom for a worst-case event (a
+    // 50-byte SysEx) so the event handler's write never blocks while we
+    // hold two mutexes. The next step retries once the UART has drained.
     if (Serial2.availableForWrite() < 64) break;
     bool a = smf.getNextEvent();
     if (a) advanced = true;
     if (!a) break;
     if (smf.isEOF()) break;
   }
-  if (advanced && smf.isEOF()) {
-    if (smfLoop) {
-      playSmf(false);
-    } else {
-      stopSmf();
-    }
-    needFullRedraw = true;
+  return advanced && smf.isEOF();
+}
+
+// Called from loop() when the sequencer task reported end-of-file.
+static void processSmfEof() {
+  if (smfLoop) {
+    playSmf(false);
+  } else {
+    stopSmf();
   }
+  needToolbarRedraw = true;
+  needContentRedraw = true;
+  needPartialUpdate = true;
+}
+
+// =================================================================
+//  SMF sequencer task (core 0, priority 6)
+// =================================================================
+// Previously getNextEvent() was pumped from loop() on the UI core, so every
+// full-screen repaint (tens of ms) or SD directory scan stalled the
+// sequencer and audibly smeared the timing. The dedicated task ticks every
+// millisecond regardless of what the UI is doing. It only touches the
+// parser under g_smfMux, and hands end-of-file back to loop() via a flag so
+// SD re-open / All Notes Off / redraws stay on the UI thread.
+static void smf_task(void* /*pv*/) {
+  for (;;) {
+    if (smfPlaying && smfLoaded) {
+      bool eof = false;
+      if (xSemaphoreTakeRecursive(g_smfMux, pdMS_TO_TICKS(5)) == pdTRUE) {
+        eof = smfTaskStep();
+        xSemaphoreGiveRecursive(g_smfMux);
+      }
+      if (eof) {
+        g_smfEofPending = true;
+        // Let the UI thread handle it before we look at the parser again.
+        vTaskDelay(pdMS_TO_TICKS(20));
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+}
+
+static void startSmfTask() {
+  if (g_smfTaskHandle) return;
+  xTaskCreatePinnedToCore(smf_task, "smf_seq", 8192, nullptr, 6, &g_smfTaskHandle, 0);
 }
 
 static void scanMp3Files() {
@@ -4831,6 +5220,7 @@ static bool startMp3Track(int index) {
   if (!ensureStorage() || mp3PlaylistCount == 0) return false;
   if (index < 0 || index >= mp3PlaylistCount) return false;
 
+  Mp3Lock lk;   // decoder task must not run loop() while we re-arm the decoder
   stopMp3();
   mp3CurrentTrack = index;
   const char* path = mp3Playlist[index];
@@ -4874,6 +5264,7 @@ static bool startMp3Track(int index) {
 }
 
 static void stopMp3() {
+  Mp3Lock lk;
   if (mp3Playing) {
     mp3Decoder.stop();
     mp3Out.stop();
@@ -4892,19 +5283,60 @@ static void stopMp3() {
   mp3VisualDirty = true;
 }
 
-static void processMp3() {
-  if (!mp3Playing) return;
-  if (!mp3Decoder.loop() || !mp3Decoder.isRunning()) {
+// UI-side per-tick work for MP3: cassette animation and the "decoder
+// finished" hand-off from the decode task.
+static void processMp3Ui() {
+  if (g_mp3EndedPending) {
+    g_mp3EndedPending = false;
     stopMp3();
+    needToolbarRedraw = true;
     needPartialUpdate = true;
     return;
   }
+  if (!mp3Playing) return;
   uint32_t now = millis();
   if (now - mp3LastAnimMs >= 120) {
     mp3LastAnimMs = now;
     mp3CassetteAngle += 0.25f;
     mp3VisualDirty = true;
   }
+}
+
+// =================================================================
+//  MP3 decoder task (core 0, priority 4)
+// =================================================================
+// libmad frame decoding used to run inside loop() on the UI core, where a
+// full-screen repaint could stall it long enough for the speaker queue to
+// run dry (audible clicks). The task now feeds the speaker from core 0.
+// AudioOutputM5Speaker::ConsumeSample() returns false instead of blocking
+// when both speaker slots are queued, so loop() returns quickly and the task
+// sleeps a tick — IDLE0 (which the task watchdog monitors) always gets time.
+static void mp3_task(void* /*pv*/) {
+  for (;;) {
+    if (mp3Playing) {
+      bool ended = false;
+      if (xSemaphoreTakeRecursive(g_mp3Mux, pdMS_TO_TICKS(5)) == pdTRUE) {
+        if (mp3Playing) {
+          if (!mp3Decoder.loop() || !mp3Decoder.isRunning()) ended = true;
+        }
+        xSemaphoreGiveRecursive(g_mp3Mux);
+      }
+      if (ended) {
+        g_mp3EndedPending = true;
+        vTaskDelay(pdMS_TO_TICKS(20));   // wait for the UI thread to tear down
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+}
+
+static void startMp3Task() {
+  if (g_mp3TaskHandle) return;
+  // libmad's layer-III synthesis keeps sizeable arrays on the stack.
+  xTaskCreatePinnedToCore(mp3_task, "mp3_dec", 16384, nullptr, 4, &g_mp3TaskHandle, 0);
 }
 
 static void handleSmfTouch(int x, int y) {
@@ -4914,31 +5346,33 @@ static void handleSmfTouch(int x, int y) {
   if (visible < 1) visible = 1;
   int pageStep = max(1, visible - 1);
   int maxScroll = max(0, smfPlaylistCount - visible);
+  // Scrolling / folder navigation / track selection all live inside the
+  // content band — header and toolbar never change here.
   if (hit(smfListPageUpBtn, x, y)) {
     if (smfListScroll > 0) {
       smfListScroll = max(0, smfListScroll - pageStep);
-      needFullRedraw = true;
+      needContentRedraw = true;
     }
     return;
   }
   if (hit(smfListUpBtn, x, y)) {
     if (smfListScroll > 0) {
       smfListScroll--;
-      needFullRedraw = true;
+      needContentRedraw = true;
     }
     return;
   }
   if (hit(smfListDownBtn, x, y)) {
     if (smfListScroll < maxScroll) {
       smfListScroll++;
-      needFullRedraw = true;
+      needContentRedraw = true;
     }
     return;
   }
   if (hit(smfListPageDownBtn, x, y)) {
     if (smfListScroll < maxScroll) {
       smfListScroll = min(maxScroll, smfListScroll + pageStep);
-      needFullRedraw = true;
+      needContentRedraw = true;
     }
     return;
   }
@@ -4951,7 +5385,7 @@ static void handleSmfTouch(int x, int y) {
         playlistGoUp(smfCurrentDir, SMF_FOLDER);
         smfCurrentTrack = -1;
         scanSmfFiles();
-        needFullRedraw = true;
+        needContentRedraw = true;
       } else if (entryIsDir(path)) {
         // Drop the trailing slash so the value matches what SD.open() expects.
         strlcpy(smfCurrentDir, path, sizeof(smfCurrentDir));
@@ -4959,10 +5393,11 @@ static void handleSmfTouch(int x, int y) {
         if (n > 0 && smfCurrentDir[n - 1] == '/') smfCurrentDir[n - 1] = '\0';
         smfCurrentTrack = -1;
         scanSmfFiles();
-        needFullRedraw = true;
+        needContentRedraw = true;
       } else {
         loadSmfTrack(idx);
-        needFullRedraw = true;
+        needContentRedraw = true;
+        needPartialUpdate = true;   // elapsed-time readout resets
       }
     }
   }
@@ -5015,17 +5450,20 @@ static void handleMp3Touch(int x, int y) {
         playlistGoUp(mp3CurrentDir, MP3_FOLDER);
         mp3CurrentTrack = -1;
         scanMp3Files();
-        needFullRedraw = true;
+        mp3StaticDirty = true;
+        needPartialUpdate = true;
       } else if (entryIsDir(path)) {
         strlcpy(mp3CurrentDir, path, sizeof(mp3CurrentDir));
         size_t n = strlen(mp3CurrentDir);
         if (n > 0 && mp3CurrentDir[n - 1] == '/') mp3CurrentDir[n - 1] = '\0';
         mp3CurrentTrack = -1;
         scanMp3Files();
-        needFullRedraw = true;
+        mp3StaticDirty = true;
+        needPartialUpdate = true;
       } else {
-        startMp3Track(idx);
-        needFullRedraw = true;
+        startMp3Track(idx);              // sets mp3StaticDirty / mp3VisualDirty
+        needToolbarRedraw = true;        // PLAY → STOP
+        needPartialUpdate = true;
       }
     }
   }
@@ -5168,7 +5606,7 @@ static void processDeferredStorageTasks(uint32_t now) {
   if (g_seqSaveUiState != SEQ_SAVE_UI_IDLE && g_seqSaveUiUntil != 0 && now >= g_seqSaveUiUntil) {
     g_seqSaveUiState = SEQ_SAVE_UI_IDLE;
     g_seqSaveUiUntil = 0;
-    needFullRedraw = true;
+    if (isSeqScreenVisible()) drawSeqSaveBtn();
   }
 
   if (!g_seqSavePending || !isMidiInputIdle(now)) return;
@@ -5184,7 +5622,7 @@ static void processDeferredStorageTasks(uint32_t now) {
   bool ok = saveSequencesToSD();
   g_seqSaveUiState = ok ? SEQ_SAVE_UI_OK : SEQ_SAVE_UI_ERR;
   g_seqSaveUiUntil = now + (ok ? 1200 : 1600);
-  needFullRedraw = true;
+  if (isSeqScreenVisible()) drawSeqSaveBtn();
 }
 
 static int getMIDIMessageLength(uint8_t status) {
@@ -5646,6 +6084,11 @@ static void handleParsedMidiMessage(const MidiMessage& inMsg) {
   outputMidiMessage(mapped);                            // Transpose + 送信
 }
 
+// Every MIDI message leaves through one Serial2.write(buf, n) call: each
+// write() is a trip through the IDF UART driver (ring-buffer lock, ISR
+// enable), so sending a 3-byte Note On as one call instead of three cuts
+// that overhead by two thirds and keeps the message contiguous in the TX
+// ring even if the mutex is contended.
 static void sendMIDIMessage(uint8_t* buffer, int length) {
   Serial2TxLock lk;  // serialise with UI-thread sends so chord bytes don't tangle
   uint8_t status = buffer[0];
@@ -5657,21 +6100,14 @@ static void sendMIDIMessage(uint8_t* buffer, int length) {
     uint8_t vel  = buffer[2];
     bool isNoteOn = (type == 0x90) && (vel > 0);
     int idx = getTrackedNoteStateIndex(note, channel);
+    int16_t transposed;
 
     if (isNoteOn) {
-      int16_t transposed = note + transposeValue;
-      if (transposed >= 0 && transposed <= 127) {
-        Serial2.write(status);
-        Serial2.write((uint8_t)transposed);
-        Serial2.write(vel);
-        midiOutCount += 3;
-        midiOutRealCount += 3;   // NoteOn — real event
-        if (idx >= 0) {
-          currentNoteStates[idx] = { true, (int8_t)transposeValue, channel, vel };
-        }
+      transposed = note + transposeValue;
+      if (transposed >= 0 && transposed <= 127 && idx >= 0) {
+        currentNoteStates[idx] = { true, (int8_t)transposeValue, channel, vel };
       }
     } else {
-      int16_t transposed;
       if (idx >= 0) {
         if (currentNoteStates[idx].isActive) {
           transposed = note + currentNoteStates[idx].originalTranspose;
@@ -5685,17 +6121,16 @@ static void sendMIDIMessage(uint8_t* buffer, int length) {
       } else {
         transposed = note + transposeValue;
       }
-      if (transposed >= 0 && transposed <= 127) {
-        Serial2.write(status);
-        Serial2.write((uint8_t)transposed);
-        Serial2.write(vel);
-        midiOutCount += 3;
-        midiOutRealCount += 3;   // NoteOff — real event
-      }
+    }
+    if (transposed >= 0 && transposed <= 127) {
+      uint8_t out[3] = { status, (uint8_t)transposed, vel };
+      Serial2.write(out, 3);
+      midiOutCount += 3;
+      midiOutRealCount += 3;   // Note On / Off — real event
     }
   } else {
+    Serial2.write(buffer, length);
     for (int i = 0; i < length; i++) {
-      Serial2.write(buffer[i]);
       if (!isHeartbeatByte(buffer[i])) ++midiOutRealCount;
     }
     midiOutCount += length;
@@ -5882,27 +6317,23 @@ static void processMidiInput() {
 }
 
 // =================================================================
-//  Dedicated MIDI I/O task (core 0)
+//  Dedicated MIDI I/O task (core 1, priority 10)
 // =================================================================
-// Runs processMidiInput() on a separate FreeRTOS task pinned to a dedicated
-// core at high priority, so heavy UI redraws on the main loop — like the SRC
-// piano-roll repaint — don't starve the MIDI input drain. Without this, a
-// 7–10 ms fillRect on the piano-roll panel could let the Serial2 RX buffer
-// accumulate enough bytes that a chord Note Off in the middle of a burst
-// gets cut off mid-message.
+// Runs processMidiInput() on a separate FreeRTOS task at high priority, so
+// heavy UI redraws on the main loop don't starve the MIDI input drain.
+// Without this, a long fillRect could let the Serial2 RX buffer accumulate
+// enough bytes that a chord Note Off in the middle of a burst gets cut off
+// mid-message.
 //
-// The task wakes every 1 ms via vTaskDelay so it doesn't busy-spin. At
-// 31.25 kbaud, 1 ms covers ~3 incoming bytes — plenty of headroom.
-static TaskHandle_t g_midiTaskHandle = nullptr;
-
+// Wake-up: the task blocks on a task notification that the UART RX event
+// task (Serial2.onReceive) and the USB IN-transfer callback raise as soon
+// as bytes land, so a byte is normally picked up within a context switch
+// rather than after a polling interval. A 1 ms timeout remains as a
+// fallback so nothing depends on the notification path.
 static void midi_io_task(void* /*pv*/) {
   for (;;) {
     processMidiInput();
-    // 1 ms wake-up interval, expressed in tick-rate-agnostic units. With
-    // arduino-esp32's default 1 kHz tick this is 1 tick; on builds with a
-    // slower tick rate it floors to 0 and we yield without sleeping (still
-    // bounded — the task is the highest-priority cooperative consumer here).
-    vTaskDelay(pdMS_TO_TICKS(1));
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
   }
 }
 
@@ -5920,14 +6351,20 @@ static void startMidiIoTask() {
 }
 
 static void sendAllNotesOff() {
-  Serial2TxLock lk;
-  for (int ch = 0; ch < 16; ch++) {
-    Serial2.write(0xB0 | ch); Serial2.write((uint8_t)123); Serial2.write((uint8_t)0);
-    Serial2.write(0xB0 | ch); Serial2.write((uint8_t)120); Serial2.write((uint8_t)0);
-    midiOutCount += 6;
-    midiOutRealCount += 6;  // CC 120/123 are real events
+  {
+    Serial2TxLock lk;
+    // 16 × (CC123 + CC120) = 96 bytes in one burst.
+    uint8_t buf[16 * 6];
+    uint8_t* p = buf;
+    for (int ch = 0; ch < 16; ch++) {
+      *p++ = (uint8_t)(0xB0 | ch); *p++ = 123; *p++ = 0;
+      *p++ = (uint8_t)(0xB0 | ch); *p++ = 120; *p++ = 0;
+    }
+    Serial2.write(buf, sizeof(buf));
+    midiOutCount += sizeof(buf);
+    midiOutRealCount += sizeof(buf);  // CC 120/123 are real events
+    clearTrackedNoteStates();
   }
-  clearTrackedNoteStates();
   // Also clear the SRC live-monitor state so any stuck visual notes (from a
   // dropped Note Off etc.) get released along with the synth's voices.
   for (int ch = 0; ch < 16; ++ch) {
@@ -5938,6 +6375,9 @@ static void sendAllNotesOff() {
     }
   }
   srcKeyAllDirty = true;
+  // Held-note bars vanish without passing through the history ring, so the
+  // delta renderer can't reconstruct what to erase — force a full repaint.
+  srcRollInvalidate();
 }
 
 static void sendGSReset() {
@@ -5945,11 +6385,9 @@ static void sendGSReset() {
   static const uint8_t gsReset[] = {
     0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7
   };
-  for (uint8_t b : gsReset) {
-    Serial2.write(b);
-    ++midiOutCount;
-    if (!isHeartbeatByte(b)) ++midiOutRealCount;
-  }
+  Serial2.write(gsReset, sizeof(gsReset));
+  midiOutCount     += sizeof(gsReset);
+  midiOutRealCount += sizeof(gsReset);
 }
 
 // Universal Non-Realtime SysEx "GM System On" (turns the synth into a clean
@@ -5957,11 +6395,9 @@ static void sendGSReset() {
 static void sendGMReset() {
   Serial2TxLock lk;
   static const uint8_t gmReset[] = { 0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7 };
-  for (uint8_t b : gmReset) {
-    Serial2.write(b);
-    ++midiOutCount;
-    if (!isHeartbeatByte(b)) ++midiOutRealCount;
-  }
+  Serial2.write(gmReset, sizeof(gmReset));
+  midiOutCount     += sizeof(gmReset);
+  midiOutRealCount += sizeof(gmReset);
 }
 
 // =================================================================
@@ -5969,26 +6405,24 @@ static void sendGMReset() {
 // =================================================================
 static void sendUnitProgramChange(uint8_t channel, uint8_t program) {
   Serial2TxLock lk;
-  Serial2.write((uint8_t)(0xC0 | (channel & 0x0F)));
-  Serial2.write((uint8_t)(program & 0x7F));
+  uint8_t out[2] = { (uint8_t)(0xC0 | (channel & 0x0F)), (uint8_t)(program & 0x7F) };
+  Serial2.write(out, 2);
   midiOutCount += 2;
   midiOutRealCount += 2;
 }
 
 static void sendUnitCC(uint8_t channel, uint8_t cc, uint8_t value) {
   Serial2TxLock lk;
-  Serial2.write((uint8_t)(0xB0 | (channel & 0x0F)));
-  Serial2.write((uint8_t)(cc & 0x7F));
-  Serial2.write((uint8_t)(value & 0x7F));
+  uint8_t out[3] = { (uint8_t)(0xB0 | (channel & 0x0F)), (uint8_t)(cc & 0x7F), (uint8_t)(value & 0x7F) };
+  Serial2.write(out, 3);
   midiOutCount += 3;
   midiOutRealCount += 3;
 }
 
 static void sendUnitPitchBend(uint8_t channel, uint16_t bend14) {
   Serial2TxLock lk;
-  Serial2.write((uint8_t)(0xE0 | (channel & 0x0F)));
-  Serial2.write((uint8_t)(bend14 & 0x7F));
-  Serial2.write((uint8_t)((bend14 >> 7) & 0x7F));
+  uint8_t out[3] = { (uint8_t)(0xE0 | (channel & 0x0F)), (uint8_t)(bend14 & 0x7F), (uint8_t)((bend14 >> 7) & 0x7F) };
+  Serial2.write(out, 3);
   midiOutCount += 3;
   midiOutRealCount += 3;
 }
@@ -6044,18 +6478,19 @@ static void srcSendCurrentProgram(uint8_t channel) {
   sendUnitProgramChange(channel, srcProgram[channel]);
 }
 
+// The srcSet* setters only update state and talk to the synth. Repainting is
+// the caller's job (handleSrcTouch repaints just the widget that changed;
+// the picker closes into a full redraw anyway).
 static void srcSetProgram(uint8_t channel, uint8_t program) {
   if (channel >= SRC_CH_COUNT) return;
   srcProgram[channel] = (uint8_t)(program & 0x7F);
   srcSendCurrentProgram(channel);
-  srcDirtyAll = true;
 }
 
 static void srcSetVolume(uint8_t channel, uint8_t volume) {
   if (channel >= SRC_CH_COUNT) return;
   srcVolume[channel] = (uint8_t)(volume & 0x7F);
   sendUnitCC(channel, 7, srcVolume[channel]);
-  srcDirtyAll = true;
 }
 
 static void srcSetPitchBend(uint8_t channel, uint16_t bend14) {
@@ -6063,14 +6498,12 @@ static void srcSetPitchBend(uint8_t channel, uint16_t bend14) {
   if (bend14 > 16383) bend14 = 16383;
   srcPitchBend[channel] = bend14;
   sendUnitPitchBend(channel, bend14);
-  srcDirtyAll = true;
 }
 
 static void srcSetSustain(uint8_t channel, bool on) {
   if (channel >= SRC_CH_COUNT) return;
   srcSustain[channel] = on;
   sendUnitCC(channel, 64, on ? 127 : 0);
-  srcDirtyAll = true;
 }
 
 // Called from MIDI parsing when a channel-bearing message arrives. Updates
@@ -6243,6 +6676,10 @@ static bool saveDeviceConfigToSD() {
   doc["SrcInitProgram"]        = g_config.srcInitProgram;
   doc["SrcInitVolume"]         = g_config.srcInitVolume;
   doc["SrcAutoChannel"]        = g_config.srcAutoChannel;
+  // The SMF sequencer task reads the card through SdFat on the other core;
+  // hold its lock for the duration of this SD.h write so the two filesystem
+  // layers never interleave on the shared SPI bus (brief playback pause).
+  SmfLock smfLk;
   // FILE_WRITE on SD.h appends; remove first so the file is rewritten cleanly.
   if (SD.exists("/config.json")) SD.remove("/config.json");
   File f = SD.open("/config.json", FILE_WRITE);
@@ -6501,8 +6938,9 @@ static void drawConfigEditMode() {
 
 static void processConfigEditTouch(int tx, int ty) {
   Rect ft[5]; cfgGetFooterRects(ft);
-  if (hit(ft[0], tx, ty)) { g_configPage = (g_configPage + CFG_PAGES - 1) % CFG_PAGES; needFullRedraw = true; return; }
-  if (hit(ft[1], tx, ty)) { g_configPage = (g_configPage + 1) % CFG_PAGES; needFullRedraw = true; return; }
+  // Paging / field edits stay inside the overlay's content band.
+  if (hit(ft[0], tx, ty)) { g_configPage = (g_configPage + CFG_PAGES - 1) % CFG_PAGES; needContentRedraw = true; return; }
+  if (hit(ft[1], tx, ty)) { g_configPage = (g_configPage + 1) % CFG_PAGES; needContentRedraw = true; return; }
   if (hit(ft[2], tx, ty)) { exitConfigEditMode(true, false); return; }
   if (hit(ft[3], tx, ty)) { exitConfigEditMode(false, false); return; }
   if (hit(ft[4], tx, ty)) { exitConfigEditMode(true, true);  return; }
@@ -6513,7 +6951,7 @@ static void processConfigEditTouch(int tx, int ty) {
     Rect rr; cfgGetRowRect(rOnPage, rr);
     if (hit(rr, tx, ty)) {
       cfgCycleValue(field);
-      needFullRedraw = true;
+      needContentRedraw = true;
       return;
     }
   }
@@ -6557,7 +6995,7 @@ static void setTransposeBase(int newBase) {
     // new base.
     handleTransposeChange(clampTranspose((int8_t)(transposeValue + delta)));
   }
-  needFullRedraw = true;
+  needContentRedraw = true;   // BASE grid highlight (+ header "K" via handleTransposeChange)
 }
 
 static void enterBaseSetMode() {
@@ -6582,7 +7020,7 @@ static void cycleBaseSetPage() {
   if      (g_basePage == -1) g_basePage = 0;
   else if (g_basePage ==  0) g_basePage = 1;
   else                        g_basePage = -1;
-  needFullRedraw = true;
+  needContentRedraw = true;
 }
 
 static void baseGetGridRect(int idx, Rect& r) {
@@ -6670,7 +7108,7 @@ static void processBaseSetTouch(int tx, int ty) {
       } else { // L
         if (val == -1) g_basePage = 0;
       }
-      needFullRedraw = true;
+      needContentRedraw = true;
       return;
     }
   }
@@ -6781,6 +7219,7 @@ static bool setGroupFromCommand(const char* group) {
 static void handleButtonAAction() {
   allNotesOffEnabled = !allNotesOffEnabled;
   if (allNotesOffEnabled) sendAllNotesOff();
+  needToolbarRedraw = true;   // AOFF button colour
   needPartialUpdate = true;
 }
 
@@ -7096,10 +7535,17 @@ void setup() {
   Serial2.setRxBufferSize(8192);
   Serial2.setTxBufferSize(4096);
   Serial2.begin(MIDI_BAUD, SERIAL_8N1, RXD2, TXD2);
-  // Recursive mutex protects the Serial2 TX FIFO across the MIDI task on
-  // core 0 and any UI-driven sends on core 1. Must exist before either
+  // At 31.25 kbaud arduino-esp32 already sets the RX FIFO-full threshold to
+  // 1 byte, so every byte is copied to the ring buffer as it arrives. The
+  // onReceive hook (UART event task) just pokes the MIDI task so it drains
+  // right away instead of at its next 1 ms poll.
+  Serial2.onReceive([]() { wakeMidiTask(); }, false);
+  // Recursive mutex protects the Serial2 TX FIFO across the MIDI task, the
+  // SMF sequencer task and any UI-driven sends. Must exist before either
   // sendGSReset() below or the midi_io_task spin-up touches Serial2.
   g_serial2TxMux = xSemaphoreCreateRecursiveMutex();
+  g_smfMux = xSemaphoreCreateRecursiveMutex();
+  g_mp3Mux = xSemaphoreCreateRecursiveMutex();
 
   // Start USB host once at boot. Input-source changes only toggle whether
   // received data is consumed, never the USB host itself.
@@ -7147,11 +7593,13 @@ void setup() {
 
   drawInterface();
 
-  // Start the dedicated MIDI I/O task on core 0 so input drain / output
-  // pass-through stay responsive even when the main loop is busy redrawing
-  // the SRC piano roll or other heavy UI work. Must come AFTER Serial2 is
-  // initialised and the Serial2 TX mutex is created.
+  // Start the streaming tasks. The MIDI I/O drain shares core 1 with the UI
+  // at a higher priority; the SMF sequencer and the MP3 decoder live on
+  // core 0 next to the USB host task so UI repaints can't stall them. Must
+  // come AFTER Serial2 is initialised and the mutexes are created.
   startMidiIoTask();
+  startSmfTask();
+  startMp3Task();
 
 #ifdef M5TAB_DIAG
   Serial.printf("[boot] Tab5 MIDI Transposer ready  panel=%dx%d  reset_reason=%d\n",
@@ -7208,16 +7656,17 @@ void loop() {
   diagMaybeReport(now);
   serviceUsbHost(now);
 
-  // MIDI input drain (processMidiInput) runs on the dedicated midi_io_task
-  // (core 0). Heavy UI work in this loop no longer affects MIDI throughput.
-  // Only the mode-specific OUTPUT/PLAYBACK helpers stay on the main loop here.
-  if (currentApp == APP_PLAY && currentPlay == PLAY_SMF) {
-    processSmf();
-  } else if (currentApp == APP_PLAY && currentPlay == PLAY_MP3) {
-    processMp3();
+  // All streaming work runs on its own task now:
+  //   MIDI drain      → midi_io_task (core 1, prio 10)
+  //   SMF sequencing  → smf_task     (core 0, prio 6)
+  //   MP3 decoding    → mp3_task     (core 0, prio 4)
+  // loop() is purely the UI thread: touch, repaints, serial commands, SD
+  // housekeeping, and the hand-offs the tasks leave for it.
+  if (g_smfEofPending) {
+    g_smfEofPending = false;
+    processSmfEof();
   }
-  // PLAY_SRC, APP_TRANSPOSE, APP_MIDI need no extra per-loop work — the MIDI
-  // task already handles them.
+  processMp3Ui();
 
   processUsbSerialCommands();
 
@@ -7246,9 +7695,23 @@ void loop() {
     if (needFullRedraw) {
       drawInterface();
       needFullRedraw = false;
+      needToolbarRedraw = false;
+      needContentRedraw = false;
       midiManageDirty = false;
       needPartialUpdate = false;
     } else {
+      // Finer-grained repaints, coarsest first so a content repaint
+      // supersedes the per-widget dirty flags it would cover anyway.
+      if (needToolbarRedraw && !g_srcPickerOpen) {
+        drawToolbarApp();
+        needToolbarRedraw = false;
+      }
+      if (needContentRedraw && !g_srcPickerOpen) {
+        drawContentApp();
+        needContentRedraw = false;
+        midiManageDirty = false;
+        srcDirtyAll = false;
+      }
       if (currentApp == APP_MIDI && midiManageDirty) {
         drawMidiManage();
         midiManageDirty = false;
@@ -7266,9 +7729,8 @@ void loop() {
       }
       if (srcVisible) {
         // Incremental key-light updates so the live keyboard tracks input
-        // without a full repaint every tick. Piano roll interior scrolls
-        // every tick (cheap fillRect over a small panel — its border was
-        // drawn once during the full repaint and stays put).
+        // without a full repaint every tick, and the delta-rendered piano
+        // roll (only the few rows that changed since the last tick).
         srcFlushKeyboardDirty();
         srcDrawRoll();
       }
@@ -7290,4 +7752,8 @@ void loop() {
       }
     }
   }
+  // Nothing in loop() needs sub-millisecond polling any more, so yield for a
+  // tick instead of spinning. Keeps the UI core cool and gives the idle task
+  // (and anything at loopTask's priority) regular time.
+  vTaskDelay(1);
 }
