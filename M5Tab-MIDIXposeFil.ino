@@ -35,6 +35,7 @@
 #include <AudioFileSourceID3.h>
 #include <AudioGeneratorMP3.h>
 #include <usb/usb_host.h>
+#include <soc/usb_dwc_struct.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/portmacro.h>
@@ -548,6 +549,24 @@ static volatile bool g_mp3EndedPending = false;
 // (stepping the transpose value repaints widgets). Signed accumulator:
 // +1 per NEXT press, -1 per PREV press.
 static volatile int  g_pedalStepPending = 0;
+// USB HID pedal presses, posted by the USB host task and drained by the UI
+// thread in press order (PREV / NEXT / SELECT must not be reordered).
+static const uint8_t PEDAL_EV_PREV   = 1;
+static const uint8_t PEDAL_EV_NEXT   = 2;
+static const uint8_t PEDAL_EV_SELECT = 3;
+static QueueHandle_t g_pedalEventQueue = nullptr;
+// SELECT pedal is physically down right now (USB host task writes).
+static volatile bool g_usbHidSelectHeld = false;
+
+// Pedal preselect mode (UI thread only). The first SELECT press arms it: a
+// red frame marks a target item, PREV / NEXT move the frame instead of
+// transposing, and SELECT jumps to the framed item in one go. Holding SELECT
+// for PEDAL_SELECT_EXIT_HOLD_MS drops back to plain step-by-step transposing.
+static constexpr uint32_t PEDAL_SELECT_EXIT_HOLD_MS = 3000;
+static bool        g_preselActive = false;
+static DisplayMode g_preselMode   = DIRECT_MODE;  // mode g_preselIdx belongs to
+static int         g_preselIdx    = 0;            // SEQUENCE step, else slot in buildValueList()
+static uint32_t    g_pedalSelectDownAt = 0;       // millis() of the SELECT press being held, 0 = none
 
 class SmfLock {
   bool taken;
@@ -602,6 +621,38 @@ static usb_transfer_t*          g_usbInXfers[USB_MIDI_IN_XFERS] = {};
 // without a counter we can't tell). Surfaced via STATUS too.
 static volatile uint32_t        g_usbInResubmitFails = 0;
 static TaskHandle_t             g_usbTask   = nullptr;
+
+// The IDF 5.5 hub driver has no transaction-translator support: an FS/LS
+// device behind a hub that linked at High Speed is refused ("transaction
+// translator (TT) is not supported"). Everything this sketch talks to (MIDI
+// keyboards, HID pedals) is FS/LS anyway, so keep the root port from
+// chirping up to HS — a USB 2.0 hub then falls back to Full Speed and behaves
+// like a USB 1.1 hub, which needs no TT. Set to 0 for the stock HS-capable
+// root port.
+#define USB_ROOT_FORCE_FS 1
+
+// Second device slot: a HID keyboard — in practice a USB foot pedal that
+// types cursor keys — sharing a hub with the MIDI keyboard. Left / Right step
+// the transpose value like the Core2 pedal relay does; Up drives the
+// preselect mode.
+static usb_device_handle_t      g_usbHidDevice     = nullptr;
+static volatile bool            g_usbHidMounted    = false;  // interface claimed
+static uint8_t                  g_usbHidClaimedItf = 0xFF;
+static uint8_t                  g_usbHidInEpAddr   = 0;
+static const int                USB_HID_IN_XFERS   = 2;
+static usb_transfer_t*          g_usbHidInXfers[USB_HID_IN_XFERS] = {};
+// Only alive while the SET_IDLE / SET_PROTOCOL setup sequence is in flight.
+static usb_transfer_t*          g_usbHidCtrlXfer   = nullptr;
+static uint8_t                  g_usbHidCtrlStage  = 0;
+static uint8_t                  g_usbHidPrevKeys[6] = {};    // keys held in the last report
+// Surfaced via STATUS instead of logging per key: Serial output from the USB
+// host task would stall MIDI IN completion callbacks behind it.
+static volatile uint32_t        g_usbHidKeyCount   = 0;      // key-down edges seen
+static volatile uint8_t         g_usbHidLastKey    = 0;      // HID usage of the last one
+// Boot-subclass interface: SET_PROTOCOL(boot) applies. Pedals often expose
+// their keyboard as protocol 1 without the boot subclass; those stay in
+// report protocol.
+static bool                     g_usbHidBoot       = false;
 
 // Lock-free-ish ring buffer the USB task uses to hand raw MIDI bytes to the
 // main loop. processMIDIByte() touches Serial2 and global UI state, so it
@@ -721,6 +772,10 @@ static bool saveSequencesToSD();
 static bool loadSequencesFromSD();
 static void setCurrentTransposeButton();
 static void shiftTransposeBy(int dir);
+static int buildValueList(int8_t* out);
+static bool preselOnItem(int idx);
+static bool preselOnValue(int8_t value);
+static bool preselTarget(int8_t* out);
 static void updateDirectButtonLabels();
 
 // Device configuration / overlay-mode forward decls.
@@ -752,6 +807,48 @@ static void drawRectBtn(const Rect& r, uint16_t bg, uint16_t border,
     M5.Display.setTextDatum(middle_center);
     M5.Display.drawString(label, r.x + r.w / 2, r.y + r.h / 2);
   }
+}
+
+// Thick red frame of the pedal preselect cursor. Square-cornered but inset far
+// enough to stay inside the rounded fill of the widget it sits on, so
+// repainting that widget erases it again.
+static void drawPreselFrame(const Rect& r) {
+  const int inset = 3;
+  const int t = 7;
+  int x = r.x + inset, y = r.y + inset, w = r.w - 2 * inset, h = r.h - 2 * inset;
+  if (w <= 2 * t || h <= 2 * t) return;
+  M5.Display.fillRect(x,         y,         w, t,         COL_DANGER);
+  M5.Display.fillRect(x,         y + h - t, w, t,         COL_DANGER);
+  M5.Display.fillRect(x,         y + t,     t, h - 2 * t, COL_DANGER);
+  M5.Display.fillRect(x + w - t, y + t,     t, h - 2 * t, COL_DANGER);
+}
+
+// True when the preselect cursor sits on item idx of the mode on screen.
+static bool preselOnItem(int idx) {
+  return g_preselActive && g_preselMode == currentMode && g_preselIdx == idx;
+}
+
+// Transpose value the preselect cursor points at. False while preselect is
+// off or the cursor still belongs to another mode.
+static bool preselTarget(int8_t* out) {
+  if (!g_preselActive || g_preselMode != currentMode) return false;
+  if (currentMode == SEQUENCE_MODE) {
+    if (g_preselIdx < 0 || g_preselIdx >= SEQ_STEP_COUNT) return false;
+    *out = seqPatterns[seqCurrentPattern][g_preselIdx];
+    return true;
+  }
+  int8_t values[12];
+  int n = buildValueList(values);
+  if (g_preselIdx < 0 || g_preselIdx >= n) return false;
+  *out = values[g_preselIdx];
+  return true;
+}
+
+// Cursor test for widgets keyed by transpose value rather than by item index
+// (INSTANT buttons, KEY piano keys).
+static bool preselOnValue(int8_t value) {
+  int8_t target;
+  return currentMode != SEQUENCE_MODE && preselTarget(&target) && target == value;
 }
 
 static void drawTriangleBtn(const Rect& r, uint16_t bg, uint16_t border,
@@ -1393,6 +1490,19 @@ static void updateStatusArea() {
   M5.Display.setFont(FONT_LARGE);
   M5.Display.setTextColor(COL_VALUE, COL_PANEL);
   M5.Display.setTextDatum(middle_right);
+
+  // Pedal preselect armed: the pending target goes on a red line above the
+  // live value, so it can be read even when its widget isn't on screen.
+  int8_t target;
+  if (preselTarget(&target)) {
+    int midY = headerArea.y + headerArea.h / 2;
+    M5.Display.drawString(buf, textRight, midY + 18);
+    snprintf(buf, sizeof(buf), ">> %+d", (int)target);
+    M5.Display.setFont(FONT_SMALL);
+    M5.Display.setTextColor(COL_DANGER, COL_PANEL);
+    M5.Display.drawString(buf, textRight, midY - 20);
+    return;
+  }
   M5.Display.drawString(buf, textRight, headerArea.y + headerArea.h / 2);
 }
 
@@ -1739,6 +1849,7 @@ static void drawDirectBtn(int i) {
   uint16_t bg  = on ? COL_BTN_HI : COL_BTN;
   uint16_t txt = on ? COL_BTN_TXT_HI : COL_BTN_TXT;
   drawRectBtn(directBtns[i].r, bg, COL_BTN_BDR, directBtns[i].label, txt, FONT_HUGE);
+  if (preselOnItem(i)) drawPreselFrame(directBtns[i].r);
 }
 
 static void drawDirect() {
@@ -1759,20 +1870,28 @@ static void drawKey() {
   M5.Display.drawString(minorUpperTranspose ? "Minor Keys (Lower -)" : "Minor Keys (to Am)",
                         30, midLabelY);
 
-  int correspondingMajor = -1;
-  int correspondingMinor = -1;
-  if (majorUpperTranspose) {
-    if (transposeValue >= 1 && transposeValue <= 12) correspondingMajor = 12 - transposeValue;
-  } else {
-    if (transposeValue <= 0 && transposeValue >= -11) correspondingMajor = -transposeValue;
-  }
-  if (minorUpperTranspose) {
-    if (transposeValue <= -1 && transposeValue >= -9) correspondingMinor = 9 + transposeValue;
-  } else {
-    if (transposeValue >= -2 && transposeValue <= 9) correspondingMinor = 9 - transposeValue;
+  // Key that stands for a transpose value on each keyboard (-1 = none).
+  auto majorKeyFor = [](int v) -> int {
+    if (majorUpperTranspose) return (v >= 1 && v <= 12) ? 12 - v : -1;
+    return (v <= 0 && v >= -11) ? -v : -1;
+  };
+  auto minorKeyFor = [](int v) -> int {
+    if (minorUpperTranspose) return (v <= -1 && v >= -9) ? 9 + v : -1;
+    return (v >= -2 && v <= 9) ? 9 - v : -1;
+  };
+  int correspondingMajor = majorKeyFor(transposeValue);
+  int correspondingMinor = minorKeyFor(transposeValue);
+
+  // Preselect cursor: frame the keys of the pending value on both keyboards.
+  int preselMajor = -1;
+  int preselMinor = -1;
+  int8_t preselValue;
+  if (preselTarget(&preselValue)) {
+    preselMajor = majorKeyFor(preselValue);
+    preselMinor = minorKeyFor(preselValue);
   }
 
-  auto drawKeySet = [&](KeyBtn* keys, int selected, int corresponding,
+  auto drawKeySet = [&](KeyBtn* keys, int selected, int corresponding, int presel,
                         uint16_t selColor, uint16_t corrColor) {
     // white keys first, then black so black overlays.
     for (int pass = 0; pass < 2; pass++) {
@@ -1791,11 +1910,12 @@ static void drawKey() {
         M5.Display.drawString(keys[i].keyName,
                               keys[i].r.x + keys[i].r.w / 2,
                               keys[i].r.y + keys[i].r.h - 10);
+        if (presel == i) drawPreselFrame(keys[i].r);
       }
     }
   };
-  drawKeySet(majorKeys, selectedMajorKey, correspondingMajor, TFT_GREEN, 0x07E0);
-  drawKeySet(minorKeys, selectedMinorKey, correspondingMinor, TFT_ORANGE, 0xFD20);
+  drawKeySet(majorKeys, selectedMajorKey, correspondingMajor, preselMajor, TFT_GREEN, 0x07E0);
+  drawKeySet(minorKeys, selectedMinorKey, correspondingMinor, preselMinor, TFT_ORANGE, 0xFD20);
 }
 
 static void drawInstant() {
@@ -1819,6 +1939,7 @@ static void drawInstantBtn(int i) {
                 COL_BTN_BDR, "0",
                 zeroOn ? COL_BTN_TXT_HI : COL_BTN_TXT,
                 FONT_HUGE);
+    if (preselOnValue(0)) drawPreselFrame(instantZero);
     return;
   }
   if (i >= 8) return;
@@ -1826,6 +1947,7 @@ static void drawInstantBtn(int i) {
   uint16_t bg  = on ? COL_BTN_HI : COL_BTN;
   uint16_t txt = on ? COL_BTN_TXT_HI : COL_BTN_TXT;
   drawRectBtn(instantBtns[i].r, bg, COL_BTN_BDR, instantBtns[i].label, txt, FONT_HUGE);
+  if (preselOnValue(instantBtns[i].value)) drawPreselFrame(instantBtns[i].r);
 }
 
 // Repaint only the INSTANT buttons whose highlight could have changed when
@@ -1901,6 +2023,7 @@ static void drawSeqSlot(int i) {
               COL_BTN_BDR, vstr,
               isCurrent ? COL_BTN_TXT_HI : COL_BTN_TXT,
               FONT_HUGE);
+  if (preselOnItem(i)) drawPreselFrame(seqSteps[i].slot);
 }
 
 // SAVE / QUEUED / SAVED / SD ERR button. Its state machine runs from
@@ -4046,10 +4169,7 @@ static bool usbMidiClaimAndStart(const usb_config_desc_t* cfg) {
     i += len;
   }
 
-  if (midiItfNum == 0xFF || inEp == 0) {
-    Serial.println("[USB] no MIDI Streaming interface found");
-    return false;
-  }
+  if (midiItfNum == 0xFF || inEp == 0) return false;
 
   esp_err_t err = usb_host_interface_claim(g_usbClient, g_usbDevice, midiItfNum, midiItfAlt);
   if (err != ESP_OK) {
@@ -4162,35 +4282,313 @@ static void usbMidiTeardown() {
   needFullRedraw = true;
 }
 
+// =================================================================
+//  USB HID keyboard (foot pedal) — second device behind a hub
+// =================================================================
+static const uint8_t USB_HID_KEY_SELECT = 0x52;  // Up Arrow
+
+// HID keyboard-page usage → pedal event (0 = not ours). Page-turner pedals
+// type cursor or paging keys; anything else only shows up in STATUS
+// (hid_last).
+static uint8_t usbHidKeyToEvent(uint8_t usage) {
+  switch (usage) {
+    case 0x4F:  // Right Arrow
+    case 0x4E:  // Page Down
+      return PEDAL_EV_NEXT;
+    case 0x50:  // Left Arrow
+    case 0x4B:  // Page Up
+      return PEDAL_EV_PREV;
+    case USB_HID_KEY_SELECT:
+      return PEDAL_EV_SELECT;
+    default:
+      return 0;
+  }
+}
+
+// Keyboard report: [modifiers][reserved][key1..key6]. A report-protocol
+// keyboard may put a Report ID in front, which shows up as a 9-byte report.
+// Only key-down edges act, so auto-repeat and devices that ignore SET_IDLE
+// can't retrigger a step.
+static void usbHidHandleReport(const uint8_t* r, int len) {
+  if (len == 9) { ++r; --len; }
+  if (len < 3) return;
+  uint8_t keys[6] = {};
+  int n = len - 2;
+  if (n > 6) n = 6;
+  memcpy(keys, r + 2, n);
+  if (keys[0] == 0x01) return;  // ErrorRollOver: keep the previous key set
+  // Publish the SELECT hold state before its press event, so the UI thread
+  // never sees the event while the key still reads as released.
+  bool selectHeld = false;
+  for (int a = 0; a < 6; ++a) {
+    if (keys[a] == USB_HID_KEY_SELECT) selectHeld = true;
+  }
+  g_usbHidSelectHeld = selectHeld;
+  for (int a = 0; a < 6; ++a) {
+    uint8_t k = keys[a];
+    if (k < 0x04) continue;     // 0 = empty slot, 1..3 = error codes
+    bool held = false;
+    for (int b = 0; b < 6; ++b) {
+      if (g_usbHidPrevKeys[b] == k) { held = true; break; }
+    }
+    if (held) continue;
+    g_usbHidLastKey  = k;
+    g_usbHidKeyCount = g_usbHidKeyCount + 1;
+    uint8_t ev = usbHidKeyToEvent(k);
+    if (ev != 0 && g_pedalEventQueue) xQueueSend(g_pedalEventQueue, &ev, 0);
+  }
+  memcpy(g_usbHidPrevKeys, keys, sizeof(g_usbHidPrevKeys));
+}
+
+// Interrupt IN transfer completed. Runs in USB task context.
+static void usbHidInDoneCb(usb_transfer_t* t) {
+  if (t == nullptr) return;
+  if (t->status == USB_TRANSFER_STATUS_COMPLETED && t->actual_num_bytes > 0) {
+    usbHidHandleReport(t->data_buffer, t->actual_num_bytes);
+  }
+  // Same re-arm rule as usbMidiInDoneCb: never resubmit into a teardown.
+  if (g_usbHidMounted &&
+      t->status != USB_TRANSFER_STATUS_NO_DEVICE &&
+      t->status != USB_TRANSFER_STATUS_CANCELED) {
+    usb_host_transfer_submit(t);
+  }
+}
+
+static void usbHidStartInXfers() {
+  for (int i = 0; i < USB_HID_IN_XFERS; ++i) {
+    if (g_usbHidInXfers[i] && usb_host_transfer_submit(g_usbHidInXfers[i]) != ESP_OK) {
+      Serial.printf("[USB] HID initial IN submit[%d] failed\n", i);
+    }
+  }
+}
+
+// Queue a no-data HID class request (SET_IDLE / SET_PROTOCOL) on the claimed
+// interface using the setup-sequence control transfer.
+static bool usbHidSendClassReq(uint8_t bRequest, uint16_t wValue) {
+  usb_setup_packet_t* setup = (usb_setup_packet_t*)g_usbHidCtrlXfer->data_buffer;
+  setup->bmRequestType = USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS |
+                         USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
+  setup->bRequest = bRequest;
+  setup->wValue   = wValue;
+  setup->wIndex   = g_usbHidClaimedItf;
+  setup->wLength  = 0;
+  g_usbHidCtrlXfer->num_bytes = sizeof(usb_setup_packet_t);
+  return usb_host_transfer_submit_control(g_usbClient, g_usbHidCtrlXfer) == ESP_OK;
+}
+
+// Setup sequence: SET_IDLE(0) → SET_PROTOCOL(boot), boot-subclass interfaces
+// only → start the IN transfers. The control transfer is freed here, in its
+// own completion, so it never outlives the sequence.
+static void usbHidCtrlDoneCb(usb_transfer_t* t) {
+  if (t == nullptr) return;
+  // Not current = the device went away mid-setup and usbHidTeardown() left
+  // this transfer for us to free.
+  if (g_usbHidMounted && t == g_usbHidCtrlXfer) {
+    bool alive = (t->status != USB_TRANSFER_STATUS_NO_DEVICE);
+    // A STALL is fine — plenty of keyboards don't implement SET_IDLE.
+    if (alive && g_usbHidCtrlStage == 1 && g_usbHidBoot) {
+      g_usbHidCtrlStage = 2;
+      if (usbHidSendClassReq(0x0B /*SET_PROTOCOL*/, 0 /*boot*/)) return;
+    }
+    g_usbHidCtrlXfer  = nullptr;
+    g_usbHidCtrlStage = 0;
+    if (alive) usbHidStartInXfers();
+  }
+  usb_host_transfer_free(t);
+}
+
+// Walk the active configuration descriptor and claim a keyboard HID interface
+// (class 0x03, protocol 0x01) that has an interrupt IN endpoint, preferring
+// one with the boot subclass. Other HID interfaces (mice, the vendor/config
+// collections programmable pedals carry) are left alone: without parsing the
+// report descriptor their reports can't be decoded.
+static bool usbHidClaimAndStart(const usb_config_desc_t* cfg) {
+  const uint8_t* p = cfg->val;
+  uint16_t total = cfg->wTotalLength;
+  uint16_t i = 0;
+
+  uint8_t  hidItfNum = 0xFF;
+  uint8_t  inEp      = 0;
+  uint16_t inEpMps   = 0;
+  bool     boot      = false;
+
+  while (i + 2 <= total) {
+    uint8_t len = p[i];
+    if (len < 2 || i + len > total) break;
+    if (p[i + 1] == 0x04 /*INTERFACE*/ && len >= 9 &&
+        p[i + 5] == USB_CLASS_HID && p[i + 3] == 0 /*alt 0*/) {
+      uint8_t itfNum = p[i + 2];
+      uint8_t numEp  = p[i + 4];
+      uint8_t subcls = p[i + 6];
+      uint8_t proto  = p[i + 7];
+      if (proto == 0x01 /*KEYBOARD*/ && (hidItfNum == 0xFF || subcls == 0x01 /*BOOT*/)) {
+        // Scan endpoints belonging to this interface (the HID class
+        // descriptor sits in between and is stepped over).
+        uint16_t j = i + len;
+        uint8_t  epSeen = 0;
+        while (j + 2 <= total && epSeen < numEp) {
+          uint8_t lj = p[j];
+          if (lj < 2 || j + lj > total) break;
+          uint8_t tj = p[j + 1];
+          if (tj == 0x04 /*INTERFACE*/) break;  // hit next interface
+          if (tj == 0x05 /*ENDPOINT*/ && lj >= 7) {
+            uint8_t  addr = p[j + 2];
+            uint8_t  attr = p[j + 3];
+            uint16_t mps  = (uint16_t)(p[j + 4] | (p[j + 5] << 8)) & 0x07FF;
+            if ((addr & 0x80) && (attr & 0x03) == 0x03 /*INTERRUPT*/ && mps != 0) {
+              hidItfNum = itfNum;
+              inEp      = addr;
+              inEpMps   = mps;
+              boot      = (subcls == 0x01);
+              break;
+            }
+            epSeen++;
+          }
+          j += lj;
+        }
+        if (boot) break;  // can't do better than a boot keyboard
+      }
+    }
+    i += len;
+  }
+
+  if (hidItfNum == 0xFF) return false;
+
+  esp_err_t err = usb_host_interface_claim(g_usbClient, g_usbHidDevice, hidItfNum, 0);
+  if (err != ESP_OK) {
+    Serial.printf("[USB] HID interface_claim itf=%u err=0x%x\n",
+                  (unsigned)hidItfNum, (unsigned)err);
+    return false;
+  }
+
+  int allocated = 0;
+  for (int k = 0; k < USB_HID_IN_XFERS; ++k) {
+    err = usb_host_transfer_alloc(inEpMps, 0, &g_usbHidInXfers[k]);
+    if (err != ESP_OK || g_usbHidInXfers[k] == nullptr) {
+      Serial.printf("[USB] HID transfer_alloc[%d] err=0x%x\n", k, (unsigned)err);
+      break;
+    }
+    g_usbHidInXfers[k]->device_handle    = g_usbHidDevice;
+    g_usbHidInXfers[k]->bEndpointAddress = inEp;
+    g_usbHidInXfers[k]->callback         = usbHidInDoneCb;
+    g_usbHidInXfers[k]->context          = nullptr;
+    g_usbHidInXfers[k]->num_bytes        = inEpMps;
+    g_usbHidInXfers[k]->timeout_ms       = 0;
+    ++allocated;
+  }
+  if (allocated == 0) {
+    usb_host_interface_release(g_usbClient, g_usbHidDevice, hidItfNum);
+    return false;
+  }
+
+  g_usbHidClaimedItf = hidItfNum;
+  g_usbHidInEpAddr   = inEp;
+  g_usbHidBoot       = boot;
+  memset(g_usbHidPrevKeys, 0, sizeof(g_usbHidPrevKeys));
+  g_usbHidMounted    = true;
+  Serial.printf("[USB] HID keyboard mounted itf=%u in_ep=0x%02x mps=%u %s\n",
+                (unsigned)hidItfNum, (unsigned)inEp, (unsigned)inEpMps,
+                boot ? "boot" : "report-protocol");
+
+  // SET_IDLE(0) asks for reports on change only; on a boot-subclass interface
+  // SET_PROTOCOL(boot) then pins the report to the fixed 8-byte layout
+  // whatever the report descriptor says. usbHidCtrlDoneCb starts the IN
+  // transfers once the sequence is through — or we start them right here if
+  // the control transfer can't be set up.
+  if (usb_host_transfer_alloc(sizeof(usb_setup_packet_t), 0, &g_usbHidCtrlXfer) == ESP_OK &&
+      g_usbHidCtrlXfer != nullptr) {
+    g_usbHidCtrlXfer->device_handle    = g_usbHidDevice;
+    g_usbHidCtrlXfer->bEndpointAddress = 0;
+    g_usbHidCtrlXfer->callback         = usbHidCtrlDoneCb;
+    g_usbHidCtrlXfer->context          = nullptr;
+    g_usbHidCtrlXfer->timeout_ms       = 0;
+    g_usbHidCtrlStage = 1;
+    if (usbHidSendClassReq(0x0A /*SET_IDLE*/, 0)) return true;
+    usb_host_transfer_free(g_usbHidCtrlXfer);
+  }
+  g_usbHidCtrlXfer  = nullptr;
+  g_usbHidCtrlStage = 0;
+  usbHidStartInXfers();
+  return true;
+}
+
+static void usbHidTeardown() {
+  // Mark unmounted FIRST so the IN callback stops resubmitting if it races.
+  g_usbHidMounted = false;
+
+  // Same order as usbMidiTeardown(): quiesce the endpoint, release the
+  // interface, then free the transfers.
+  if (g_usbHidDevice && g_usbHidInEpAddr != 0) {
+    usb_host_endpoint_halt(g_usbHidDevice, g_usbHidInEpAddr);
+    usb_host_endpoint_flush(g_usbHidDevice, g_usbHidInEpAddr);
+    usb_host_endpoint_clear(g_usbHidDevice, g_usbHidInEpAddr);
+  }
+  if (g_usbHidDevice && g_usbClient && g_usbHidClaimedItf != 0xFF) {
+    usb_host_interface_release(g_usbClient, g_usbHidDevice, g_usbHidClaimedItf);
+  }
+  for (int i = 0; i < USB_HID_IN_XFERS; ++i) {
+    if (g_usbHidInXfers[i]) {
+      usb_host_transfer_free(g_usbHidInXfers[i]);
+      g_usbHidInXfers[i] = nullptr;
+    }
+  }
+  // A control transfer that still exists is in flight by construction; drop
+  // our reference and let usbHidCtrlDoneCb free it.
+  g_usbHidCtrlXfer  = nullptr;
+  g_usbHidCtrlStage = 0;
+
+  g_usbHidClaimedItf = 0xFF;
+  g_usbHidInEpAddr   = 0;
+  if (g_usbHidDevice) {
+    usb_host_device_close(g_usbClient, g_usbHidDevice);
+    g_usbHidDevice = nullptr;
+  }
+  memset(g_usbHidPrevKeys, 0, sizeof(g_usbHidPrevKeys));
+  g_usbHidSelectHeld = false;  // unplugged mid-press: no release report will come
+}
+
 // Called by the USB host stack when a device is attached or removed.
 static void usbClientEventCb(const usb_host_client_event_msg_t* msg, void* /*arg*/) {
   switch (msg->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV: {
-      if (g_usbDevice) break;  // already have one (we don't manage hubs of MIDI devices)
-      esp_err_t err = usb_host_device_open(g_usbClient, msg->new_dev.address, &g_usbDevice);
+      usb_device_handle_t dev = nullptr;
+      esp_err_t err = usb_host_device_open(g_usbClient, msg->new_dev.address, &dev);
       if (err != ESP_OK) {
         Serial.printf("[USB] device_open err=0x%x\n", (unsigned)err);
-        g_usbDevice = nullptr;
         break;
       }
       const usb_config_desc_t* cfg = nullptr;
-      err = usb_host_get_active_config_descriptor(g_usbDevice, &cfg);
+      err = usb_host_get_active_config_descriptor(dev, &cfg);
       if (err != ESP_OK || !cfg) {
         Serial.printf("[USB] get_active_config_descriptor err=0x%x\n", (unsigned)err);
-        usb_host_device_close(g_usbClient, g_usbDevice);
-        g_usbDevice = nullptr;
+        usb_host_device_close(g_usbClient, dev);
         break;
       }
-      if (!usbMidiClaimAndStart(cfg)) {
-        // Not a MIDI device (or no claim) — release the device handle.
-        usb_host_device_close(g_usbClient, g_usbDevice);
-        g_usbDevice = nullptr;
+      // One MIDI device and one HID keyboard at a time. Hubs, and anything
+      // arriving while its slot is taken, are closed again.
+      bool claimed = false;
+      if (!g_usbDevice) {
+        g_usbDevice = dev;
+        claimed = usbMidiClaimAndStart(cfg);
+        if (!claimed) g_usbDevice = nullptr;
       }
+      if (!claimed && !g_usbHidDevice) {
+        g_usbHidDevice = dev;
+        claimed = usbHidClaimAndStart(cfg);
+        if (!claimed) g_usbHidDevice = nullptr;
+      }
+      if (!claimed) usb_host_device_close(g_usbClient, dev);
       break;
     }
     case USB_HOST_CLIENT_EVENT_DEV_GONE: {
-      Serial.println("[USB] device gone");
-      usbMidiTeardown();
+      usb_device_handle_t gone = msg->dev_gone.dev_hdl;
+      if (gone == g_usbDevice) {
+        Serial.println("[USB] MIDI device gone");
+        usbMidiTeardown();
+      } else if (gone == g_usbHidDevice) {
+        Serial.println("[USB] HID device gone");
+        usbHidTeardown();
+      }
       break;
     }
     default:
@@ -4198,9 +4596,25 @@ static void usbClientEventCb(const usb_host_client_event_msg_t* msg, void* /*arg
   }
 }
 
+#if USB_ROOT_FORCE_FS
+// HCFG.FSLSSupp makes the DWC2 core skip the High-Speed chirp during a port
+// reset. The IDF leaves it clear on the P4 HS port, and the core soft reset
+// done for root-port recovery (after an unplug) clears it again, so it is
+// re-asserted before every event pump. Soft reset and bus reset both happen
+// inside usb_host_lib_handle_events() on this same task, so the write can't
+// interleave with the IDF's own HCFG updates; a replug spans many passes of
+// the loop, so the bit is back long before the next device is reset.
+static inline void usbRootForceFs() {
+  if (!USB_DWC_HS.hcfg_reg.fslssupp) USB_DWC_HS.hcfg_reg.fslssupp = 1;
+}
+#endif
+
 // Background task: drives the host stack and the registered client.
 static void usbHostTask(void* /*arg*/) {
   for (;;) {
+#if USB_ROOT_FORCE_FS
+    usbRootForceFs();
+#endif
     uint32_t evtFlags = 0;
     usb_host_lib_handle_events(pdMS_TO_TICKS(20), &evtFlags);
     if (g_usbClient) {
@@ -4221,6 +4635,11 @@ static bool startUsbHost() {
     Serial.printf("[USB] host_install err=0x%x\n", (unsigned)err);
     return false;
   }
+#if USB_ROOT_FORCE_FS
+  // The host task doesn't exist yet, so nothing can have been reset: a
+  // device already plugged in at boot is still waiting in debounce.
+  usbRootForceFs();
+#endif
 
   usb_host_client_config_t clientCfg = {};
   clientCfg.is_synchronous   = false;
@@ -4487,34 +4906,56 @@ static int buildValueList(int8_t* out) {
   return 12;
 }
 
-static void shiftTransposeBy(int dir) {
-  // The pedal relay can step the value while another app (MSG / PLAY) or an
-  // overlay is on screen. State always updates; widgets are only painted
-  // when the XPOSE content is what the panel is showing.
-  const bool xposeVisible = (currentApp == APP_TRANSPOSE)
-                         && (currentMode <= SEQUENCE_MODE)
-                         && !g_srcPickerOpen;
+// The pedals can step the value while another app (MSG / PLAY) or an overlay
+// is on screen. State always updates; widgets are only painted when the
+// XPOSE content is what the panel is showing.
+static bool isXposeContentVisible() {
+  return (currentApp == APP_TRANSPOSE)
+      && (currentMode <= SEQUENCE_MODE)
+      && !g_srcPickerOpen;
+}
+
+// PREV / NEXT walk a ring of "items": the SEQUENCE steps, or the slots of the
+// mode's value list.
+static int transposeItemCount() {
+  if (currentMode == SEQUENCE_MODE) return SEQ_STEP_COUNT;
+  int8_t values[12];
+  return buildValueList(values);
+}
+
+// Item the nav is standing on right now.
+static int currentTransposeItem() {
+  if (currentMode == SEQUENCE_MODE) return seqCurrentStep;
+  int8_t values[12];
+  int n = buildValueList(values);
+  for (int i = 0; i < n; i++) if (values[i] == transposeValue) return i;
+  return n / 2;
+}
+
+static int stepTransposeItem(int idx, int dir) {
+  int n = transposeItemCount();
+  return (dir < 0) ? ((idx > 0) ? idx - 1 : n - 1)
+                   : ((idx < n - 1) ? idx + 1 : 0);
+}
+
+// Make item newIdx the current one: apply its transpose value and move the
+// highlight.
+static void selectTransposeItem(int newIdx) {
+  if (newIdx < 0 || newIdx >= transposeItemCount()) return;
+  const bool xposeVisible = isXposeContentVisible();
   if (currentMode == SEQUENCE_MODE) {
     int oldStep = seqCurrentStep;
-    if (dir < 0)
-      seqCurrentStep = (seqCurrentStep > 0) ? seqCurrentStep - 1 : SEQ_STEP_COUNT - 1;
-    else
-      seqCurrentStep = (seqCurrentStep < SEQ_STEP_COUNT - 1) ? seqCurrentStep + 1 : 0;
+    seqCurrentStep = newIdx;
     handleTransposeChange(seqPatterns[seqCurrentPattern][seqCurrentStep]);
     if (xposeVisible) {
-      drawSeqSlot(oldStep);
+      if (oldStep != seqCurrentStep) drawSeqSlot(oldStep);
       drawSeqSlot(seqCurrentStep);
     }
     return;
   }
 
   int8_t values[12];
-  int n = buildValueList(values);
-  int idx = -1;
-  for (int i = 0; i < n; i++) if (values[i] == transposeValue) { idx = i; break; }
-  if (idx < 0) idx = n / 2;
-  int newIdx = (dir < 0) ? ((idx > 0) ? idx - 1 : n - 1)
-                         : ((idx < n - 1) ? idx + 1 : 0);
+  buildValueList(values);
   int8_t oldValue = transposeValue;
   handleTransposeChange(values[newIdx]);
 
@@ -4539,16 +4980,96 @@ static void shiftTransposeBy(int dir) {
   }
 }
 
-// Apply pedal-relay presses queued by the MIDI task. One transpose step per
-// press, in arrival order (the accumulator collapses PREV+NEXT pairs, which
-// is the same end state).
+static void shiftTransposeBy(int dir) {
+  selectTransposeItem(stepTransposeItem(currentTransposeItem(), dir));
+}
+
+// Repaint the widget of one item, e.g. after the preselect frame moved on or
+// off it.
+static void repaintTransposeItem(int idx) {
+  if (!isXposeContentVisible()) return;
+  if (currentMode == DIRECT_MODE) {
+    drawDirectBtn(idx);
+  } else if (currentMode == SEQUENCE_MODE) {
+    drawSeqSlot(idx);
+  } else if (currentMode == INSTANT_MODE) {
+    int8_t values[12];
+    int n = buildValueList(values);
+    if (idx >= 0 && idx < n) drawInstantBtnsForValues(values[idx], values[idx]);
+  } else {
+    needContentRedraw = true;  // KEY: the piano keys overlap, repaint the lot
+  }
+}
+
+// Put the preselect cursor on item idx and move the red frame there.
+static void preselSetCursor(int idx) {
+  int old = g_preselIdx;
+  g_preselMode = currentMode;
+  g_preselIdx  = idx;
+  if (old != idx) repaintTransposeItem(old);
+  repaintTransposeItem(idx);
+  needPartialUpdate = true;  // header shows the pending target
+}
+
+static void preselEnter() {
+  g_preselActive = true;
+  preselSetCursor(currentTransposeItem());
+}
+
+static void preselExit() {
+  g_preselActive = false;
+  repaintTransposeItem(g_preselIdx);
+  needPartialUpdate = true;
+}
+
+// PREV / NEXT pedal, whatever it came from (USB HID or the Core2 relay).
+static void pedalStep(int dir) {
+  if (g_preselActive) preselSetCursor(stepTransposeItem(g_preselIdx, dir));
+  else                shiftTransposeBy(dir);
+}
+
+// SELECT pedal went down: arm preselect, or jump to the framed item. Acting
+// on the press rather than the release keeps the key change on the beat; the
+// frame stays so the next jump can be lined up straight away.
+static void pedalSelect(uint32_t now) {
+  g_pedalSelectDownAt = now ? now : 1;
+  if (g_preselActive) selectTransposeItem(g_preselIdx);
+  else                preselEnter();
+}
+
+// Apply pedal presses on the UI thread: relay steps queued by the MIDI task
+// (the accumulator collapses PREV+NEXT pairs, which is the same end state)
+// and USB HID pedal events in the order they were pressed.
 static void processPedalRelay() {
+  // A mode switch (tab tap, overlay) invalidates the cursor index: restart
+  // it on the current item of the mode now showing.
+  if (g_preselActive && g_preselMode != currentMode) preselSetCursor(currentTransposeItem());
+
   int steps = g_pedalStepPending;
-  if (steps == 0) return;
-  g_pedalStepPending = g_pedalStepPending - steps;
-  int dir = (steps < 0) ? -1 : +1;
-  int n = (steps < 0) ? -steps : steps;
-  for (int i = 0; i < n; ++i) shiftTransposeBy(dir);
+  if (steps != 0) {
+    g_pedalStepPending = g_pedalStepPending - steps;
+    int dir = (steps < 0) ? -1 : +1;
+    int n = (steps < 0) ? -steps : steps;
+    for (int i = 0; i < n; ++i) pedalStep(dir);
+  }
+
+  uint32_t now = millis();
+  uint8_t ev;
+  while (g_pedalEventQueue && xQueueReceive(g_pedalEventQueue, &ev, 0) == pdTRUE) {
+    if      (ev == PEDAL_EV_PREV)   pedalStep(-1);
+    else if (ev == PEDAL_EV_NEXT)   pedalStep(+1);
+    else if (ev == PEDAL_EV_SELECT) pedalSelect(now);
+  }
+
+  // SELECT held long enough: leave preselect. One exit per press.
+  if (g_pedalSelectDownAt != 0) {
+    if (!g_usbHidSelectHeld) {
+      g_pedalSelectDownAt = 0;
+    } else if (g_preselActive && now - g_pedalSelectDownAt >= PEDAL_SELECT_EXIT_HOLD_MS) {
+      g_pedalSelectDownAt = 0;
+      preselExit();
+    }
+  }
 }
 
 static void handleNavTouch(int x, int y) {
@@ -7346,7 +7867,8 @@ static void printUsbSerialStatus() {
   const char* usbLabel        = g_usbMidiMounted ? "connected" : "disconnected";
   Serial.printf(
     "OK STATUS app=%s mode=%s input=%s transpose=%d range=%d filter_bypass=%d mapper_bypass=%d "
-    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu usb_in=%s cables=%u usb_drop=%lu usb_resub_fail=%lu pedal_relay=%d ch=%u prev_cc=%u next_cc=%u\n",
+    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu usb_in=%s cables=%u usb_drop=%lu usb_resub_fail=%lu pedal_relay=%d ch=%u prev_cc=%u next_cc=%u "
+    "usb_hid=%s hid_keys=%lu hid_last=0x%02x presel=%d presel_idx=%d\n",
     getAppLabel(currentApp),
     getDisplayModeLabel(currentMode),
     inputLabel,
@@ -7366,7 +7888,12 @@ static void printUsbSerialStatus() {
     g_config.pedalRelay ? 1 : 0,
     (unsigned)g_config.pedalRelayChannel,
     (unsigned)g_config.pedalPrevCC,
-    (unsigned)g_config.pedalNextCC
+    (unsigned)g_config.pedalNextCC,
+    g_usbHidMounted ? "connected" : "disconnected",
+    (unsigned long)g_usbHidKeyCount,
+    (unsigned)g_usbHidLastKey,
+    g_preselActive ? 1 : 0,
+    g_preselActive ? g_preselIdx : -1
   );
 }
 
@@ -7384,6 +7911,7 @@ static void printUsbSerialHelp() {
   Serial.println("SET FILTER BYPASS [0|1] | ACTIVE | ENABLED <n> 0|1");
   Serial.println("SET MAPPER BYPASS [0|1] | ACTIVE | ENABLED <n> 0|1");
   Serial.println("LOAD TESTRULES");
+  Serial.println("PEDAL PREV|NEXT|SELECT|EXIT");
   Serial.println("INFO SCREEN");
   Serial.println("OK HELP END");
 }
@@ -7436,6 +7964,21 @@ static void handleUsbSerialCommand(char* line) {
     if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) { Serial.println("ERR TOUCH out of range"); return; }
     injectTouchPoint((int16_t)x, (int16_t)y);
     Serial.printf("OK TOUCH %d %d\n", x, y);
+    return;
+  }
+
+  // Pedal presses without a pedal, for bench checks. EXIT stands in for the
+  // long SELECT hold, which can't be faked from here.
+  if (tokenEqualsIgnoreCase(cmd, "PEDAL")) {
+    char* p = strtok_r(nullptr, " \t", &save);
+    if      (p && tokenEqualsIgnoreCase(p, "PREV"))   pedalStep(-1);
+    else if (p && tokenEqualsIgnoreCase(p, "NEXT"))   pedalStep(+1);
+    else if (p && tokenEqualsIgnoreCase(p, "SELECT")) pedalSelect(millis());
+    else if (p && tokenEqualsIgnoreCase(p, "EXIT"))   { if (g_preselActive) preselExit(); }
+    else { Serial.println("ERR PEDAL requires PREV, NEXT, SELECT or EXIT"); return; }
+    Serial.printf("OK PEDAL transpose=%d presel=%d presel_idx=%d\n",
+                  (int)transposeValue, g_preselActive ? 1 : 0,
+                  g_preselActive ? g_preselIdx : -1);
     return;
   }
 
@@ -7629,6 +8172,7 @@ void setup() {
 
   // Start USB host once at boot. Input-source changes only toggle whether
   // received data is consumed, never the USB host itself.
+  g_pedalEventQueue = xQueueCreate(16, sizeof(uint8_t));
   if (startUsbHost()) {
     Serial.println("[USB] host ready");
   } else {

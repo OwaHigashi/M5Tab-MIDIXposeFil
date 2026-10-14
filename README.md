@@ -178,7 +178,7 @@ PRG 名バナーをタップで開く。レイアウト:
 | MIDI I/O | PortA を UART に転用 (RX = G54, TX = G53, 31250 bps) |
 | ストレージ | microSD (SPI: SCK=43, MOSI=44, MISO=39, CS=42) |
 
-Tab5 単体では Bluetooth フットペダルに接続できない (無線は ESP32-C6 で **BLE 専用**、Classic HID のペダルとはペアリング不能。BLE HID 経路は安定性問題で削除済み)。転調の prev/next は画面下端の PREV / NEXT ボタンか、下記の **Core2 経由ペダル中継** で操作する。
+Tab5 単体では Bluetooth フットペダルに接続できない (無線は ESP32-C6 で **BLE 専用**、Classic HID のペダルとはペアリング不能。BLE HID 経路は安定性問題で削除済み)。転調の prev/next は画面下端の PREV / NEXT ボタン、下記の **Core2 経由ペダル中継**、または **USB ハブ経由の USB フットペダル** で操作する。
 
 ### Core2 ペダルブリッジ経由のフットペダル (2026-10-11)
 
@@ -196,6 +196,39 @@ Tab5 単体では Bluetooth フットペダルに接続できない (無線は E
 - 踏み込みは MIDI タスクで検出し、転調の適用と画面更新は UI スレッドで行う。XPOSE 以外の画面 (MSG / PLAY) を表示中でも転調値は動く (画面は戻ったときに反映)。
 - ペダル無しの疎通確認はブリッジの `C` ボタン (短押し NEXT / 長押し PREV) か USB シリアル `PEDAL NEXT|PREV`。Tab5 側では `STATUS` の `midi_in_real` が 1 押しあたり 6 (踏 3 + 離 3) 増える。
 - `M5Core2-MIDIXposeFilBT` (転調機としての Core2) 側には変更を入れていない。
+
+### USB ハブ経由の USB フットペダル (2026-10-14)
+
+Tab5 の USB-A にハブを挿すと、USB MIDI キーボードと USB フットペダル (HID キーボードとしてカーソルキーを送るもの) を同時に使える。
+
+```
+[USB 鍵盤]  ──┐
+              ├─ [USB ハブ] ── [Tab5 USB-A]
+[USB ペダル] ─┘
+```
+
+- **ハブを通すための仕掛け**: arduino-esp32 3.3.8 (IDF 5.5) のハブドライバには Transaction Translator が無く、High Speed でリンクしたハブ配下の FS/LS デバイスは拒否される。本機が扱うデバイス (MIDI 鍵盤・HID ペダル) はどれも FS/LS なので、ルートポートを Full Speed 固定 (`USB_ROOT_FORCE_FS`、DWC2 の `HCFG.FSLSSupp`) にして USB 2.0 ハブを FS で動かしている。`0` にすると従来どおり HS 対応に戻る (その場合ハブ配下は動かない)。
+- 同時に掴むのは **MIDI デバイス 1 台 + HID キーボード 1 台**。HID はインターフェースプロトコルが「キーボード」のものだけを掴む (ブートサブクラスがあれば優先)。マウスやベンダー定義のインターフェースは無視する。
+- キー割り当て: `←` / `PageUp` = **PREV**、`→` / `PageDown` = **NEXT**、`↑` = **SELECT**。踏んだ瞬間 (key-down) だけに反応する。
+- 2026-10-14 に Kinesis の 3 連フットペダル (VID:PID `29EA:0100`、左 / 右 / 上) + USB MIDI 鍵盤 + ハブの組み合わせで動作を確認。
+- `STATUS` 応答に `usb_hid=` (接続状態) / `hid_keys=` (受信したキー押下数) / `hid_last=` (最後のキーの HID Usage) が出る。割り当て外のキーを送るペダルは `hid_last` で正体が分かる。
+
+#### ペダル予約モード (SELECT ペダル)
+
+1 段ずつ転調していては間に合わない場面のために、転調先をあらかじめ選んでおいて一気に飛ぶモード。
+
+| 状態 | PREV / NEXT | SELECT |
+|---|---|---|
+| 通常 | その場で 1 段転調 | 予約モードに入る (現在の項目に太い赤枠) |
+| 予約モード | 赤枠だけを動かす (転調しない) | 赤枠の項目へ一気に転調 (赤枠は残る) |
+
+- SELECT を **3 秒以上踏み続ける**と赤枠が消えて通常モードに戻る。
+- 予約モード中はヘッダ右端の `K +n` の上に、予約先が赤字で `>> +n` と出る。
+- 「項目」は DIRECT の 12 ボタン / SEQUENCE のステップ。KEY と INSTANT は −5..+6 の値で、KEY は対応する鍵盤に、INSTANT は該当する値のボタンがあるときだけ赤枠が出る (ヘッダの `>> +n` は常に出る)。
+- Core2 中継の PREV / NEXT も、予約モード中は赤枠の移動になる。
+- 転調は SELECT を**踏んだ瞬間**に実行する (離したときではない)。そのため長押しで抜けるとき、赤枠が現在値と違う位置にあれば踏んだ瞬間にそこへ転調する。
+- モード切替やオーバーレイ (CONFIG / BASE) を挟むと、赤枠は現在の項目に戻る。
+- `STATUS` 応答の `presel=` / `presel_idx=` で状態を確認でき、ペダル無しでも USB シリアル `PEDAL PREV|NEXT|SELECT|EXIT` で同じ操作ができる (`EXIT` は長押しの代わり)。
 
 ---
 
@@ -280,6 +313,7 @@ PC から本体を遠隔操作できる (115200 bps、改行 LF / CRLF)。
 | `SET MAPPER BYPASS 0\|1` | MAPPER バイパス (0=ACTIVE, 1=BYPASS) |
 | `SET MAPPER ENABLED <n> 0\|1` | MAPPER ルール n を個別 EN/DIS |
 | `LOAD TESTRULES` | リグレッション用ルール (PB/CC ブロック + Note Ch1→Ch2 / Ch3 vel スケール) を流し込む |
+| `PEDAL PREV\|NEXT\|SELECT\|EXIT` | フットペダルの疑似操作 (`EXIT` は SELECT 長押し = 予約モード解除) |
 
 ## 自動リグレッションテスト
 
