@@ -36,6 +36,7 @@
 #include <AudioGeneratorMP3.h>
 #include <usb/usb_host.h>
 #include <soc/usb_dwc_struct.h>
+#include "src/ble_pedal.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/portmacro.h>
@@ -201,6 +202,14 @@ struct RollRect;
 struct ValueBtn { Rect r; int8_t value; char label[5]; };
 struct KeyBtn   { Rect r; int8_t keyValue; const char* keyName; bool isBlackKey; };
 struct SeqSlot  { Rect up, slot, down; };
+// A pedal that types HID keyboard keys (USB or BLE): keys held in its last
+// report, whether SELECT is down right now, and counters for STATUS.
+struct PedalKeyboard {
+  uint8_t           prevKeys[6];
+  volatile bool     selectHeld;
+  volatile uint32_t keyCount;   // key-down edges seen
+  volatile uint8_t  lastKey;    // HID usage of the last one
+};
 struct PianoKeyGeom { Rect r; uint8_t note; bool isBlackKey; };
 struct SmfKeyGeom { Rect r; bool isBlackKey; };
 
@@ -399,6 +408,9 @@ struct DeviceConfig {
   uint8_t pedalRelayChannel; // 1..16
   uint8_t pedalPrevCC;       // CC number = PREV (default 80, General Purpose 5)
   uint8_t pedalNextCC;       // CC number = NEXT (default 81, General Purpose 6)
+  // BLE HID pedal straight into the Tab5 (src/ble_pedal). Off by default:
+  // the radio stack is not even started unless this is set.
+  bool    blePedal;
 };
 static DeviceConfig g_config;
 
@@ -555,8 +567,18 @@ static const uint8_t PEDAL_EV_PREV   = 1;
 static const uint8_t PEDAL_EV_NEXT   = 2;
 static const uint8_t PEDAL_EV_SELECT = 3;
 static QueueHandle_t g_pedalEventQueue = nullptr;
-// SELECT pedal is physically down right now (USB host task writes).
-static volatile bool g_usbHidSelectHeld = false;
+// Keyboard-report decoder state, one per pedal transport. Each is written
+// only by its own task (USB host task / NimBLE host task); the UI thread just
+// reads selectHeld and the STATUS counters.
+static PedalKeyboard g_usbPedalKb = {};
+static PedalKeyboard g_blePedalKb = {};
+// Bring-up: last BLE input report and how many arrived.
+static uint8_t           g_bleRaw[16]  = {};
+static volatile uint8_t  g_bleRawLen   = 0;
+static volatile uint32_t g_bleRawCount = 0;
+// CONFIG "BlePair" row: re-pairing drops the pedal that works today, so the
+// first tap only arms it and a second tap before this time (millis) does it.
+static uint32_t g_blePairArmedUntil = 0;
 
 // Pedal preselect mode (UI thread only). The first SELECT press arms it: a
 // red frame marks a target item, PREV / NEXT move the frame instead of
@@ -644,11 +666,6 @@ static usb_transfer_t*          g_usbHidInXfers[USB_HID_IN_XFERS] = {};
 // Only alive while the SET_IDLE / SET_PROTOCOL setup sequence is in flight.
 static usb_transfer_t*          g_usbHidCtrlXfer   = nullptr;
 static uint8_t                  g_usbHidCtrlStage  = 0;
-static uint8_t                  g_usbHidPrevKeys[6] = {};    // keys held in the last report
-// Surfaced via STATUS instead of logging per key: Serial output from the USB
-// host task would stall MIDI IN completion callbacks behind it.
-static volatile uint32_t        g_usbHidKeyCount   = 0;      // key-down edges seen
-static volatile uint8_t         g_usbHidLastKey    = 0;      // HID usage of the last one
 // Boot-subclass interface: SET_PROTOCOL(boot) applies. Pedals often expose
 // their keyboard as protocol 1 without the boot subclass; those stay in
 // report protocol.
@@ -776,6 +793,10 @@ static int buildValueList(int8_t* out);
 static bool preselOnItem(int idx);
 static bool preselOnValue(int8_t value);
 static bool preselTarget(int8_t* out);
+static void blePedalReport(const uint8_t* data, size_t len);
+static const char* blePedalStatusText();
+static void drawBleIndicator();
+static void applyBlePedalConfig();
 static void updateDirectButtonLabels();
 
 // Device configuration / overlay-mode forward decls.
@@ -1442,6 +1463,7 @@ static void drawHeader() {
   M5.Display.setTextDatum(middle_left);
   M5.Display.drawString(getHeaderTitle(), 30, headerArea.y + headerArea.h / 2);
 
+  drawBleIndicator();
   drawAppTabs();
   drawHeaderRightButtons();
   drawHeaderStatusApp();
@@ -1449,6 +1471,52 @@ static void drawHeader() {
   // of the colour cache.
   invalidateMidiActivityStripes();
   drawMidiActivityLines();
+}
+
+// What the BLE pedal is doing, in words short enough for the header.
+static const char* blePedalStatusText() {
+  if (!g_config.blePedal) return "BLE off";
+  switch (blePedalState()) {
+    case BLE_PEDAL_STARTING:   return "BLE starting";
+    case BLE_PEDAL_FAILED:     return "BLE failed";
+    case BLE_PEDAL_SCANNING:   return "BLE pairing...";
+    case BLE_PEDAL_SETUP:      return "BLE linking";
+    case BLE_PEDAL_READY:      return "BLE pedal OK";
+    case BLE_PEDAL_IDLE:
+    case BLE_PEDAL_CONNECTING: return blePedalHasPedal() ? "BLE waiting" : "BLE no pedal";
+    default:                   return "BLE off";
+  }
+}
+
+// BLE pedal status in small print above the header title. Nothing is drawn
+// until the BLE stack has been started, so the header looks as before when
+// the feature is unused.
+static void drawBleIndicator() {
+  const int x = 30, y = headerArea.y + 8, w = 290, h = 18;
+  M5.Display.fillRect(x, y, w, h, COL_PANEL);
+  if (blePedalState() == BLE_PEDAL_OFF) return;
+  uint16_t col = COL_MUTED;
+  if (g_config.blePedal) {
+    switch (blePedalState()) {
+      case BLE_PEDAL_READY:    col = COL_BTN_HI;  break;
+      case BLE_PEDAL_FAILED:   col = COL_DANGER;  break;
+      case BLE_PEDAL_SCANNING: col = COL_ACCENT;  break;
+      case BLE_PEDAL_SETUP:    col = COL_VALUE;   break;
+      default:                 col = blePedalHasPedal() ? COL_VALUE : COL_MUTED; break;
+    }
+  }
+  M5.Display.setFont(FONT_TINY);
+  M5.Display.setTextColor(col, COL_PANEL);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.drawString(blePedalStatusText(), x, y);
+}
+
+// Bring the BLE pedal in line with the BlePedal setting. The stack starts on
+// first use and then stays up until reboot; turning the setting off only
+// drops the link.
+static void applyBlePedalConfig() {
+  if (g_config.blePedal) blePedalBegin(blePedalReport);
+  blePedalSetEnabled(g_config.blePedal);
 }
 
 // BASE / CONF / MIX live in the right strip but only change state on
@@ -4285,12 +4353,12 @@ static void usbMidiTeardown() {
 // =================================================================
 //  USB HID keyboard (foot pedal) — second device behind a hub
 // =================================================================
-static const uint8_t USB_HID_KEY_SELECT = 0x52;  // Up Arrow
+static const uint8_t HID_KEY_SELECT = 0x52;  // Up Arrow
 
 // HID keyboard-page usage → pedal event (0 = not ours). Page-turner pedals
 // type cursor or paging keys; anything else only shows up in STATUS
-// (hid_last).
-static uint8_t usbHidKeyToEvent(uint8_t usage) {
+// (hid_last / ble_last).
+static uint8_t pedalKeyToEvent(uint8_t usage) {
   switch (usage) {
     case 0x4F:  // Right Arrow
     case 0x4E:  // Page Down
@@ -4298,19 +4366,17 @@ static uint8_t usbHidKeyToEvent(uint8_t usage) {
     case 0x50:  // Left Arrow
     case 0x4B:  // Page Up
       return PEDAL_EV_PREV;
-    case USB_HID_KEY_SELECT:
+    case HID_KEY_SELECT:
       return PEDAL_EV_SELECT;
     default:
       return 0;
   }
 }
 
-// Keyboard report: [modifiers][reserved][key1..key6]. A report-protocol
-// keyboard may put a Report ID in front, which shows up as a 9-byte report.
+// Keyboard report from a pedal, USB or BLE: [modifiers][reserved][key1..key6].
 // Only key-down edges act, so auto-repeat and devices that ignore SET_IDLE
-// can't retrigger a step.
-static void usbHidHandleReport(const uint8_t* r, int len) {
-  if (len == 9) { ++r; --len; }
+// can't retrigger a step. Runs on the transport's own task.
+static void pedalKeyboardReport(PedalKeyboard* kb, const uint8_t* r, int len) {
   if (len < 3) return;
   uint8_t keys[6] = {};
   int n = len - 2;
@@ -4321,23 +4387,49 @@ static void usbHidHandleReport(const uint8_t* r, int len) {
   // never sees the event while the key still reads as released.
   bool selectHeld = false;
   for (int a = 0; a < 6; ++a) {
-    if (keys[a] == USB_HID_KEY_SELECT) selectHeld = true;
+    if (keys[a] == HID_KEY_SELECT) selectHeld = true;
   }
-  g_usbHidSelectHeld = selectHeld;
+  kb->selectHeld = selectHeld;
   for (int a = 0; a < 6; ++a) {
     uint8_t k = keys[a];
     if (k < 0x04) continue;     // 0 = empty slot, 1..3 = error codes
     bool held = false;
     for (int b = 0; b < 6; ++b) {
-      if (g_usbHidPrevKeys[b] == k) { held = true; break; }
+      if (kb->prevKeys[b] == k) { held = true; break; }
     }
     if (held) continue;
-    g_usbHidLastKey  = k;
-    g_usbHidKeyCount = g_usbHidKeyCount + 1;
-    uint8_t ev = usbHidKeyToEvent(k);
+    kb->lastKey  = k;
+    kb->keyCount = kb->keyCount + 1;
+    uint8_t ev = pedalKeyToEvent(k);
     if (ev != 0 && g_pedalEventQueue) xQueueSend(g_pedalEventQueue, &ev, 0);
   }
-  memcpy(g_usbHidPrevKeys, keys, sizeof(g_usbHidPrevKeys));
+  memcpy(kb->prevKeys, keys, sizeof(kb->prevKeys));
+}
+
+// Forget what a pedal was holding (it went away mid-press: no release report
+// will come).
+static void pedalKeyboardRelease(PedalKeyboard* kb) {
+  memset(kb->prevKeys, 0, sizeof(kb->prevKeys));
+  kb->selectHeld = false;
+}
+
+// USB reports: a report-protocol keyboard may put a Report ID in front, which
+// shows up as a 9-byte report.
+static void usbHidHandleReport(const uint8_t* r, int len) {
+  if (len == 9) { ++r; --len; }
+  pedalKeyboardReport(&g_usbPedalKb, r, len);
+}
+
+// BLE reports arrive without a Report ID. Only the 8-byte keyboard layout is
+// taken: a page turner in a mouse or media mode notifies shorter reports
+// whose bytes must not be read as key codes. NimBLE host task.
+static void blePedalReport(const uint8_t* data, size_t len) {
+  // Bring-up: keep the last report so BLE STATUS can show what the pedal
+  // really sends.
+  g_bleRawLen = (uint8_t)(len < sizeof(g_bleRaw) ? len : sizeof(g_bleRaw));
+  memcpy(g_bleRaw, data, g_bleRawLen);
+  g_bleRawCount = g_bleRawCount + 1;
+  if (len == 8) pedalKeyboardReport(&g_blePedalKb, data, (int)len);
 }
 
 // Interrupt IN transfer completed. Runs in USB task context.
@@ -4484,7 +4576,7 @@ static bool usbHidClaimAndStart(const usb_config_desc_t* cfg) {
   g_usbHidClaimedItf = hidItfNum;
   g_usbHidInEpAddr   = inEp;
   g_usbHidBoot       = boot;
-  memset(g_usbHidPrevKeys, 0, sizeof(g_usbHidPrevKeys));
+  pedalKeyboardRelease(&g_usbPedalKb);
   g_usbHidMounted    = true;
   Serial.printf("[USB] HID keyboard mounted itf=%u in_ep=0x%02x mps=%u %s\n",
                 (unsigned)hidItfNum, (unsigned)inEp, (unsigned)inEpMps,
@@ -4543,8 +4635,7 @@ static void usbHidTeardown() {
     usb_host_device_close(g_usbClient, g_usbHidDevice);
     g_usbHidDevice = nullptr;
   }
-  memset(g_usbHidPrevKeys, 0, sizeof(g_usbHidPrevKeys));
-  g_usbHidSelectHeld = false;  // unplugged mid-press: no release report will come
+  pedalKeyboardRelease(&g_usbPedalKb);
 }
 
 // Called by the USB host stack when a device is attached or removed.
@@ -5063,13 +5154,38 @@ static void processPedalRelay() {
 
   // SELECT held long enough: leave preselect. One exit per press.
   if (g_pedalSelectDownAt != 0) {
-    if (!g_usbHidSelectHeld) {
+    if (!g_usbPedalKb.selectHeld && !g_blePedalKb.selectHeld) {
       g_pedalSelectDownAt = 0;
     } else if (g_preselActive && now - g_pedalSelectDownAt >= PEDAL_SELECT_EXIT_HOLD_MS) {
       g_pedalSelectDownAt = 0;
       preselExit();
     }
   }
+}
+
+// BLE pedal housekeeping on the UI thread: reconnect timers, plus a clean
+// key state whenever the link is not up.
+static void serviceBlePedal(uint32_t now) {
+  static uint32_t lastService = 0;
+  static uint8_t  lastState = BLE_PEDAL_OFF;
+  if (now - lastService < 200) return;
+  lastService = now;
+  blePedalService(now);
+
+  bool cfgStale = false;
+  if (g_blePairArmedUntil != 0 && (int32_t)(g_blePairArmedUntil - now) <= 0) {
+    g_blePairArmedUntil = 0;   // second tap never came
+    cfgStale = true;
+  }
+  uint8_t st = blePedalState();
+  if (st != lastState) {
+    lastState = st;
+    if (st != BLE_PEDAL_READY) pedalKeyboardRelease(&g_blePedalKb);
+    if (!g_srcPickerOpen) drawBleIndicator();
+    cfgStale = true;
+  }
+  // The CONFIG overlay shows the BLE state on its BlePair row.
+  if (cfgStale && currentMode == CONFIG_EDIT_MODE) needContentRedraw = true;
 }
 
 static void handleNavTouch(int x, int y) {
@@ -7183,6 +7299,7 @@ static void setDefaultConfig() {
   g_config.pedalRelayChannel = 16;
   g_config.pedalPrevCC       = 80;
   g_config.pedalNextCC       = 81;
+  g_config.blePedal          = false;
 }
 
 static bool loadDeviceConfigFromSD() {
@@ -7227,6 +7344,7 @@ static bool loadDeviceConfigFromSD() {
   if (doc["PedalRelayChannel"].is<int>())            g_config.pedalRelayChannel = (uint8_t)constrain((int)doc["PedalRelayChannel"], 1, 16);
   if (doc["PedalPrevCC"].is<int>())                  g_config.pedalPrevCC = (uint8_t)constrain((int)doc["PedalPrevCC"], 0, 127);
   if (doc["PedalNextCC"].is<int>())                  g_config.pedalNextCC = (uint8_t)constrain((int)doc["PedalNextCC"], 0, 127);
+  if (doc["BlePedal"].is<bool>())                    g_config.blePedal = doc["BlePedal"];
   Serial.printf("[CFG] loaded: app=%s base=%d input=%s splash=%d gsBoot=%d srcCh=%d\n",
                 g_config.defaultApp, g_config.transposeBase,
                 g_config.midiInputSource, g_config.showSplash ? 1 : 0,
@@ -7261,6 +7379,7 @@ static bool saveDeviceConfigToSD() {
   doc["PedalRelayChannel"]     = g_config.pedalRelayChannel;
   doc["PedalPrevCC"]           = g_config.pedalPrevCC;
   doc["PedalNextCC"]           = g_config.pedalNextCC;
+  doc["BlePedal"]              = g_config.blePedal;
   // The SMF sequencer task reads the card through SdFat on the other core;
   // hold its lock for the duration of this SD.h write so the two filesystem
   // layers never interleave on the shared SPI bus (brief playback pause).
@@ -7332,9 +7451,10 @@ static AppMode      g_appBeforeOverlay  = APP_TRANSPOSE;
 static DisplayMode  g_modeBeforeOverlay = DIRECT_MODE;
 static PlayMode     g_playBeforeOverlay = PLAY_SRC;
 
-static const int CFG_ROWS = 21;
+static const int CFG_ROWS = 23;
 static const int CFG_ROWS_PER_PAGE = 4;
-static const int CFG_PAGES = 6;       // 21 fields / 4 per page = 6 (last page partially used)
+static const int CFG_PAGES = 6;       // 23 fields / 4 per page = 6 (last page partially used)
+static const int CFG_ROW_BLE_PAIR = 22;   // action row, not a stored value
 static int g_configPage = 0;
 static const char* CFG_LABELS[CFG_ROWS] = {
   "DefaultApp",
@@ -7358,6 +7478,8 @@ static const char* CFG_LABELS[CFG_ROWS] = {
   "PedalRelayCh",
   "PedalPrevCC",
   "PedalNextCC",
+  "BlePedal",
+  "BlePair",
 };
 
 static void cfgCycleString(char* dst, size_t cap, const char* const* options, int n) {
@@ -7391,6 +7513,16 @@ static void cfgFormatValue(int row, char* out, size_t outSize) {
     case 18: snprintf(out, outSize, "%u", (unsigned)g_config.pedalRelayChannel); break;
     case 19: snprintf(out, outSize, "%u", (unsigned)g_config.pedalPrevCC); break;
     case 20: snprintf(out, outSize, "%u", (unsigned)g_config.pedalNextCC); break;
+    case 21: snprintf(out, outSize, "%s", g_config.blePedal        ? "ON" : "OFF"); break;
+    case CFG_ROW_BLE_PAIR:
+      if (!g_config.blePedal) {
+        snprintf(out, outSize, "(BlePedal is OFF)");
+      } else if ((int32_t)(g_blePairArmedUntil - millis()) > 0) {
+        snprintf(out, outSize, "TAP AGAIN TO RE-PAIR");
+      } else {
+        snprintf(out, outSize, "%s", blePedalStatusText());
+      }
+      break;
     default: out[0] = '\0';
   }
 }
@@ -7422,6 +7554,19 @@ static void cfgCycleValue(int row) {
     case 18: g_config.pedalRelayChannel = (g_config.pedalRelayChannel >= 16) ? 1 : (uint8_t)(g_config.pedalRelayChannel + 1); break;
     case 19: g_config.pedalPrevCC       = (g_config.pedalPrevCC >= 127) ? 0 : (uint8_t)(g_config.pedalPrevCC + 1); break;
     case 20: g_config.pedalNextCC       = (g_config.pedalNextCC >= 127) ? 0 : (uint8_t)(g_config.pedalNextCC + 1); break;
+    case 21: g_config.blePedal          = !g_config.blePedal; break;
+    case CFG_ROW_BLE_PAIR:
+      if (!g_config.blePedal) break;
+      // The row acts right away (the pedal has to be put in pairing mode
+      // while this screen is up), without waiting for SAVE.
+      applyBlePedalConfig();
+      if (blePedalHasPedal() && (int32_t)(g_blePairArmedUntil - millis()) <= 0) {
+        g_blePairArmedUntil = millis() + 5000;
+      } else {
+        g_blePairArmedUntil = 0;
+        blePedalPair();
+      }
+      break;
   }
 }
 
@@ -7468,10 +7613,13 @@ static void enterConfigEditMode() {
 }
 
 static void exitConfigEditMode(bool save, bool apply) {
+  g_blePairArmedUntil = 0;
   if (!save && !apply) {
     g_config = g_configSnapshot;  // CANCEL — revert
+    applyBlePedalConfig();
   } else {
     saveDeviceConfigToSD();
+    applyBlePedalConfig();
     if (apply) {
       // applyDeviceConfig() jumps to the configured app/mode. It also calls
       // setCurrentApp() which clears overlay state implicitly.
@@ -7868,7 +8016,7 @@ static void printUsbSerialStatus() {
   Serial.printf(
     "OK STATUS app=%s mode=%s input=%s transpose=%d range=%d filter_bypass=%d mapper_bypass=%d "
     "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu usb_in=%s cables=%u usb_drop=%lu usb_resub_fail=%lu pedal_relay=%d ch=%u prev_cc=%u next_cc=%u "
-    "usb_hid=%s hid_keys=%lu hid_last=0x%02x presel=%d presel_idx=%d\n",
+    "usb_hid=%s hid_keys=%lu hid_last=0x%02x presel=%d presel_idx=%d ble=%s\n",
     getAppLabel(currentApp),
     getDisplayModeLabel(currentMode),
     inputLabel,
@@ -7890,10 +8038,11 @@ static void printUsbSerialStatus() {
     (unsigned)g_config.pedalPrevCC,
     (unsigned)g_config.pedalNextCC,
     g_usbHidMounted ? "connected" : "disconnected",
-    (unsigned long)g_usbHidKeyCount,
-    (unsigned)g_usbHidLastKey,
+    (unsigned long)g_usbPedalKb.keyCount,
+    (unsigned)g_usbPedalKb.lastKey,
     g_preselActive ? 1 : 0,
-    g_preselActive ? g_preselIdx : -1
+    g_preselActive ? g_preselIdx : -1,
+    blePedalStateLabel(blePedalState())
   );
 }
 
@@ -7964,6 +8113,42 @@ static void handleUsbSerialCommand(char* line) {
     if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) { Serial.println("ERR TOUCH out of range"); return; }
     injectTouchPoint((int16_t)x, (int16_t)y);
     Serial.printf("OK TOUCH %d %d\n", x, y);
+    return;
+  }
+
+  // BLE pedal control. ON starts the radio stack (it stays up until reboot);
+  // PAIR bonds with the first HID pedal that advertises; SCAN only surveys.
+  if (tokenEqualsIgnoreCase(cmd, "BLE")) {
+    char* p = strtok_r(nullptr, " \t", &save);
+    // ON / OFF flip the BlePedal setting for this session only (not saved).
+    if (p && (tokenEqualsIgnoreCase(p, "ON") || tokenEqualsIgnoreCase(p, "OFF"))) {
+      g_config.blePedal = tokenEqualsIgnoreCase(p, "ON");
+      applyBlePedalConfig();
+    } else if (p && tokenEqualsIgnoreCase(p, "PAIR")) {
+      g_config.blePedal = true;
+      applyBlePedalConfig();
+      blePedalPair();
+    } else if (p && tokenEqualsIgnoreCase(p, "SCAN")) {
+      blePedalScanOnly();   // survey only; needs BLE ON first
+    } else if (p && tokenEqualsIgnoreCase(p, "FORGET")) {
+      blePedalForget();
+    } else if (p && tokenEqualsIgnoreCase(p, "SEEN")) {
+      blePedalPrintSeen(Serial);
+      return;
+    } else if (!p || !tokenEqualsIgnoreCase(p, "STATUS")) {
+      Serial.println("ERR BLE requires ON, OFF, PAIR, SCAN, SEEN, FORGET or STATUS");
+      return;
+    }
+    char desc[96];
+    blePedalDescribe(desc, sizeof(desc));
+    char raw[2 * sizeof(g_bleRaw) + 1] = "-";
+    uint8_t rawLen = g_bleRawLen;
+    for (uint8_t i = 0; i < rawLen; ++i) snprintf(raw + 2 * i, 3, "%02x", (unsigned)g_bleRaw[i]);
+    Serial.printf("OK BLE %s ble_keys=%lu ble_last=0x%02x reports=%lu raw=%s heap=%u heap_min=%u\n",
+                  desc, (unsigned long)g_blePedalKb.keyCount, (unsigned)g_blePedalKb.lastKey,
+                  (unsigned long)g_bleRawCount, raw,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     return;
   }
 
@@ -8225,6 +8410,10 @@ void setup() {
   startSmfTask();
   startMp3Task();
 
+  // BLE pedal last, and only if configured: bringing up the C6 link takes a
+  // while and must not hold up MIDI.
+  applyBlePedalConfig();
+
 #ifdef M5TAB_DIAG
   Serial.printf("[boot] Tab5 MIDI Transposer ready  panel=%dx%d  reset_reason=%d\n",
                 M5.Display.width(), M5.Display.height(), (int)esp_reset_reason());
@@ -8292,6 +8481,7 @@ void loop() {
   }
   processMp3Ui();
   processPedalRelay();
+  serviceBlePedal(now);
 
   processUsbSerialCommands();
 
