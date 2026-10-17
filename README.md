@@ -245,7 +245,7 @@ libraries:
   - ESP8266Audio (1.9.9)
 ```
 
-esp32-core 3.3.8 には `BOARD_SDMMC_POWER_CHANNEL` が未定義の問題があるので、コンパイルは付属の [`build.cmd`](./build.cmd) を経由する (`-DBOARD_SDMMC_POWER_CHANNEL=4` を注入)。
+esp32-core 3.3.8 には `BOARD_SDMMC_POWER_CHANNEL` が未定義の問題があるので、コンパイルは付属の [`build.cmd`](./build.cmd) (Git Bash なら [`build.sh`](./build.sh)) を経由する (`-DBOARD_SDMMC_POWER_CHANNEL=4` を注入)。引数なしで実行するとコンパイル後に [`comports.ps1`](./comports.ps1) が今つながっている COM ポートの一覧 (推定デバイス / VID:PID / シリアル番号。Tab5 はシリアル番号 = MAC なので 2 台を見分けられる) を出すので、書き込み先の COM 番号はそこで確認できる。ポートは開かない (開くと Tab5 がリセットされる) ので、動作中の機体に影響しない。
 
 ```cmd
 build.cmd
@@ -350,7 +350,9 @@ OK STATUS app=MIDI mode=DIRECT transpose=0 range=2 filter_bypass=0 mapper_bypass
 | [`src/MD_MIDITrack.cpp`](./src/) | SMF トラック |
 | [`src/AudioOutputM5Speaker.h`](./src/) | M5.Speaker 用 ESP8266Audio 出力 |
 | [`sketch.yaml`](./sketch.yaml) | Arduino-CLI プロファイル |
-| [`build.cmd`](./build.cmd) | ビルドラッパー (PSRAM/POWER_CHANNEL workaround 入り) |
+| [`build.cmd`](./build.cmd) | ビルドラッパー (PSRAM/POWER_CHANNEL workaround 入り。引数なしなら COM ポート一覧も表示) |
+| [`build.sh`](./build.sh) | `build.cmd` の Git Bash 版 |
+| [`comports.ps1`](./comports.ps1) | COM ポート一覧 (`build.cmd` / `build.sh` から呼ばれる。単体でも実行可) |
 | [`src/gm_instruments.h`](./src/gm_instruments.h) | GM 128 音色名 + Drum Kit テーブル (SRC モード用) |
 | [`scripts/chord_diag.py`](./scripts/chord_diag.py) | 和音 Note Off 落ち診断 (STATUS 差分で入出力カウンタを照合) |
 
