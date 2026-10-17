@@ -298,7 +298,7 @@ PC から本体を遠隔操作できる (115200 bps、改行 LF / CRLF)。
 | コマンド | 動作 |
 |---|---|
 | `HELP` | コマンド一覧 |
-| `STATUS` | アプリ / モード / 転調値 / FILTER・MAPPER 状態 / `midi_in`・`midi_out` (生バイト数) / `midi_in_real`・`midi_out_real` (ハートビート除外) / BT を 1 行で返す |
+| `STATUS` | アプリ / モード / 転調値 / `aoff=` (AOFF 状態) / FILTER・MAPPER 状態 / `midi_in`・`midi_out` (生バイト数) / `midi_in_real`・`midi_out_real` (ハートビート除外) / USB 診断カウンタ (`usb_drop` `usb_resub_fail` `usb_xfer_err` `usb_xfer_last` `usb_mounts`) / ペダル・HID 状態を 1 行で返す |
 | `REDRAW` | 画面再描画 |
 | `INFO SCREEN` | 画面サイズを返す |
 | `BUTTON A\|B\|C [LONG]` | 物理ボタン疑似操作 (Tab5 はハードボタンが無いので疑似) |
@@ -361,7 +361,7 @@ OK STATUS app=MIDI mode=DIRECT transpose=0 range=2 filter_bypass=0 mapper_bypass
 - **MIDI 処理パイプライン** は `processMIDIByte` でバイトを溜めて `MidiMessage` 構造体を組み立て、`handleParsedMidiMessage` 経由で FILTER → MAPPER → Transpose → `Serial2` の順に流す。SysEx もペイロード単位で FILTER 対象。
 - **Tab5 用の MAPPER 編集 UI** は M5Core2 と違って PG1/PG2 を切り替えず、**SOURCE 側と DESTINATION 側を左右並列**で同時表示する。1280 px 幅を生かしている。
 - **大メニュー / サブメニュー** は 2 段構成: 大メニュー (XPOSE/MSG/PLAY) はヘッダ右側に常駐、サブモードタブ + 機能ボタンはその下のツールバーに展開する。アプリを切り替えるとツールバーの内容が DIR./KEY/INST./SEQ. (XPOSE) → FILTER/MAPPER/BYPASS (MSG) → SMF/MP3 + トランスポート (PLAY) と差し替わる。
-- 転調実行中の Note On / Note Off は `currentNoteStates[]` / `savedNoteStates[]` でペアリング保持しているので、転調値変更時も「同じ鍵が止まらない」現象が出ない。
+- 転調実行中の Note On / Note Off は `currentNoteStates[]` (全 128 ノート × 16 ch) でペアリング保持している。Note On を送った時点の転調量をノート単位で覚え、Note Off はその量で戻すので、鍵を押さえたままペダルで転調しても「同じ鍵が止まらない」現象が出ない。2026-10-17 までは 88 鍵 (21..108) の範囲しか追跡しておらず、範囲外のノート (オクターブシフトした鍵盤、MAPPER のノート書換) は Note Off が新しい転調量で出てスタックし得た。追跡エントリには入力元 (USB / DIN) も記録し、USB 鍵盤が演奏中に消えた (抜けた / ハブの瞬断で再列挙された) ときは、その鍵盤由来の鳴っているノートだけを元の転調量で Note Off する。同じ鍵の Note On が別の転調量で重なって来た場合 (上流で Note Off が落ちた等) は、先に旧ピッチの Note Off を補って送る。
 - **SRC モードの MIDI 経路**: SRC は転調パイプラインの上にかぶせる UI レイヤであり、入力 MIDI は通常通り FILTER → MAPPER → Transpose → Serial2 を流れる。Program Change / CC / Pitch Bend は SRC の操作に応じて UI 側から `Serial2.write()` で直接 Unit MIDI へ送出する。チャンネル別に GM Program / Volume / PB / Sustain をキャッシュしているので、Ch を切替えるたびに状態が再送される。
 - **専用 MIDI I/O タスク (2026-05-08)**: 旧構成は `processMidiInput()` をメインループから呼ぶ作りで、SRC モードのピアノロール再描画や `drawInterface()` の重い `fillRect` が走るたびに MIDI 入力ドレインが数 ms 〜 数十 ms 止まり、演奏中の和音バイトが Serial2 RX 内で詰まっていた。専用タスク `midi_io_task` (FreeRTOS, **core 1**, priority 10) に切り出し、UI 側の重い処理に関係なく MIDI 入出力を維持。タスクは UI と同じ core 1 で動くが優先度が高いので必要時に loopTask をプリエンプトする。
 - **2 コア分担 (2026-10-11)**: ESP32-P4 の 2 コアを「core 0 = ストリーミング / リアルタイム」「core 1 = UI」に分けた。
@@ -376,7 +376,10 @@ OK STATUS app=MIDI mode=DIRECT transpose=0 range=2 filter_bypass=0 mapper_bypass
 - **部分再描画 (2026-10-11)**: ほぼ全てのタップが `needFullRedraw` (全画面: ヘッダ + ツールバー + ナビ + コンテンツで数十 ms) になっていたのを、`needToolbarRedraw` / `needContentRedraw` / `needPartialUpdate` (ヘッダ右の状態テキスト) の 3 段階に分け、さらに DIRECT / INSTANT / SEQ のボタン、SRC の VOL / PB / SUS / PRG バナー / AUTO、AOFF、RANGE は **変化したウィジェットだけ**を即描きする。`drawInterface()` 冒頭の `fillScreen` も撤去した (4 帯域がそれぞれ自分の背景を塗るので 1.8 MB の無駄書きだった)。副次的に直したバグ: MP3 画面で AOFF / MIX などを押して全画面再描画が走るとプレイリストと Cassette パネルが真っ黒になる (`drawMp3()` が dirty フラグ駆動なのに全画面再描画でフラグを立てていなかった)、SMF 再生中に全画面再描画が走るとチャンネルモニタの鍵盤グリッドが消える (ベース描画の無効化漏れ)。MSG (FILTER/MAPPER) 画面でもヘッダ右に `K +n` を出すようにした。
 - **Serial2 TX ミューテックス**: 専用 MIDI タスクと UI 側からの送信 (`sendGSReset` / `sendGMReset` / `sendUnitProgramChange` / `sendAllNotesOff` / SMF 再生時の `smfMidiEventHandler`) が同じ Serial2 TX FIFO を共有するため、再帰ミューテックス `g_serial2TxMux` で各メッセージ送信を直列化している。バイト列のインターリーブで Note Off が破損して音がスタックする問題を防ぐ。
 - **USB ホストの並列 IN 転送 (2026-05-08)**: 旧構成は USB MIDI IN 転送を 1 つだけ `usb_host_transfer_submit` していた。完了コールバック処理中は次の転送がキューにないので、その隙にキーボードが送ったバイトが USB ホストドライバ層で取りこぼされていた (我々のリングカウンタ `usb_drop` には乗らないので不可視のドロップ)。**16 並列**で常時 in-flight にし、コールバックは個別の転送だけ再投入する設計に変更。再投入失敗にも 3 回までリトライを入れて、キュー深度が永続的に下がらないようにしている。USB MIDI 入力リングは 1 KB → 8 KB に拡大。
-- **STATUS の診断カウンタ**: `midi_in` / `midi_in_real` / `midi_out` / `midi_out_real` (heartbeat 除外) に加えて、`usb_drop` (USB MIDI リング溢れバイト数) と `usb_resub_fail` (USB IN 再投入失敗回数) を追加。`scripts/chord_diag.py` で chord on+off の前後に STATUS を撮って差分を見れば、入力で落ちているか出力で落ちているかが切り分けられる。
+- **STATUS の診断カウンタ**: `midi_in` / `midi_in_real` / `midi_out` / `midi_out_real` (heartbeat 除外) に加えて、`usb_drop` (USB MIDI リング溢れバイト数) と `usb_resub_fail` (USB IN 再投入失敗回数) を追加。`scripts/chord_diag.py` で chord on+off の前後に STATUS を撮って差分を見れば、入力で落ちているか出力で落ちているかが切り分けられる。2026-10-17 に `usb_xfer_err` (COMPLETED 以外で返った、または 4 の倍数でないバイト数の USB IN 転送の回数 — その回のペイロードは失われている) / `usb_xfer_last` (最後のステータス値、`0x7F` = 端数バイト) / `usb_mounts` (起動後に USB MIDI を掴んだ回数。演奏後に 2 以上なら途中で再列挙が起きている) / `aoff` (AOFF の ON/OFF) を追加。**Note Off 落ちが起きたら、まず `STATUS` を撮ってこの 4 つを見る。**
+- **ペダル転調時のちらつき対策 (2026-10-17)**: AOFF が ON だと転調のたびに `sendAllNotesOff()` が走り、以前はそこで SRC ピアノロールの保持中ノートのスタンプを消して**ロール全面の再描画** (約 0.45 MB の PSRAM 書き込み) を強制していた。この一撃が DSI スキャンアウトと帯域を取り合って画面全体が一瞬消えていた (差分描画化で消したはずの症状がこの経路だけに残っていた)。保持中ノートは「今 Note Off した」として履歴リングへ送り、差分レンダラに普通に流させる方式に変更 (`srcReleaseHeldVisualNotes()`)。全面クリアはしない。
+- **MIDI パーサを入力元ごとに分離 (2026-10-17)**: `processMIDIByte()` の状態 (ステータス / ランニングステータス / 途中バイト / SysEx) が DIN と USB で 1 組だったため、MIX モードで両方にトラフィックがあると、3 ms 予算で途中打ち切りになった USB の Note Off の前 2 バイトが、次のパスで先に処理される DIN のステータスバイトに潰されて消える経路があった。`MidiParser` 構造体を DIN / USB に 1 つずつ持たせた。
+- **細かな競合修正 (2026-10-17)**: Core2 中継ペダルの歩数カウンタ `g_pedalStepPending` は MIDI タスク (加算) と UI スレッド (減算) の read-modify-write が同一コアで割り込まれると 1 歩消えたので `__atomic_fetch_add` / `__atomic_exchange_n` に変更。AOFF ON の転調では All Notes Off 送出と転調値の切替を Serial2 ミューテックスの中で一括して行い、送出直後に MIDI タスクが旧転調量で Note On を出す窓を閉じた。
 
 ## 関連プロジェクト
 

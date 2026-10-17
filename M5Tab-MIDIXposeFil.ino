@@ -198,6 +198,7 @@ struct Rect { int x, y, w, h; };
 enum CyclerKind : uint8_t;
 struct RollBar;
 struct RollRect;
+struct MidiParser;
 struct ValueBtn { Rect r; int8_t value; char label[5]; };
 struct KeyBtn   { Rect r; int8_t keyValue; const char* keyName; bool isBlackKey; };
 struct SeqSlot  { Rect up, slot, down; };
@@ -248,20 +249,24 @@ static bool storageReady = false;
 static bool midiFsReady = false;
 static SdFs midiSd;
 
-// ==== 88-key tracking (A0=21 .. C8=108) ====
+// ==== 88-key piano geometry (A0=21 .. C8=108) for the KEY-mode UI ====
 #define PIANO_LOWEST_NOTE 21
 #define PIANO_HIGHEST_NOTE 108
 #define PIANO_KEY_COUNT   88
 #define MIDI_CHANNEL_COUNT 16
-#define TRACKED_NOTE_STATE_COUNT (PIANO_KEY_COUNT * MIDI_CHANNEL_COUNT)
+// ==== Sounding-note tracking: every note x channel ====
+// Each Note On we forward is remembered with the transpose offset it went
+// out with, so its Note Off can undo the same offset even if the value moved
+// in between (pedal steps mid-chord). Covers the full 0..127 range: a note
+// outside the 88 piano keys (octave-shifted keyboard, MAPPER remap) that was
+// not tracked would get its Note Off at the *new* offset and stay stuck.
+#define TRACKED_NOTE_STATE_COUNT (128 * MIDI_CHANNEL_COUNT)
 struct NoteState {
-  bool isActive;
-  int8_t originalTranspose;
-  uint8_t channel;
-  uint8_t velocity;
+  bool    isActive;
+  int8_t  originalTranspose;
+  uint8_t fromUsb;   // 1 = arrived over USB MIDI (released when that device vanishes)
 };
 static NoteState currentNoteStates[TRACKED_NOTE_STATE_COUNT];
-static NoteState savedNoteStates  [TRACKED_NOTE_STATE_COUNT];
 static PianoKeyGeom pianoKeys[PIANO_KEY_COUNT];
 
 // ==== Sequence mode ====
@@ -497,6 +502,12 @@ struct SrcRollEvent { uint8_t note; uint8_t vel; uint8_t channel; uint32_t start
 static SrcRollEvent srcRollHist[SRC_ROLL_HISTORY];
 static volatile uint32_t srcRollHistCount = 0;  // total writes (mod SRC_ROLL_HISTORY for ring)
 static uint32_t srcNoteStartMs[16][128];  // 0 = note not currently held
+// Guards the ring counter + held-note stamps as one unit. The MIDI task
+// appends to the ring and clears the stamp of a finished note back to back;
+// the UI snapshots both inside this critical section so a note is never
+// missing from (or doubled in) a roll frame. Recursive per core, so a holder
+// may call srcRollAppend().
+static portMUX_TYPE g_rollSnapMux = portMUX_INITIALIZER_UNLOCKED;
 
 // SRC fullscreen instrument picker overlay state. Opens when the user taps
 // the PRG name banner; covers the entire screen with a paged grid of all
@@ -620,6 +631,17 @@ static usb_transfer_t*          g_usbInXfers[USB_MIDI_IN_XFERS] = {};
 // Drop counter for transfers we couldn't re-submit (usually transient, but
 // without a counter we can't tell). Surfaced via STATUS too.
 static volatile uint32_t        g_usbInResubmitFails = 0;
+// IN transfers that came back with something other than COMPLETED (bus
+// error, STALL, overflow, ...) or with a byte count that isn't whole
+// USB-MIDI packets. Their payload is lost — a Note Off among it leaves a
+// voice stuck — and until now nothing recorded that it happened. STATUS
+// shows the count and the last status code (0x7F = odd byte count).
+static volatile uint32_t        g_usbInXferErrors   = 0;
+static volatile uint8_t         g_usbInLastErrStatus = 0;
+// Times the MIDI interface was (re)mounted since boot. More than 1 after a
+// session means the keyboard re-enumerated mid-play (hub glitch, loose
+// cable) — the Note Offs in flight at that moment never arrive.
+static volatile uint32_t        g_usbMidiMountCount = 0;
 static TaskHandle_t             g_usbTask   = nullptr;
 
 // The IDF 5.5 hub driver has no transaction-translator support: an FS/LS
@@ -740,7 +762,8 @@ static void resetMidiInputParser();
 static bool startUsbHost();
 static void serviceUsbHost(uint32_t now);
 static void processMidiInput();
-static void processUsbMidiInput();
+static void releaseTrackedNotes(bool usbOnly);
+static void srcReleaseHeldVisualNotes();
 static size_t getMidiInputAvailable();
 static void scanMp3Files();
 static bool startMp3Track(int index);
@@ -3301,13 +3324,17 @@ static void srcFlushKeyboardDirty() {
   }
 }
 
-// Append a finished note to the piano-roll history ring buffer.
+// Append a finished note to the piano-roll history ring buffer. Normally the
+// MIDI task's call; the UI thread (All Notes Off) and the USB host task
+// (device gone) also append, so the slot claim is serialised.
 static void srcRollAppend(uint8_t note, uint8_t vel, uint8_t channel, uint32_t startMs, uint32_t endMs) {
+  portENTER_CRITICAL(&g_rollSnapMux);
   uint32_t slot = srcRollHistCount % SRC_ROLL_HISTORY;
   srcRollHist[slot] = { note, vel, channel, startMs, endMs };
   // Publish the slot only after its fields are written so a UI-thread
   // snapshot of the counter never sees a half-filled event.
   __atomic_store_n(&srcRollHistCount, srcRollHistCount + 1, __ATOMIC_RELEASE);
+  portEXIT_CRITICAL(&g_rollSnapMux);
 }
 
 // Update srcKeyVel from a parsed MIDI message. Called by handleParsedMidiMessage.
@@ -3338,6 +3365,35 @@ static void srcKeyboardOnNote(int channel, int note, int velocity, bool noteOn) 
   // whenever the SRC screen is visible; no header repaint is needed here.
 }
 
+// Every note the monitor still shows as held ends right now: its bar goes
+// into the history ring as a finished note, so the delta renderer scrolls it
+// away like any other and nothing has to be cleared wholesale. (The old way
+// zeroed the stamps and forced a full roll repaint — a ~0.45 MB PSRAM burst
+// that fought the DSI scanout and blanked the panel for a frame on every
+// pedal step with AOFF on.) Used when the synth's voices are cut from the
+// UI side (All Notes Off) or the input device vanished mid-chord. Each note
+// is converted inside one critical section so a roll frame never sees it as
+// both held and finished. Callable from any task.
+static void srcReleaseHeldVisualNotes() {
+  const uint32_t now = millis();
+  for (int ch = 0; ch < 16; ++ch) {
+    for (int note = 0; note < 128; ++note) {
+      if (srcNoteStartMs[ch][note] == 0 && srcKeyVel[ch][note] == 0) continue;  // unlocked fast path
+      portENTER_CRITICAL(&g_rollSnapMux);
+      uint32_t s = srcNoteStartMs[ch][note];
+      if (s != 0) {
+        srcRollAppend((uint8_t)note, srcKeyVel[ch][note], (uint8_t)ch, s, now);
+        srcNoteStartMs[ch][note] = 0;
+      }
+      if (srcKeyVel[ch][note]) {
+        srcKeyVel[ch][note] = 0;
+        srcKeyDirty[ch][note] = true;
+      }
+      portEXIT_CRITICAL(&g_rollSnapMux);
+    }
+  }
+}
+
 // =================================================================
 //  Piano roll — delta renderer
 // =================================================================
@@ -3358,11 +3414,6 @@ static uint32_t       g_rollPrevMs   = 0;       // time the on-screen frame was 
 static bool           g_rollNeedFull = true;    // clear interior + redraw everything
 static uint32_t       g_rollOldestUsedIdx = 0;  // oldest ring index referenced last frame
 static bool           g_rollLastHadBars = false; // previous frame drew at least one bar
-// The MIDI task (same core, higher priority) appends to the ring and clears
-// the held-note stamp of a finished note back to back. Snapshotting both
-// inside a critical section makes the pair atomic from the UI's point of
-// view, so a note is never missing from (or doubled in) a frame.
-static portMUX_TYPE   g_rollSnapMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Packed to 16-bit coordinates: the scratch arrays below hold a few hundred
 // of these in internal DRAM, so field width matters.
@@ -3431,13 +3482,6 @@ static void srcRollClearInterior() {
   M5.Display.fillRect(srcRollArea.x + SRC_ROLL_INSET, srcRollArea.y + SRC_ROLL_INSET,
                       srcRollArea.w - SRC_ROLL_INSET * 2, srcRollArea.h - SRC_ROLL_INSET * 2,
                       0x10A2);
-}
-
-// Request a full interior repaint on the next tick. Call whenever bars can
-// vanish without passing through the history ring (All Notes Off clears the
-// held-note stamps) or the panel was repainted underneath.
-static void srcRollInvalidate() {
-  g_rollNeedFull = true;
 }
 
 // Draw the static panel border for the piano roll. Called once on full
@@ -4024,10 +4068,14 @@ static void setCurrentTransposeButton() {
 // a global flag the parser inspects on entry.
 static volatile bool g_midiParserResetRequested = false;
 static void resetMidiInputParser() {
-  // Mark the parser dirty; processMIDIByte() will clear its internal latches
-  // before consuming the next byte from any source.
+  // Mark the parsers dirty; processMidiInput() clears both sources' latches
+  // before its next drain pass.
   g_midiParserResetRequested = true;
 }
+// Which input the MIDI task is draining right now; sendMIDIMessage() tags
+// the Note On it tracks with this so releaseTrackedNotes(usbOnly) can tell
+// the USB keyboard's voices from a DIN keyboard's in MIX mode.
+static bool g_midiParsingUsb = false;
 
 // =================================================================
 //  USB MIDI host (ESP-IDF usb_host driver)
@@ -4081,6 +4129,17 @@ static void usbMidiInDoneCb(usb_transfer_t* t) {
   // the transfer further or resubmit — the host stack will free it.
   if (t == nullptr) return;
   bool dataOk = (t->status == USB_TRANSFER_STATUS_COMPLETED && t->actual_num_bytes >= 4);
+  if (t->status == USB_TRANSFER_STATUS_COMPLETED) {
+    if (t->actual_num_bytes & 3) {          // trailing partial packet is dropped below
+      g_usbInXferErrors = g_usbInXferErrors + 1;
+      g_usbInLastErrStatus = 0x7F;
+    }
+  } else if (t->status != USB_TRANSFER_STATUS_NO_DEVICE &&
+             t->status != USB_TRANSFER_STATUS_CANCELED) {
+    // Payload of this poll is gone (the device considers it delivered).
+    g_usbInXferErrors = g_usbInXferErrors + 1;
+    g_usbInLastErrStatus = (uint8_t)t->status;
+  }
   if (dataOk) {
     for (int off = 0; off + 4 <= t->actual_num_bytes; off += 4) {
       const uint8_t* p = t->data_buffer + off;
@@ -4208,6 +4267,7 @@ static bool usbMidiClaimAndStart(const usb_config_desc_t* cfg) {
   g_usbMidiCableCount = 1;  // we don't parse Element/Jack descriptors; assume 1
   g_usbMidiActiveIndex = 0;
   g_usbMidiMounted    = true;
+  g_usbMidiMountCount = g_usbMidiMountCount + 1;
 
   for (int i = 0; i < allocated; ++i) {
     if (usb_host_transfer_submit(g_usbInXfers[i]) != ESP_OK) {
@@ -4276,6 +4336,14 @@ static void usbMidiTeardown() {
   g_usbMidiRingTail = 0;
   portEXIT_CRITICAL(&g_usbMidiRingMux);
   g_midiParserResetRequested = true;
+
+  // Whatever the keyboard still had down when it vanished will never get its
+  // Note Off (a hub glitch that re-enumerates the device mid-chord looks the
+  // same as an unplug). Release those voices ourselves, each at the offset
+  // it was sent with, and end their bars on the SRC monitor. DIN-sourced
+  // notes (MIX mode) are left alone.
+  releaseTrackedNotes(true);
+  srcReleaseHeldVisualNotes();
 
   // Full redraw because the MIX button highlight depends on g_usbMidiMounted
   // and partial updates intentionally don't repaint the right-side buttons.
@@ -5045,9 +5113,11 @@ static void processPedalRelay() {
   // it on the current item of the mode now showing.
   if (g_preselActive && g_preselMode != currentMode) preselSetCursor(currentTransposeItem());
 
-  int steps = g_pedalStepPending;
+  // Take the whole accumulator in one atomic swap. The old read-then-subtract
+  // could lose a step: the MIDI task may add one between the two halves on
+  // this same core, and the subtraction then wrote the stale sum back.
+  int steps = __atomic_exchange_n(&g_pedalStepPending, 0, __ATOMIC_RELAXED);
   if (steps != 0) {
-    g_pedalStepPending = g_pedalStepPending - steps;
     int dir = (steps < 0) ? -1 : +1;
     int n = (steps < 0) ? -steps : steps;
     for (int i = 0; i < n; ++i) pedalStep(dir);
@@ -6123,34 +6193,52 @@ static void handleTransposeChange(int8_t newValue) {
   if (newValue == transposeValue) return;
 
   if (allNotesOffEnabled) {
+    // Silence the old-offset voices and switch the offset in one locked
+    // step. A Note On the MIDI task is about to send waits on the mutex and
+    // then reads the new value; before, it could slip out at the old offset
+    // right after the burst — a wrong note for its whole duration.
+    Serial2TxLock lk;
     sendAllNotesOff();
     transposeValue = newValue;
-    needPartialUpdate = true;
-    return;
+  } else {
+    // Smooth transpose: every sounding note is tracked with the offset it
+    // was sent with (sendMIDIMessage undoes exactly that on its Note Off),
+    // so the live value can simply flip.
+    transposeValue = newValue;
   }
-
-  // Smooth transpose: remember which notes were on at the old transpose so
-  // their matching Note-Off messages can undo the correct offset.
-  for (int i = 0; i < TRACKED_NOTE_STATE_COUNT; i++) savedNoteStates[i] = currentNoteStates[i];
-  transposeValue = newValue;
   needPartialUpdate = true;
 }
 
-static int getPianoKeyIndex(uint8_t midiNote) {
-  if (midiNote < PIANO_LOWEST_NOTE || midiNote > PIANO_HIGHEST_NOTE) return -1;
-  return midiNote - PIANO_LOWEST_NOTE;
-}
-
 static int getTrackedNoteStateIndex(uint8_t midiNote, uint8_t channel) {
-  int pianoKeyIndex = getPianoKeyIndex(midiNote);
-  if (pianoKeyIndex < 0 || channel >= MIDI_CHANNEL_COUNT) return -1;
-  return pianoKeyIndex * MIDI_CHANNEL_COUNT + channel;
+  if (midiNote > 127 || channel >= MIDI_CHANNEL_COUNT) return -1;
+  return (int)midiNote * MIDI_CHANNEL_COUNT + channel;
 }
 
+// Forget every sounding note. Caller has just silenced the synth (All Notes
+// Off / All Sound Off), so there is nothing left to undo.
 static void clearTrackedNoteStates() {
+  for (int i = 0; i < TRACKED_NOTE_STATE_COUNT; i++) currentNoteStates[i].isActive = false;
+}
+
+// Send a Note Off for every note we still consider sounding, each at the
+// offset its Note On went out with, and forget it. The surgical counterpart
+// of sendAllNotesOff(): only voices this device started are released, so an
+// SMF playing on other channels keeps going. usbOnly limits it to notes that
+// arrived over USB MIDI (the device-gone path; a DIN keyboard in MIX mode is
+// still playing). Safe from any task — the TX mutex covers the table.
+static void releaseTrackedNotes(bool usbOnly) {
+  Serial2TxLock lk;
   for (int i = 0; i < TRACKED_NOTE_STATE_COUNT; i++) {
-    currentNoteStates[i].isActive = false;
-    savedNoteStates[i].isActive = false;
+    NoteState& st = currentNoteStates[i];
+    if (!st.isActive) continue;
+    if (usbOnly && !st.fromUsb) continue;
+    st.isActive = false;
+    int transposed = (i / MIDI_CHANNEL_COUNT) + st.originalTranspose;
+    if (transposed < 0 || transposed > 127) continue;
+    uint8_t out[3] = { (uint8_t)(0x80 | (i % MIDI_CHANNEL_COUNT)), (uint8_t)transposed, 0 };
+    Serial2.write(out, 3);
+    midiOutCount += 3;
+    midiOutRealCount += 3;
   }
 }
 
@@ -6631,7 +6719,9 @@ static bool consumePedalRelay(const MidiMessage& msg) {
   if      (cc == g_config.pedalPrevCC) dir = -1;
   else if (cc == g_config.pedalNextCC) dir = +1;
   else return false;
-  if (msg.bytes[2] >= 64) g_pedalStepPending = g_pedalStepPending + dir;
+  // Atomic: the UI thread drains this with an exchange, and a plain
+  // read-modify-write here could be split by it (same core, we preempt).
+  if (msg.bytes[2] >= 64) __atomic_fetch_add(&g_pedalStepPending, dir, __ATOMIC_RELAXED);
   return true;
 }
 
@@ -6673,26 +6763,43 @@ static void sendMIDIMessage(uint8_t* buffer, int length) {
     uint8_t vel  = buffer[2];
     bool isNoteOn = (type == 0x90) && (vel > 0);
     int idx = getTrackedNoteStateIndex(note, channel);
+    const int8_t liveT = transposeValue;   // one read: the UI thread may flip it any time
     int16_t transposed;
 
     if (isNoteOn) {
-      transposed = note + transposeValue;
-      if (transposed >= 0 && transposed <= 127 && idx >= 0) {
-        currentNoteStates[idx] = { true, (int8_t)transposeValue, channel, vel };
+      transposed = note + liveT;
+      if (idx >= 0) {
+        NoteState& st = currentNoteStates[idx];
+        if (st.isActive && st.originalTranspose != liveT) {
+          // Same key struck again while we still think it is down at another
+          // offset (its Note Off went missing upstream, or the keyboard
+          // retriggers). Without this the old pitch would have no Note Off
+          // left to claim it.
+          int old = note + st.originalTranspose;
+          if (old >= 0 && old <= 127) {
+            uint8_t off[3] = { (uint8_t)(0x80 | channel), (uint8_t)old, 0 };
+            Serial2.write(off, 3);
+            midiOutCount += 3;
+            midiOutRealCount += 3;
+          }
+        }
+        if (transposed >= 0 && transposed <= 127) {
+          st.isActive = true;
+          st.originalTranspose = liveT;
+          st.fromUsb = g_midiParsingUsb ? 1 : 0;
+        } else {
+          st.isActive = false;   // nothing went out, nothing to undo
+        }
       }
     } else {
-      if (idx >= 0) {
-        if (currentNoteStates[idx].isActive) {
-          transposed = note + currentNoteStates[idx].originalTranspose;
-          currentNoteStates[idx].isActive = false;
-        } else if (savedNoteStates[idx].isActive) {
-          transposed = note + savedNoteStates[idx].originalTranspose;
-          savedNoteStates[idx].isActive = false;
-        } else {
-          transposed = note + transposeValue;
-        }
+      if (idx >= 0 && currentNoteStates[idx].isActive) {
+        transposed = note + currentNoteStates[idx].originalTranspose;
+        currentNoteStates[idx].isActive = false;
       } else {
-        transposed = note + transposeValue;
+        // Not tracked (never sent, or already released by an All Notes Off /
+        // device-gone sweep): still forward it at the live offset so nothing
+        // we don't know about is left hanging.
+        transposed = note + liveT;
       }
     }
     if (transposed >= 0 && transposed <= 127) {
@@ -6716,25 +6823,38 @@ static void outputMidiMessage(const MidiMessage& msg) {
   sendMIDIMessage((uint8_t*)msg.bytes, msg.length);
 }
 
-static void processMIDIByte(uint8_t data) {
-  static uint8_t midiBuffer[3];
-  static int bufferIndex = 0;
-  static uint8_t runningStatus = 0;
-  static uint8_t currentStatus = 0;
-  static bool inSysEx = false;
-  static bool allowCurrentSysEx = true;
+// Byte-level MIDI parser state. One instance per input so the DIN and USB
+// streams can never be spliced into each other: with a single shared parser,
+// MIX mode fed both sources through the same latches — a 3-byte Note Off
+// cut in half by the per-pass time budget (or still waiting for its third
+// byte on the UART) was discarded as soon as the other source's status byte
+// arrived, leaving that voice stuck.
+struct MidiParser {
+  uint8_t midiBuffer[3];
+  int     bufferIndex;
+  uint8_t runningStatus;
+  uint8_t currentStatus;
+  bool    inSysEx;
+  bool    allowCurrentSysEx;
+};
+static MidiParser g_dinMidiParser = { {0, 0, 0}, 0, 0, 0, false, true };
+static MidiParser g_usbMidiParser = { {0, 0, 0}, 0, 0, 0, false, true };
 
-  // External reset (input-source switch, USB unplug, etc.) — clear all
-  // half-parsed state so we never treat a stray byte as a continuation of a
-  // message that came from a different stream.
-  if (g_midiParserResetRequested) {
-    g_midiParserResetRequested = false;
-    bufferIndex = 0;
-    runningStatus = 0;
-    currentStatus = 0;
-    inSysEx = false;
-    allowCurrentSysEx = true;
-  }
+static void resetMidiParser(MidiParser& p) {
+  p.bufferIndex = 0;
+  p.runningStatus = 0;
+  p.currentStatus = 0;
+  p.inSysEx = false;
+  p.allowCurrentSysEx = true;
+}
+
+static void processMIDIByte(MidiParser& p, uint8_t data) {
+  uint8_t* midiBuffer        = p.midiBuffer;
+  int&     bufferIndex       = p.bufferIndex;
+  uint8_t& runningStatus     = p.runningStatus;
+  uint8_t& currentStatus     = p.currentStatus;
+  bool&    inSysEx           = p.inSysEx;
+  bool&    allowCurrentSysEx = p.allowCurrentSysEx;
 
   // Real-time
   if (data >= 0xF8) {
@@ -6821,22 +6941,6 @@ static void serviceUsbHost(uint32_t now) {
   // ESP-IDF host events are pumped by the dedicated task on core 0.
 }
 
-static void processUsbMidiInput() {
-  if (midiInputSource != MIDI_INPUT_USB && midiInputSource != MIDI_INPUT_MIX) return;
-  if (!g_usbHostReady || !g_usbMidiMounted) return;
-
-  bool sawInput = false;
-  while (true) {
-    int b = usbMidiRingPop();
-    if (b < 0) break;
-    sawInput = true;
-    midiInCount++;
-    if (!isHeartbeatByte((uint8_t)b)) midiInRealCount++;
-    processMIDIByte((uint8_t)b);
-  }
-  if (sawInput) g_lastMidiInputAt = millis();
-}
-
 static void processMidiInput() {
   // Cap the work done per drain pass. A keyboard player driving heavy
   // running-status + chord traffic can sustain bursts that outpace the
@@ -6855,7 +6959,17 @@ static void processMidiInput() {
   const uint32_t kBudgetUs = 3000UL;
   bool sawInput = false;
 
+  // External reset (input-source switch, USB unplug, etc.) — clear all
+  // half-parsed state so we never treat a stray byte as a continuation of a
+  // message that came from a stream that no longer exists.
+  if (g_midiParserResetRequested) {
+    g_midiParserResetRequested = false;
+    resetMidiParser(g_dinMidiParser);
+    resetMidiParser(g_usbMidiParser);
+  }
+
   if (midiInputSource == MIDI_INPUT_UNIT || midiInputSource == MIDI_INPUT_MIX) {
+    g_midiParsingUsb = false;
     while (Serial2.available()) {
       if ((micros() - startUs) >= kBudgetUs) {
         if (sawInput) g_lastMidiInputAt = millis();
@@ -6865,12 +6979,13 @@ static void processMidiInput() {
       sawInput = true;
       midiInCount++;
       if (!isHeartbeatByte(b)) midiInRealCount++;
-      processMIDIByte(b);
+      processMIDIByte(g_dinMidiParser, b);
     }
   }
 
   if (midiInputSource == MIDI_INPUT_USB || midiInputSource == MIDI_INPUT_MIX) {
     if (g_usbMidiMounted) {
+      g_midiParsingUsb = true;
       while (true) {
         if ((micros() - startUs) >= kBudgetUs) {
           if (sawInput) g_lastMidiInputAt = millis();
@@ -6881,7 +6996,7 @@ static void processMidiInput() {
         sawInput = true;
         midiInCount++;
         if (!isHeartbeatByte((uint8_t)b)) midiInRealCount++;
-        processMIDIByte((uint8_t)b);
+        processMIDIByte(g_usbMidiParser, (uint8_t)b);
       }
     }
   }
@@ -6938,19 +7053,11 @@ static void sendAllNotesOff() {
     midiOutRealCount += sizeof(buf);  // CC 120/123 are real events
     clearTrackedNoteStates();
   }
-  // Also clear the SRC live-monitor state so any stuck visual notes (from a
-  // dropped Note Off etc.) get released along with the synth's voices.
-  for (int ch = 0; ch < 16; ++ch) {
-    for (int note = 0; note < 128; ++note) {
-      if (srcKeyVel[ch][note]) srcKeyDirty[ch][note] = true;
-      srcKeyVel[ch][note] = 0;
-      srcNoteStartMs[ch][note] = 0;
-    }
-  }
-  srcKeyAllDirty = true;
-  // Held-note bars vanish without passing through the history ring, so the
-  // delta renderer can't reconstruct what to erase — force a full repaint.
-  srcRollInvalidate();
+  // The synth's voices are gone, so the SRC monitor's held notes end now.
+  // They go through the history ring like any Note Off, which lets the delta
+  // renderer scroll them away; the lit keys repaint one by one via their
+  // dirty flags. No whole-roll clear.
+  srcReleaseHeldVisualNotes();
 }
 
 static void sendGSReset() {
@@ -7866,13 +7973,14 @@ static void printUsbSerialStatus() {
   const char* inputLabel      = getMidiInputSourceLabel();
   const char* usbLabel        = g_usbMidiMounted ? "connected" : "disconnected";
   Serial.printf(
-    "OK STATUS app=%s mode=%s input=%s transpose=%d range=%d filter_bypass=%d mapper_bypass=%d "
-    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu usb_in=%s cables=%u usb_drop=%lu usb_resub_fail=%lu pedal_relay=%d ch=%u prev_cc=%u next_cc=%u "
+    "OK STATUS app=%s mode=%s input=%s transpose=%d aoff=%d range=%d filter_bypass=%d mapper_bypass=%d "
+    "filter_rule=%d/%d mapper_rule=%d/%d page=%s mapper_page=%s midi_in=%lu midi_out=%lu midi_in_real=%lu midi_out_real=%lu usb_in=%s cables=%u usb_drop=%lu usb_resub_fail=%lu usb_xfer_err=%lu usb_xfer_last=0x%02x usb_mounts=%lu pedal_relay=%d ch=%u prev_cc=%u next_cc=%u "
     "usb_hid=%s hid_keys=%lu hid_last=0x%02x presel=%d presel_idx=%d\n",
     getAppLabel(currentApp),
     getDisplayModeLabel(currentMode),
     inputLabel,
     (int)transposeValue,
+    allNotesOffEnabled ? 1 : 0,
     (int)transposeRange,
     midiFilterBypass ? 1 : 0,
     midiMapperBypass ? 1 : 0,
@@ -7885,6 +7993,9 @@ static void printUsbSerialStatus() {
     (unsigned)g_usbMidiCableCount,
     (unsigned long)g_usbMidiRingDropCount,
     (unsigned long)g_usbInResubmitFails,
+    (unsigned long)g_usbInXferErrors,
+    (unsigned)g_usbInLastErrStatus,
+    (unsigned long)g_usbMidiMountCount,
     g_config.pedalRelay ? 1 : 0,
     (unsigned)g_config.pedalRelayChannel,
     (unsigned)g_config.pedalPrevCC,
@@ -8189,8 +8300,7 @@ void setup() {
   sendAllNotesOff();
 
   for (int i = 0; i < TRACKED_NOTE_STATE_COUNT; i++) {
-    currentNoteStates[i] = { false, 0, 0, 0 };
-    savedNoteStates[i]   = { false, 0, 0, 0 };
+    currentNoteStates[i] = { false, 0, 0 };
   }
 
   initMidiManagementDefaults();
